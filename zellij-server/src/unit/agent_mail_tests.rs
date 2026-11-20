@@ -108,6 +108,7 @@ fn message(id: &str, handle: &str, queued_at: u64, expires_at: u64) -> Stored {
             agent: Some("claude".into()),
             from: "boxa/work/brisk-heron".into(),
             from_name: Some("builder".into()),
+            from_tab: None,
             reply_to: None,
             queued_at,
             expires_at,
@@ -202,10 +203,30 @@ fn old_settled_messages_are_forgotten_and_a_broken_file_is_skipped() {
 }
 
 #[test]
-fn new_ids_are_short_and_unique() {
-    let mailbox = Mailbox::default();
-    let id = mailbox.new_id();
-    assert_eq!(id.len(), 7);
-    assert!(id.starts_with('m'));
-    assert!(id[1..].chars().all(|c| c.is_ascii_alphanumeric()));
+fn new_ids_count_up_per_session_and_survive_a_restart() {
+    let mut mailbox = Mailbox::default();
+    assert_eq!(mailbox.new_id(), "1");
+    assert_eq!(mailbox.new_id(), "2");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let mut mailbox = Mailbox::open(path.clone(), 0);
+    let first = mailbox.new_id();
+    assert_eq!(first, "1");
+    mailbox.hold(message(&first, "sunny-otter", 0, 50_000));
+    let second = mailbox.new_id();
+    assert_eq!(second, "2");
+    // a new server for the same session goes on from the saved counter, even for an id it
+    // handed out and never stored
+    let mut restored = Mailbox::open(path.clone(), 1);
+    assert_eq!(restored.new_id(), "3");
+    // the counter file lost: the ids still on disk keep the next one clear of them
+    std::fs::remove_file(path.join("next-id")).unwrap();
+    let mut restored = Mailbox::open(path.clone(), 1);
+    assert_eq!(restored.new_id(), "2");
+    // an id an older build gave is still found, and the counter steps past an id in use
+    restored.hold(message("m3k9x2q", "sunny-otter", 0, 50_000));
+    restored.hold(message("3", "sunny-otter", 0, 50_000));
+    assert!(restored.get("m3k9x2q").is_some());
+    assert_eq!(restored.new_id(), "4");
 }

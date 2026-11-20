@@ -912,6 +912,7 @@ pub enum ScreenInstruction {
         text: String,
         from: String,
         from_name: Option<String>,
+        from_tab: Option<String>,
         reply_to: Option<String>,
         expire_s: u64,
         response_channel: crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>,
@@ -8222,6 +8223,7 @@ impl Screen {
         text: String,
         from: String,
         from_name: Option<String>,
+        from_tab: Option<String>,
         reply_to: Option<String>,
         expire_s: u64,
     ) -> zellij_utils::agent_mail::MessageRecord {
@@ -8244,6 +8246,7 @@ impl Screen {
                     .and_then(|(_, agent)| agent.as_ref().map(|a| a.kind.clone())),
                 from,
                 from_name,
+                from_tab,
                 reply_to,
                 queued_at: now_ms,
                 expires_at: now_ms.saturating_add(expire_s.saturating_mul(1000)),
@@ -8363,6 +8366,7 @@ impl Screen {
             &stored.record.id,
             &stored.record.from,
             stored.record.from_name.as_deref(),
+            stored.record.from_tab.as_deref(),
             stored.record.reply_to.as_deref(),
         );
         let mut paste = b"\x1b[200~".to_vec();
@@ -13711,6 +13715,7 @@ pub(crate) fn screen_thread_main(
                 text,
                 from,
                 from_name,
+                from_tab,
                 reply_to,
                 expire_s,
                 response_channel,
@@ -13720,6 +13725,7 @@ pub(crate) fn screen_thread_main(
                     text,
                     from,
                     from_name,
+                    from_tab,
                     reply_to,
                     expire_s,
                 );

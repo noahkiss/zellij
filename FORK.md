@@ -8862,7 +8862,7 @@ To message an agent, call zellij_send with to = host/tab, host/handle or the age
 [{"host": "boxa", "host_alias": "a", "tabs": [
    {"session": "work", "tab": "develop", "panes": [
      {"handle": "brisk-heron", "kind": "claude", "name": "develop-1", "state": "idle", ...,
-      "message_to": "bridge:session_01AbC", "display_title": "Fix the build",
+      "display_title": "Fix the build",
       "last_activity_age_s": 240, "chat_age_s": 5400,
       "address": {"session": "boxa/work", "pane": "brisk-heron"}}]}]},
  {"host": "boxb", "error": "ssh could not reach boxb (exit 255): ...", "error_kind": "unreachable",
@@ -8875,8 +8875,8 @@ grouped the way a person names an agent: host, then tab (with its session), then
 
 - **The text** is one instruction, `how_to_message`, then the grouped view as JSON. The
   instruction is static: message an agent with `zellij_send` (see "Agent messages wait until the
-  agent is idle and nobody is typing"); "X on <machine>" is `to=<machine>/X`; `message_to`, when a
-  pane has it, is a second route through the harness's own messaging tool.
+  agent is idle and nobody is typing"); "X on <machine>" is `to=<machine>/X`; do not wait for the
+  answer, which arrives typed into your own prompt.
 - **Each pane entry keeps only the keys that help a decision** (table below). `display_title` is
   the title, or `new session` when it is empty or only the harness's name, like claude's `Claude
   Code`. `address` is the `session` and `pane` the tools take. This machine's rows are addressed by
@@ -8903,12 +8903,12 @@ grouped the way a person names an agent: host, then tab (with its session), then
 | `last_activity_age_s` | Idle long enough to hand it work, or to restart under it. The later of the end of its last turn and its last output. |
 | `chat_age_s` | A long-running chat or a fresh one. |
 | `queued` | Messages already wait for it; do not pile on. |
-| `message_to` | The harness's own messaging route, when it has one. |
 
 Every other row key stays in the flat `result` only. `pane_id`, `tab_id`, `tab_position`,
 `tab_name`, `session`, `host` and `host_alias` are the groups above the pane. `title` becomes
-`display_title`. `state_at`, `last_output_at` and `chat_started_at` become ages. `message_route`
-follows from `message_to`. `command`, `pid`, `source`, `session_source`, `agent_id`, `state_app`,
+`display_title`. `state_at`, `last_output_at` and `chat_started_at` become ages. `message_to`
+and `message_route` stay flat: `zellij_send` reaches every agent, and a bridge id in the grouped
+view read as a `to` target. `command`, `pid`, `source`, `session_source`, `agent_id`, `state_app`,
 `state_title`, `state_progress` and `state_working` decide nothing a reader of the grouped view
 does.
 
@@ -8939,9 +8939,10 @@ change.
 ```
 zellij_send {"to": "boxa/develop", "text": "The build is green; go ahead."}
   # ssh boxa: zellij action send-message --to develop --all-sessions --from here/main/brisk-heron ...
-{"id": "m3k9x2q", "status": "queued", "reason": "draft", "pane_id": "terminal_3",
+{"id": "3", "status": "queued", "reason": "draft", "pane_id": "terminal_3",
  "handle": "sunny-otter", "session": "work", "agent": "claude", "from": "here/main/brisk-heron",
- "queued_at": 1795120865694, "expires_at": 1795122665694}
+ "from_name": "builder", "from_tab": "main", "queued_at": 1795120865694,
+ "expires_at": 1795122665694}
 ```
 
 Typing a message into another agent's pane (`zellij_write_input submit`) pasted it into whatever
@@ -8991,14 +8992,29 @@ when that cannot mix with a person's typing, and otherwise holds it.
 - **The envelope**, one line above the text, marked as another agent's:
 
   ```text
-  [message m3k9x2q from agent builder at boxa/work/brisk-heron; not from the person; reply with zellij_send reply_to=m3k9x2q]
+  [message 3 from builder (tab develop, boxa); not from the person. Reply: zellij_send reply_to=3, or to=boxa/work/brisk-heron]
   ```
 
-  Control characters other than newline and tab are stripped from the text, so it cannot end the
-  paste or press a key.
+  It names the sender as the grouped agent listing does: the agent's name (its pane's handle when
+  it has none), its tab and its machine. It offers two ways back: `reply_to=<id>`, which the
+  delivering session resolves, and a `to=` address, `host/session/handle`, which resolves without
+  the id and names exactly one pane. A sender outside any pane gets `reply_to` only. The tab comes
+  from the sender: `--from-tab`, by default the sending pane's own tab. `zellij_send` passes it,
+  and sends again without it to a machine whose build does not know the flag; that envelope names
+  no tab. Control characters other than newline and tab are stripped from the text and from every
+  name, so neither can end the paste or press a key.
+- **Message ids** are a small number counted per receiving session: `1`, `2`, ... `reply_to` is
+  resolved by the session that delivered the message, so an id only has to be unique there. The
+  counter is saved beside the held messages (`next-id`) before an id is used, so a restart of the
+  server never gives one twice; a lost counter file restarts past the highest id still on disk.
+  An id an older build gave (`m3k9x2q`) still resolves.
 - **The answer** is one record (`--json`, or a line): `delivered`, `queued` with a `reason`,
   `refused`, or `expired`. Exit 0 for delivered and queued, 2 otherwise. `--wait <s>` blocks until
-  a held message goes in. **`zellij action message-status [<id>]`** prints the held records, then
+  a held message goes in. It waits for delivery only, never for an answer.
+- **Do not wait for the answer.** The reply comes back as a message too, typed into the sender's
+  own prompt once the sender is idle. A sender that blocks on `zellij_wait_for`, or polls, freezes
+  itself for the whole round trip. The `zellij_send` tips, `how_to_message` and the server
+  instructions carry one static sentence that says so; the tool names no follow-up. **`zellij action message-status [<id>]`** prints the held records, then
   the settled ones. `--reply-to <id>` alone looks up that message's sender in this session and
   sends there; a sender on another machine is refused with the command to run (the MCP tool
   routes it).
@@ -9015,12 +9031,14 @@ pane (`host/session/handle` and the agent's name). `reply_to` alone looks the me
 session and routes the reply to its sender's host. A machine whose zellij has no `send-message`
 is refused (`reason: remote_too_old`) rather than typed into: the unguarded paste is the failure
 this exists to stop. The server instructions and `how_to_message` name `zellij_send` as the way to
-message an agent; `message_to` stays in the listing as the harness's own route.
+message an agent; `message_to` stays in the flat `list-agents` rows as the harness's own route.
 
 Contract: two `Action` messages, `SendMessageAction` (tag 900) and `MessageStatusAction` (tag 901),
 in the fork block from 900, clear of upstream's numbering. A stock client
 cannot send them; a fork client against a stock server of the same contract gets nothing for these
-two actions. No plugin-API change. Capability: `agent-send-message`.
+two actions. `SendMessageAction` gained `optional string from_tab = 7`, a field of a message the
+fork owns; a server from before it ignores the field and names no tab. No plugin-API change.
+Capability: `agent-send-message`.
 
 Limits:
 

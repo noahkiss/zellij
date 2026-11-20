@@ -283,7 +283,13 @@ pub struct Mailbox {
     dir: Option<PathBuf>,
     held: Vec<Stored>,
     recent: VecDeque<Stored>,
+    /// The id the next message gets. Kept in `dir` as [`NEXT_ID_FILE`], so an id is never given
+    /// twice by this session, across a restart of its server too.
+    next_id: u64,
 }
+
+/// The file in a mailbox's directory that holds the next message id.
+const NEXT_ID_FILE: &str = "next-id";
 
 impl Mailbox {
     /// The mailbox kept in `dir`, with whatever an earlier server left there. A held message that
@@ -314,6 +320,20 @@ impl Mailbox {
             })
             .collect();
         found.sort_by_key(|stored| stored.record.queued_at);
+        // the saved counter, or past every numbered id found, whichever is further: a counter file
+        // lost or written by nobody yet cannot hand out an id still in use
+        let saved = mailbox
+            .dir
+            .as_deref()
+            .and_then(|dir| std::fs::read_to_string(dir.join(NEXT_ID_FILE)).ok())
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let past_found = found
+            .iter()
+            .filter_map(|stored| stored.record.id.parse::<u64>().ok())
+            .max()
+            .map_or(0, |n| n.saturating_add(1));
+        mailbox.next_id = saved.max(past_found).max(1);
         for stored in found {
             if stored.record.status == Status::Queued {
                 mailbox.held.push(stored);
@@ -342,19 +362,35 @@ impl Mailbox {
             .count()
     }
 
-    /// An id no message here has: `m` and six base-36 characters.
-    pub fn new_id(&self) -> String {
+    /// The next id: a small number counted per receiving session, `1`, `2`, ... The receiver
+    /// passes it back as `reply_to`, and the session that delivered the message resolves it, so it
+    /// only has to be unique here. The counter is saved before the id is used, so a restart never
+    /// gives one twice. An id an older build gave (`m3k9x2q`) still resolves.
+    pub fn new_id(&mut self) -> String {
         loop {
-            let mut n = uuid::Uuid::new_v4().as_u128();
-            let mut id = String::from("m");
-            for _ in 0..6 {
-                let digit = (n % 36) as u32;
-                n /= 36;
-                id.push(std::char::from_digit(digit, 36).unwrap_or('0'));
-            }
+            let id = self.next_id.max(1);
+            self.next_id = id.saturating_add(1);
+            self.save_next_id();
+            let id = id.to_string();
             if self.get(&id).is_none() {
                 return id;
             }
+        }
+    }
+
+    fn save_next_id(&self) {
+        let Some(dir) = self.dir.as_deref() else {
+            return;
+        };
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(dir)?;
+            let path = dir.join(NEXT_ID_FILE);
+            let partial = path.with_extension("part");
+            std::fs::write(&partial, self.next_id.to_string())?;
+            std::fs::rename(&partial, &path)
+        };
+        if let Err(e) = write() {
+            log::error!("could not save the next message id: {}", e);
         }
     }
 

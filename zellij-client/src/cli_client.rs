@@ -3380,6 +3380,7 @@ pub struct SendMessageRequest {
     pub wait_s: Option<u64>,
     pub from: Option<String>,
     pub from_name: Option<String>,
+    pub from_tab: Option<String>,
     pub json: bool,
 }
 
@@ -3530,8 +3531,8 @@ pub fn start_send_message_client(
         },
     };
 
-    let (from, own_name) = match &request.from {
-        Some(from) => (from.clone(), None),
+    let (from, own_name, own_tab) = match &request.from {
+        Some(from) => (from.clone(), None, None),
         None => sender_address(make_os_input),
     };
     let action = Action::SendMessage {
@@ -3539,6 +3540,7 @@ pub fn start_send_message_client(
         text,
         from,
         from_name: request.from_name.clone().or(own_name),
+        from_tab: request.from_tab.clone().or(own_tab),
         reply_to: request.reply_to.clone(),
         expire_s: request.expire_s,
     };
@@ -3621,19 +3623,25 @@ fn message_records(
         .map_err(|e| format!("Could not read the session's messages: {}", e))
 }
 
-/// This pane's address, `host/session/handle`, and the name of the agent in it, from the
-/// environment zellij gives every pane. Outside a pane, `host/-/cli`.
-fn sender_address(make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>) -> (String, Option<String>) {
+/// This pane's address, `host/session/handle`, the name of the agent in it and the name of its tab,
+/// from the environment zellij gives every pane. Outside a pane, `host/-/cli`.
+fn sender_address(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+) -> (String, Option<String>, Option<String>) {
     let host = zellij_utils::shared::short_hostname();
     let session = std::env::var("ZELLIJ_SESSION_NAME").ok();
     let pane_id: Option<u32> = std::env::var("ZELLIJ_PANE_ID")
         .ok()
         .and_then(|id| id.parse().ok());
     let (Some(session), Some(pane_id)) = (session, pane_id) else {
-        return (format!("{}/-/cli", host), None);
+        return (format!("{}/-/cli", host), None, None);
     };
     let Ok(panes) = panes_of_session(make_os_input(), &session) else {
-        return (format!("{}/{}/terminal_{}", host, session, pane_id), None);
+        return (
+            format!("{}/{}/terminal_{}", host, session, pane_id),
+            None,
+            None,
+        );
     };
     let pane = panes
         .iter()
@@ -3645,7 +3653,10 @@ fn sender_address(make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>) -> (String, 
     let name = pane
         .and_then(|pane| pane.agent.as_ref())
         .and_then(|agent| agent.name.clone());
-    (format!("{}/{}/{}", host, session, handle), name)
+    let tab = pane
+        .map(|pane| pane.tab_name.clone())
+        .filter(|tab| !tab.is_empty());
+    (format!("{}/{}/{}", host, session, handle), name, tab)
 }
 
 /// Whether `host` names this machine: its short name, or a longer name that starts with it.

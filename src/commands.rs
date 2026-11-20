@@ -1913,6 +1913,7 @@ fn send_message(
         wait,
         from,
         from_name,
+        from_tab,
         json,
         ..
     } = cli_action
@@ -1935,6 +1936,7 @@ fn send_message(
             wait_s: *wait,
             from: from.clone(),
             from_name: from_name.clone(),
+            from_tab: from_tab.clone(),
             json: *json || output_json,
         },
     )

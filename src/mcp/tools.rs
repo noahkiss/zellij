@@ -392,10 +392,8 @@ pub const TOOLS: &[ToolSpec] = &[
                    tab, handle, agent name or project. `develop on boxa` is to=boxa/develop.",
         not_for: "a pane that runs no coding agent - type into that with zellij_write_input - and \
                   not for keys or a command line.",
-        follow_up: Some(
-            "zellij_wait_for until=agent_idle on the receiver once it says delivered, or \
-             wait_s to block until a held message goes in",
-        ),
+        // no follow-up: the answer comes back typed into the sender's own prompt
+        follow_up: None,
         reports: &["action send-message"],
         tips: "The receiving session types the message in as one paste and an Enter only when the \
                agent reported idle, done or error, no unsent text is in its prompt, and no key \
@@ -405,7 +403,9 @@ pub const TOOLS: &[ToolSpec] = &[
                expire_s. Refused means not sent: not_agent, no_state, or a target that named no \
                agent or several, with the candidates listed. The receiver reads one line above \
                your text that names you and the message id; it answers with reply_to=<id>. A \
-               machine whose zellij has no send-message is refused, not typed into.",
+               machine whose zellij has no send-message is refused, not typed into. Do not wait \
+               for the answer: it arrives typed into your own prompt as a new message once you \
+               are idle, so end your turn or carry on.",
         params: &[
             SESSION,
             ParamSpec {
@@ -451,7 +451,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action send-message", "--wait")),
                 describe: "Block until a held message is delivered, for at most this many \
-                           seconds. Keep it under your client's own request deadline.",
+                           seconds. It waits for delivery only, never for the answer. Keep it \
+                           under your client's own request deadline.",
                 default: None,
             },
         ],

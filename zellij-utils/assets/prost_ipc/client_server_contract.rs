@@ -903,6 +903,8 @@ pub struct SendMessageAction {
     pub reply_to: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, tag="6")]
     pub expire_s: u64,
+    #[prost(string, optional, tag="7")]
+    pub from_tab: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

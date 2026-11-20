@@ -70,7 +70,9 @@ zellij_overview with scope=agents answers which panes are running a coding agent
 each one is, including its live messaging name. Refresh the list before addressing another agent.
 To message another agent, on this machine or another, use zellij_send: it finds the agent by host,
 tab, handle, name or project, and types the message in only when that agent is idle and nobody is
-typing there. Use zellij_write_input for a pane that runs no agent.
+typing there. Do not wait for the answer: it arrives typed into your own prompt as a new message
+once you are idle, so end your turn or carry on. Use zellij_write_input for a pane that runs no
+agent.
 The agents prompt and zellij://agents resource return the same live list.
 
 Sessions on other machines: write `session` as `host/session` - `boxa/work` - and every tool acts
@@ -285,12 +287,28 @@ impl ZellijMcp {
             Ok(argv) => argv,
             Err(message) => return bad(message),
         };
-        let outcome = match invoke::run_on(&route.target, &argv).await {
+        let mut argv = argv;
+        let mut outcome = match invoke::run_on(&route.target, &argv).await {
             Ok(outcome) => outcome,
             Err(message) => {
                 return with_host(failed(message, json!({"reason": "not_run"})), &route.target)
             },
         };
+        // a receiving build from before `--from-tab`: the same message, without the tab
+        if outcome.is_error() {
+            if let Some(older) = send::without_from_tab(&argv, &outcome.stderr) {
+                argv = older;
+                outcome = match invoke::run_on(&route.target, &argv).await {
+                    Ok(outcome) => outcome,
+                    Err(message) => {
+                        return with_host(
+                            failed(message, json!({"reason": "not_run"})),
+                            &route.target,
+                        )
+                    },
+                };
+            }
+        }
         if outcome.is_error() && send::verb_unknown(&outcome.stderr) {
             let host = route.target.host().unwrap_or(&local_name).to_owned();
             return with_host(

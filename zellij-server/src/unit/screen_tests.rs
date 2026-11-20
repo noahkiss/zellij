@@ -25282,6 +25282,7 @@ fn send(screen: &mut Screen, text: &str) -> zellij_utils::agent_mail::MessageRec
         text.to_owned(),
         "boxa/work/brisk-heron".to_owned(),
         Some("builder".to_owned()),
+        Some("develop".to_owned()),
         None,
         60,
     )
@@ -25317,8 +25318,8 @@ fn a_message_to_an_idle_agent_goes_in_as_one_paste_and_a_held_enter() {
         sent,
         vec![
             format!(
-                "w:\x1b[200~[message {} from agent builder at boxa/work/brisk-heron; not from \
-                 the person; reply with zellij_send reply_to={}]\nRun the tests.\x1b[201~",
+                "w:\x1b[200~[message {} from builder (tab develop, boxa); not from the person. \
+                 Reply: zellij_send reply_to={}, or to=boxa/work/brisk-heron]\nRun the tests.\x1b[201~",
                 record.id, record.id
             ),
             "at:\r".to_owned(),
@@ -25430,7 +25431,7 @@ fn a_working_or_blocked_agent_holds_and_a_shell_or_no_wait_refuses() {
     agent_reports(&mut screen, "blocked");
     assert_eq!(send(&mut screen, "b").reason, Some(Reason::Blocked));
     // expire_s 0: deliver now or not at all
-    let now_only = screen.send_agent_message(1, "c".into(), "x/y/z".into(), None, None, 0);
+    let now_only = screen.send_agent_message(1, "c".into(), "x/y/z".into(), None, None, None, 0);
     assert_eq!(now_only.status, Status::Refused);
     assert_eq!(now_only.reason, Some(Reason::Blocked));
     assert!(pty_writes(&writes).is_empty());

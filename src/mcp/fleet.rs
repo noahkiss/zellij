@@ -205,8 +205,9 @@ pub fn merge(
 pub const HOW_TO_MESSAGE: &str = "To message an agent, call zellij_send with to = \
 host/tab, host/handle or the agent's name: \"X on <machine>\" is to=<machine>/X, and one agent \
 must match. It waits until that agent is idle and nobody is typing there, and says delivered, \
-queued or refused. A pane entry's address works as to = host/session/handle. message_to, when \
-present, is a second route: the harness's own messaging tool.";
+queued or refused. A pane entry's address works as to = host/session/handle. Do not wait for \
+the answer: it arrives typed into your own prompt as a new message once you are idle, so end \
+your turn or carry on.";
 
 /// The keys a grouped pane entry keeps from its row. Each one helps an agent or a person decide
 /// something (FORK.md has the table); the host, session and tab are the groups above it, and the
@@ -221,7 +222,6 @@ pub const GROUPED_PANE_KEYS: &[&str] = &[
     "state_kind",
     "state_msg",
     "queued",
-    "message_to",
 ];
 
 /// The agent rows as a person refers to them: host, then tab, then pane.
@@ -538,7 +538,7 @@ mod tests {
             .collect();
         assert_eq!(tabs, vec![("work", "develop"), ("play", "develop")]);
         let first = &here["tabs"][0]["panes"][0];
-        for key in ["handle", "kind", "name", "state", "message_to", "queued"] {
+        for key in ["handle", "kind", "name", "state", "queued"] {
             assert_eq!(first[key], rows[0][key], "{}", key);
         }
         // what the groups above say, and the raw times, are not repeated in the pane
@@ -553,6 +553,7 @@ mod tests {
             "chat_started_at",
             "context_tokens",
             "message_route",
+            "message_to",
         ] {
             assert!(first.get(key).is_none(), "{}", key);
         }

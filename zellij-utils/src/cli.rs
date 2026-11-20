@@ -3164,7 +3164,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     /// the sender and says how to reply.
     ///
     ///   zellij action send-message --to develop -- 'The build is green; go ahead.'
-    ///   zellij action send-message --reply-to m3k9x2q -- 'Done.'
+    ///   zellij action send-message --reply-to 3 -- 'Done.'
     ///
     /// Returns: one record of id, status (delivered, queued, refused or expired), reason, pane,
     /// handle, session, agent and the times; with --wait, the record once the message went in or
@@ -3188,7 +3188,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(long, value_parser, default_value = "1800")]
         expire_s: u64,
 
-        /// Block until the message is delivered, for at most this many seconds
+        /// Block until the message is delivered, for at most this many seconds. It waits for
+        /// delivery only, never for an answer: a reply arrives in the sender's own prompt
         #[clap(long, value_parser)]
         wait: Option<u64>,
 
@@ -3199,6 +3200,10 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// The sender's agent name, for the envelope
         #[clap(long, value_parser)]
         from_name: Option<String>,
+
+        /// The sender's tab name, for the envelope. Defaults to this pane's tab
+        #[clap(long, value_parser)]
+        from_tab: Option<String>,
 
         /// Look for the target in every live session on this machine, not one
         #[clap(long, value_parser)]

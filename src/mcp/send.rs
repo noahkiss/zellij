@@ -77,6 +77,8 @@ pub fn route(
 pub struct Sender {
     pub address: String,
     pub name: Option<String>,
+    /// The sender's tab, which the receiver's envelope names.
+    pub tab: Option<String>,
 }
 
 /// The sender, from this server's own pane row in `list-panes --json`.
@@ -107,9 +109,16 @@ pub fn sender(host: &str, session: Option<&str>, pane_id: Option<u32>, panes: &s
         .and_then(|agent| agent.get("name"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let tab = row
+        .as_ref()
+        .and_then(|row| row.get("tab_name"))
+        .and_then(Value::as_str)
+        .filter(|tab| !tab.is_empty())
+        .map(str::to_owned);
     Sender {
         address: format!("{}/{}/{}", host, session, handle),
         name,
+        tab,
     }
 }
 
@@ -148,11 +157,39 @@ pub fn argv(
     if let Some(name) = &sender.name {
         argv.extend(["--from-name".to_owned(), name.clone()]);
     }
+    if let Some(tab) = &sender.tab {
+        argv.extend([FROM_TAB.to_owned(), tab.clone()]);
+    }
     if let Some(reply_to) = args.get("reply_to").and_then(Value::as_str) {
         argv.extend(["--reply-to".to_owned(), reply_to.to_owned()]);
     }
     argv.extend(["--json".to_owned(), "--".to_owned(), text.to_owned()]);
     Ok(argv)
+}
+
+/// The flag that names the sender's tab. A receiving build from before it refuses the flag; the
+/// message is then sent again without it, and the envelope there names no tab.
+pub const FROM_TAB: &str = "--from-tab";
+
+/// The command line without [`FROM_TAB`], when the receiving build refused that flag and nothing
+/// else. `None` when the refusal was about something else, or the line has no such flag.
+pub fn without_from_tab(argv: &[String], stderr: &str) -> Option<Vec<String>> {
+    let refused = stderr.contains(FROM_TAB)
+        && (stderr.contains("unexpected argument")
+            || stderr.contains("Found argument")
+            || stderr.contains("wasn't expected"));
+    let at = argv.iter().position(|word| word == FROM_TAB)?;
+    // only a flag before the `--` that ends the options is the flag; after it, it is the text
+    let end = argv
+        .iter()
+        .position(|word| word == "--")
+        .unwrap_or(argv.len());
+    if !refused || at >= end {
+        return None;
+    }
+    let mut argv = argv.to_vec();
+    argv.drain(at..(at + 2).min(argv.len()));
+    Some(argv)
 }
 
 fn number(args: &Map<String, Value>, name: &str) -> Option<u64> {
@@ -229,16 +266,18 @@ mod tests {
         let sender = Sender {
             address: "here/main/brisk-heron".into(),
             name: Some("builder".into()),
+            tab: Some("develop".into()),
         };
         let args: Map<String, Value> = serde_json::from_value(json!({
             "to": "a/develop", "text": "--looks like a flag", "expire_s": 600, "wait_s": "20",
-            "reply_to": "m1a2b3c"
+            "reply_to": "3"
         }))
         .unwrap();
         assert_eq!(
             argv(&r, &sender, &args).unwrap().join(" "),
             "action send-message --to develop --all-sessions --expire-s 600 --wait 20 \
-             --from here/main/brisk-heron --from-name builder --reply-to m1a2b3c --json -- \
+             --from here/main/brisk-heron --from-name builder --from-tab develop --reply-to 3 \
+             --json -- \
              --looks like a flag"
         );
         let r = route("develop", Some("work"), &hosts(), "here").unwrap();
@@ -252,12 +291,13 @@ mod tests {
     #[test]
     fn the_sender_is_this_servers_own_pane() {
         let panes = r#"[{"id":3,"is_plugin":true,"handle":"plug"},
-                        {"id":3,"is_plugin":false,"handle":"brisk-heron","agent":{"kind":"claude","name":"builder"}}]"#;
+                        {"id":3,"is_plugin":false,"handle":"brisk-heron","tab_name":"develop","agent":{"kind":"claude","name":"builder"}}]"#;
         assert_eq!(
             sender("here", Some("main"), Some(3), panes),
             Sender {
                 address: "here/main/brisk-heron".into(),
-                name: Some("builder".into())
+                name: Some("builder".into()),
+                tab: Some("develop".into()),
             }
         );
         assert_eq!(sender("here", None, None, "[]").address, "here/-/mcp");
@@ -273,5 +313,25 @@ mod tests {
             "error: unrecognized subcommand 'send-message'\n\nUsage: zellij action <COMMAND>"
         ));
         assert!(!verb_unknown("No agent answers to 'develop'. The agents:"));
+    }
+
+    #[test]
+    fn a_build_that_refuses_from_tab_is_asked_again_without_it() {
+        let argv: Vec<String> = "action send-message --to develop --from a/b/c --from-tab dev \
+                                 --json -- say --from-tab x"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let refused = "error: unexpected argument '--from-tab' found\n\nUsage: zellij action \
+                       send-message [OPTIONS] <TEXT>";
+        assert_eq!(
+            without_from_tab(&argv, refused).unwrap().join(" "),
+            "action send-message --to develop --from a/b/c --json -- say --from-tab x"
+        );
+        // any other refusal stands
+        assert!(without_from_tab(&argv, "No agent answers to 'develop'.").is_none());
+        // and the retry is not refused again: it has no flag to drop
+        let again = without_from_tab(&argv, refused).unwrap();
+        assert!(without_from_tab(&again, refused).is_none());
     }
 }

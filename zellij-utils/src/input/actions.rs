@@ -692,6 +692,8 @@ pub enum Action {
         /// The sender's address, `host/session/handle`, as the envelope names it.
         from: String,
         from_name: Option<String>,
+        /// The sender's tab name, for the envelope.
+        from_tab: Option<String>,
         /// The message this one answers.
         reply_to: Option<String>,
         /// How long a held message waits before it expires.

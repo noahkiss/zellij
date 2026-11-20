@@ -1289,6 +1289,7 @@ fn test_client_messages() {
             text: "Run the tests.\nThen say what failed.".to_owned(),
             from: "boxa/work/brisk-heron".to_owned(),
             from_name: Some("builder".to_owned()),
+            from_tab: Some("develop".to_owned()),
             reply_to: Some("m1a2b3c".to_owned()),
             expire_s: 1800,
         },
