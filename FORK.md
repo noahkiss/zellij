@@ -868,6 +868,12 @@ text. The `resize_terminal_window` e2e snapshot does: it splits a pane, so its f
 handles `apt-anteater` and `dry-backyard`. Upstream's copy of that snapshot has no handles, so a
 merge that takes it fails the End to End workflow; keep the fork's frame line.
 
+The `#[ignore]`d plugin-system snapshots that Debug-print a spawn or layout instruction carry the
+fork's fields too: `stdout_lines` (not upstream's `stdout_message`), `resurrected` on a
+`RunCommand`, and `restored_from` and `pane_handle` on a layout pane. A merge that takes upstream's
+side of such a snapshot drops them and fails the End to End workflow. Keep upstream's new fields and
+add the fork's back; differences beyond those fields are real drift.
+
 ### Making a tab does not need somebody attached
 
 ```
