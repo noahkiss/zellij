@@ -2192,6 +2192,25 @@ impl Drop for RowShiftsWhileRendering {
     }
 }
 
+/// fork addition: one pane's agent, as the session saw it start. A message to an agent with no
+/// state is held as `starting` until [`zellij_utils::agent_mail::STARTUP_MS`] after `since`, and
+/// refused as `no_state` after it only if the agent never reported a state at all.
+///
+/// The clock starts when the session first sees the agent, and again when the pane's program asks
+/// `OSC 7501 ; ?` (it is starting) or its foreground command changes. A different harness in the
+/// pane is a new agent: its clock starts and its reports are counted afresh.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentStart {
+    pub kind: String,
+    pub since: Instant,
+    /// The pane's foreground command at the last look.
+    pub command: Option<Vec<String>>,
+    /// The pane's `OSC 7501` query count at the last look.
+    pub queries: u64,
+    /// The pane's report count when this agent was first seen; one above it means it reported.
+    pub reports_before: u64,
+}
+
 pub(crate) struct Screen {
     /// A Bus for sending and receiving messages with the other threads.
     pub bus: Bus<ScreenInstruction>,
@@ -2394,10 +2413,9 @@ pub(crate) struct Screen {
     /// What the pty thread last told us each terminal pane is running, keyed by terminal id.
     /// Read only when stamping `PaneInfo`; see `ScreenInstruction::UpdatePaneProcessInfo`.
     pane_process_info: HashMap<u32, PaneProcessInfo>,
-    /// fork addition: terminal_id -> the agent the session saw start in that pane, and when. A
-    /// message to an agent that has not reported a state is held as `starting` for
-    /// `agent_mail::STARTUP_MS` from here, then refused as `no_state`.
-    agent_seen_at: HashMap<u32, (String, Instant)>,
+    /// fork addition: terminal_id -> the agent the session saw start in that pane. A message to
+    /// an agent with no state is held as `starting`; see [`AgentStart`].
+    agent_seen_at: HashMap<u32, AgentStart>,
     /// terminal_id -> the command line to type at that pane's first prompt; see
     /// `ScreenInstruction::PrefillPane`.
     pending_prefills: HashMap<u32, String>,
@@ -8292,39 +8310,61 @@ impl Screen {
         }
     }
 
-    /// fork addition: remember when each pane's agent first appeared, and forget panes that no
-    /// longer run one. A different harness in the same pane starts the clock again.
+    /// fork addition: remember when each pane's agent started, and forget panes that no longer
+    /// run one. See [`AgentStart`] for what starts the clock again.
     fn note_agent_starts(&mut self, now: Instant) {
-        let kinds: Vec<(u32, Option<String>)> = self
+        let kinds: Vec<(u32, String)> = self
             .tabs
             .values()
             .flat_map(|tab| self.pane_infos_for_tab(tab))
             .filter(|info| !info.is_plugin)
-            .map(|info| (info.id, self.agent_in_pane(&info).map(|agent| agent.kind)))
+            .filter_map(|info| Some((info.id, self.agent_in_pane(&info)?.kind)))
             .collect();
-        let mut seen = HashMap::new();
+        let live: HashSet<u32> = kinds.iter().map(|(terminal_id, _)| *terminal_id).collect();
+        self.agent_seen_at
+            .retain(|terminal_id, _| live.contains(terminal_id));
         for (terminal_id, kind) in kinds {
-            let Some(kind) = kind else { continue };
-            let since = match self.agent_seen_at.get(&terminal_id) {
-                Some((old_kind, since)) if *old_kind == kind => *since,
-                _ => now,
-            };
-            seen.insert(terminal_id, (kind, since));
+            self.agent_start(terminal_id, &kind, now);
         }
-        self.agent_seen_at = seen;
     }
 
-    /// fork addition: how long `terminal_id` has run `kind`, starting the clock at this look if
-    /// the process tick has not seen it yet.
-    fn agent_age_ms(&mut self, terminal_id: u32, kind: &str, now: Instant) -> u64 {
+    /// fork addition: how long `terminal_id` has run `kind` in its current start, and whether it
+    /// ever reported a state, starting or restarting the clock at this look as [`AgentStart`]
+    /// says.
+    fn agent_start(&mut self, terminal_id: u32, kind: &str, now: Instant) -> (u64, bool) {
+        let (reports, queries) = self
+            .tabs
+            .values()
+            .find_map(|tab| tab.get_pane_with_id(PaneId::Terminal(terminal_id)))
+            .and_then(|pane| pane.agent_prompt(now))
+            .map_or((0, 0), |prompt| (prompt.reports, prompt.queries));
+        let command = self
+            .pane_process_info
+            .get(&terminal_id)
+            .and_then(|info| info.command.clone());
+        let fresh = AgentStart {
+            kind: kind.to_owned(),
+            since: now,
+            command: command.clone(),
+            queries,
+            reports_before: reports,
+        };
         let entry = self
             .agent_seen_at
             .entry(terminal_id)
-            .or_insert_with(|| (kind.to_owned(), now));
-        if entry.0 != kind {
-            *entry = (kind.to_owned(), now);
+            .or_insert(fresh.clone());
+        if entry.kind != kind {
+            *entry = fresh;
+        } else if entry.queries != queries || entry.command != command {
+            // the program is starting again: a new query, or a new foreground process
+            entry.since = now;
+            entry.queries = queries;
+            entry.command = command;
         }
-        now.saturating_duration_since(entry.1).as_millis() as u64
+        (
+            now.saturating_duration_since(entry.since).as_millis() as u64,
+            reports > entry.reports_before,
+        )
     }
 
     /// fork addition: the held messages, tried again in the order they came; the overdue ones
@@ -8390,9 +8430,9 @@ impl Screen {
     ) -> zellij_utils::agent_mail::Decision {
         use zellij_utils::agent_mail::{self, Decision, GuardFacts};
         let now = std::time::Instant::now();
-        let agent_age_ms = agent
+        let start = agent
             .as_ref()
-            .map(|agent| self.agent_age_ms(terminal_id, &agent.kind, now));
+            .map(|agent| self.agent_start(terminal_id, &agent.kind, now));
         let prompt = self
             .tabs
             .values()
@@ -8410,7 +8450,8 @@ impl Screen {
         let facts = GuardFacts {
             agent_kind: agent.as_ref().map(|agent| agent.kind.as_str()),
             state: state.as_deref(),
-            agent_age_ms,
+            agent_age_ms: start.map(|(age_ms, _)| age_ms),
+            reported_before: start.is_some_and(|(_, reported)| reported),
             draft_pending: prompt.as_ref().is_some_and(|prompt| prompt.draft_pending),
             since_input_ms: prompt
                 .as_ref()

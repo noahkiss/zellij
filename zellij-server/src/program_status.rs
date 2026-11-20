@@ -166,6 +166,9 @@ pub struct ProgramStatusRecords {
     /// and when a key last reached the pane. What `send-message`'s guard reads.
     draft: crate::agent_mail::Draft,
     last_input_at: Option<std::time::Instant>,
+    /// fork addition: how many times a program asked `OSC 7501 ; ?` here. Each ask is a program
+    /// starting, which starts `send-message`'s startup window again.
+    queries: u64,
 }
 
 impl ProgramStatusRecords {
@@ -256,6 +259,18 @@ impl ProgramStatusRecords {
     pub fn program_started(&mut self) {
         self.records.clear();
         self.draft.taken_up();
+        self.queries += 1;
+    }
+
+    /// fork addition: how many reports the pane has taken, ever. A clear, a query or a reset
+    /// removes records but never lowers this, so it says whether a program here has reported.
+    pub fn reports(&self) -> u64 {
+        self.seq
+    }
+
+    /// fork addition: how many times a program asked `OSC 7501 ; ?` here.
+    pub fn queries(&self) -> u64 {
+        self.queries
     }
 
     pub fn is_empty(&self) -> bool {

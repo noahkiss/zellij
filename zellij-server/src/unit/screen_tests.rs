@@ -25449,8 +25449,28 @@ fn screen_with_agent_started(kind: &str, age: Duration) -> (Screen, PtyWriterRec
     let since = std::time::Instant::now()
         .checked_sub(age)
         .expect("the clock reaches back that far");
-    screen.agent_seen_at.insert(1, (kind.to_owned(), since));
+    screen.agent_seen_at.insert(1, seen(kind, since));
     (screen, writes)
+}
+
+/// What the session remembers of an agent it saw start at `since` in pane 1 of
+/// `screen_with_claude`: no query and no report yet.
+fn seen(kind: &str, since: std::time::Instant) -> crate::screen::AgentStart {
+    crate::screen::AgentStart {
+        kind: kind.to_owned(),
+        since,
+        command: Some(vec![kind.to_owned()]),
+        queries: 0,
+        reports_before: 0,
+    }
+}
+
+fn pane_bytes(screen: &mut Screen, bytes: &str) {
+    screen
+        .get_active_tab_mut(1)
+        .unwrap()
+        .handle_pty_bytes(1, bytes.as_bytes().to_vec())
+        .unwrap();
 }
 
 #[test]
@@ -25489,9 +25509,7 @@ fn a_held_message_is_refused_when_its_agent_outlives_the_startup_window_silent()
     let since = std::time::Instant::now()
         .checked_sub(Duration::from_millis(STARTUP_MS + 1))
         .unwrap();
-    screen
-        .agent_seen_at
-        .insert(1, ("opencode".to_owned(), since));
+    screen.agent_seen_at.insert(1, seen("opencode", since));
     screen.drain_agent_messages();
     let settled = &screen.agent_mail.get(&record.id).unwrap().record;
     assert_eq!(settled.status, Status::Refused);
@@ -25515,31 +25533,135 @@ fn an_agent_silent_past_the_startup_window_is_refused_at_once() {
 #[test]
 fn the_process_tick_starts_the_clock_once_and_again_for_a_new_harness() {
     let (mut screen, _writes) = screen_with_claude(0);
+    let since = |screen: &Screen| {
+        screen
+            .agent_seen_at
+            .get(&1)
+            .map(|start| (start.kind.clone(), start.since))
+    };
     let first = std::time::Instant::now();
     screen.note_agent_starts(first);
-    assert_eq!(
-        screen.agent_seen_at.get(&1).map(|(k, t)| (k.as_str(), *t)),
-        Some(("claude", first))
-    );
+    assert_eq!(since(&screen), Some(("claude".to_owned(), first)));
     let later = first + Duration::from_secs(5);
     screen.note_agent_starts(later);
     assert_eq!(
-        screen.agent_seen_at.get(&1).unwrap().1,
-        first,
+        since(&screen),
+        Some(("claude".to_owned(), first)),
         "the same agent keeps its start"
     );
     screen.pane_process_info.get_mut(&1).unwrap().command = Some(vec!["codex".to_owned()]);
     screen.note_agent_starts(later);
-    assert_eq!(
-        screen.agent_seen_at.get(&1).map(|(k, t)| (k.as_str(), *t)),
-        Some(("codex", later))
-    );
+    assert_eq!(since(&screen), Some(("codex".to_owned(), later)));
+    // the same harness, started again with another command line
+    let relaunch = later + Duration::from_secs(5);
+    screen.pane_process_info.get_mut(&1).unwrap().command =
+        Some(vec!["codex".to_owned(), "resume".to_owned()]);
+    screen.note_agent_starts(relaunch);
+    assert_eq!(since(&screen), Some(("codex".to_owned(), relaunch)));
+    // the same harness asking OSC 7501 again, with nothing else changed
+    let asks = relaunch + Duration::from_secs(5);
+    pane_bytes(&mut screen, "\x1b]7501;?\x07");
+    screen.note_agent_starts(asks);
+    assert_eq!(since(&screen), Some(("codex".to_owned(), asks)));
     screen.pane_process_info.clear();
-    screen.note_agent_starts(later);
+    screen.note_agent_starts(asks);
     assert!(
         screen.agent_seen_at.is_empty(),
         "a pane with no agent is forgotten"
     );
+}
+
+/// An agent that reported once and then lost its state: however long it has run, a message to
+/// it is held as `starting`, never settled as `no_state`.
+#[test]
+fn an_agent_that_ever_reported_is_never_refused_as_silent() {
+    use zellij_utils::agent_mail::{Reason, Status, STARTUP_MS};
+    let long_ago = || {
+        std::time::Instant::now()
+            .checked_sub(Duration::from_millis(STARTUP_MS * 3))
+            .unwrap()
+    };
+    let cases: [(&str, &str, &str); 3] = [
+        // claude's `/clear` (or a resume) asks again, which removes every record
+        ("claude", "/clear asks again", "\x1b]7501;?\x07"),
+        // a full reset (RIS) removes every record too
+        ("claude", "a full reset", "\x1bc"),
+        // opencode clears its own state when no session is shown
+        (
+            "opencode",
+            "opencode's own clear",
+            "\x1b]7501;state=clear:app=opencode\x07",
+        ),
+    ];
+    for (kind, what, cleared_by) in cases {
+        let (mut screen, writes) = screen_with_agent_started(kind, Duration::from_secs(1));
+        agent_reports(&mut screen, "working");
+        screen.note_agent_starts(std::time::Instant::now());
+        pane_bytes(&mut screen, cleared_by);
+        screen.note_agent_starts(std::time::Instant::now());
+        // a long time passes with no state
+        screen.agent_seen_at.get_mut(&1).unwrap().since = long_ago();
+        let record = send(&mut screen, "Ping.");
+        assert_eq!(record.status, Status::Queued, "{what}");
+        assert_eq!(record.reason, Some(Reason::Starting), "{what}");
+        screen.drain_agent_messages();
+        assert_eq!(
+            screen.agent_mail.get(&record.id).unwrap().record.status,
+            Status::Queued,
+            "{what}: held, not settled"
+        );
+        agent_reports(&mut screen, "idle");
+        screen.drain_agent_messages();
+        assert_eq!(
+            screen.agent_mail.get(&record.id).unwrap().record.status,
+            Status::Delivered,
+            "{what}"
+        );
+        let pastes = pty_writes(&writes)
+            .into_iter()
+            .filter(|write| write.contains("Ping."))
+            .count();
+        assert_eq!(pastes, 1, "{what}");
+    }
+}
+
+/// A same-harness relaunch within one process tick: neither the kind nor the command line the
+/// tick reads changes, but the new program's query starts the window again.
+#[test]
+fn a_query_starts_the_window_again_for_an_agent_that_never_reported() {
+    use zellij_utils::agent_mail::{Reason, Status, STARTUP_MS};
+    let (mut screen, _writes) =
+        screen_with_agent_started("claude", Duration::from_millis(STARTUP_MS + 1));
+    pane_bytes(&mut screen, "\x1b]7501;?\x07");
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(record.reason, Some(Reason::Starting));
+    // and a new foreground command does the same
+    let (mut screen, _writes) =
+        screen_with_agent_started("codex", Duration::from_millis(STARTUP_MS + 1));
+    screen.pane_process_info.get_mut(&1).unwrap().command =
+        Some(vec!["codex".to_owned(), "resume".to_owned()]);
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.reason, Some(Reason::Starting));
+}
+
+/// A different harness in a pane whose last agent reported is a new agent: it gets its own
+/// window, and is refused once that runs out with no word from it.
+#[test]
+fn a_new_harness_does_not_inherit_the_last_agents_reports() {
+    use zellij_utils::agent_mail::{Reason, Status, STARTUP_MS};
+    let (mut screen, _writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    screen.note_agent_starts(std::time::Instant::now());
+    pane_bytes(&mut screen, "\x1b]7501;state=clear\x07");
+    screen.pane_process_info.get_mut(&1).unwrap().command = Some(vec!["codex".to_owned()]);
+    screen.note_agent_starts(std::time::Instant::now());
+    screen.agent_seen_at.get_mut(&1).unwrap().since = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(STARTUP_MS + 1))
+        .unwrap();
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.status, Status::Refused);
+    assert_eq!(record.reason, Some(Reason::NoState));
 }
 
 // fork addition: the tab-mode close key, `CloseTabOrConfirm`. Tab 0 holds one plugin pane and

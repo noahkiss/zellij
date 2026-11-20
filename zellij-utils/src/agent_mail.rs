@@ -62,7 +62,8 @@ pub enum Reason {
     Draft,
     /// A key reached the pane within the quiet window.
     Typing,
-    /// The agent has not reported a state yet, and started less than [`STARTUP_MS`] ago.
+    /// The agent has no state: it started less than [`STARTUP_MS`] ago, or it reported once and
+    /// its state was cleared since (a new query, a reset, the harness's own clear).
     Starting,
     /// The pane runs no coding agent.
     NotAgent,
@@ -251,6 +252,9 @@ pub struct GuardFacts<'a> {
     /// How long the pane has run this agent, as far as the session has seen. `None` reads as just
     /// started.
     pub agent_age_ms: Option<u64>,
+    /// The agent has reported a state since the session first saw it. A clear, a reset or a new
+    /// query since then leaves it with no state, but never makes it one that reports none.
+    pub reported_before: bool,
     /// Text typed into the prompt since the agent's last report, not yet sent or cleared.
     pub draft_pending: bool,
     /// Milliseconds since a key last reached the pane, when one ever did.
@@ -280,7 +284,9 @@ pub fn guard(facts: &GuardFacts) -> Decision {
         return Decision::Refuse(Reason::NotAgent);
     }
     match facts.state {
-        None if facts.agent_age_ms.map_or(true, |age| age < STARTUP_MS) => {
+        None if facts.reported_before
+            || facts.agent_age_ms.map_or(true, |age| age < STARTUP_MS) =>
+        {
             return Decision::Hold(Reason::Starting)
         },
         None => return Decision::Refuse(Reason::NoState),
@@ -302,7 +308,8 @@ pub fn guard(facts: &GuardFacts) -> Decision {
 }
 
 /// How long a new agent has to report its first state over `OSC 7501`. Until then a message to it
-/// is held as `starting`; after it, an agent that never reported is refused as `no_state`.
+/// is held as `starting`; after it, an agent that never reported is refused as `no_state`. One
+/// that reported before is held as `starting` however long it has run.
 ///
 /// Every harness reports once its hooks are installed (`zellij setup --agent-hooks`), and does so
 /// as its session starts: claude at its first prompt, after its MCP servers come up, which can take
@@ -351,6 +358,7 @@ mod tests {
             agent_kind: kind,
             state,
             agent_age_ms: Some(0),
+            reported_before: false,
             draft_pending: false,
             since_input_ms: None,
             quiet_ms: QUIET_MS,
@@ -409,6 +417,12 @@ mod tests {
             reported.state = Some("idle");
             assert_eq!(guard(&reported), Decision::Deliver, "{kind}");
         }
+        // one that reported once and lost its state (a query, a reset, a clear) is only starting
+        // again, however long it has run
+        let mut cleared = facts(Some("claude"), None);
+        cleared.agent_age_ms = Some(STARTUP_MS * 10);
+        cleared.reported_before = true;
+        assert_eq!(guard(&cleared), Decision::Hold(Reason::Starting));
         assert!(Reason::NoState
             .explain()
             .contains("zellij setup --agent-hooks"));

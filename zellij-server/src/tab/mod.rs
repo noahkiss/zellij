@@ -568,6 +568,10 @@ pub struct AgentPrompt {
     pub message_pending: bool,
     /// How long since a key last reached the pane.
     pub since_input: Option<std::time::Duration>,
+    /// fork addition: reports and `OSC 7501` queries the pane has taken, ever; see
+    /// `ProgramStatusRecords::reports` and `queries`.
+    pub reports: u64,
+    pub queries: u64,
 }
 
 pub trait Pane {

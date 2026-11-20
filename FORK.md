@@ -9133,7 +9133,11 @@ when that cannot mix with a person's typing, and otherwise holds it.
   its hooks are missing and nothing will ever say it is idle. The refusal names `zellij setup
   --agent-hooks`, which prints the hooks for every harness. The session starts the clock when
   its process tick first sees the agent in the pane, or at the first message to it, whichever
-  comes first; another harness in the same pane starts it again.
+  comes first. The clock starts again when the pane's program asks `OSC 7501 ; ?` (it is
+  starting) or its foreground command changes; another harness in the same pane is a new agent.
+  An agent that has reported a state even once is never refused as `no_state`: a query, a full
+  reset (RIS) or the harness's own `state=clear` leaves it with no state, and a message to it is
+  held as `starting` until it reports again.
 - **The draft** is read from the bytes that reach the pane, the same ones that set
   `input_since_state`: characters and pastes add, Backspace and Delete take away, Ctrl c and
   Ctrl u clear, cursor moves change nothing, and a key whose effect cannot be known (Up, Tab, Esc
