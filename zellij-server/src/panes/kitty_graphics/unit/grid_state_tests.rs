@@ -300,6 +300,7 @@ fn transmitted(
         width,
         height,
         format: KittyFormat::Rgba32,
+        png: None,
     };
     let pane_image_id = grid.transmit(&command, image).expect("a transmission");
     let internal = grid.pane_image_id_map()[&pane_image_id];

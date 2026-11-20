@@ -19,7 +19,9 @@ use zellij_utils::data::{Direction, Event, NewPanePlacement, Resize, ResizeStrat
 use zellij_utils::errors::prelude::*;
 use zellij_utils::errors::ErrorContext;
 use zellij_utils::input::layout::{SplitDirection, SplitSize, TiledPaneLayout};
-use zellij_utils::input::options::{PaneFrameStyle, StackListOrientation};
+use zellij_utils::input::options::{
+    CommandPaneOnCleanExit, InputWhileScrolled, PaneFrameStyle, StackListOrientation,
+};
 use zellij_utils::ipc::IpcReceiverWithContext;
 use zellij_utils::pane_size::{PaneGeom, Size, SizeInPixels};
 use zellij_utils::position::Position;
@@ -167,6 +169,14 @@ fn create_new_tab_with_plugin_receiver(
     size: Size,
     stacked_resize: bool,
 ) -> (Tab, Receiver<(PluginInstruction, ErrorContext)>) {
+    create_new_tab_with_plugin_receiver_and_pty_writer(size, stacked_resize, None)
+}
+
+fn create_new_tab_with_plugin_receiver_and_pty_writer(
+    size: Size,
+    stacked_resize: bool,
+    pty_writer: Option<SenderWithContext<PtyWriteInstruction>>,
+) -> (Tab, Receiver<(PluginInstruction, ErrorContext)>) {
     let index = 0;
     let position = 0;
     let name = String::new();
@@ -174,6 +184,9 @@ fn create_new_tab_with_plugin_receiver(
     let mut senders = ThreadSenders::default().silently_fail_on_send();
     let (to_plugin, plugin_receiver): ChannelWithContext<PluginInstruction> = unbounded();
     senders.replace_to_plugin(SenderWithContext::new(to_plugin));
+    if let Some(pty_writer) = pty_writer {
+        senders.replace_to_pty_writer(pty_writer);
+    }
     let max_panes = None;
     let mode_info = ModeInfo::default();
     let style = Style::default();
@@ -490,6 +503,101 @@ fn write_to_suppressed_pane() {
         None,
     )
     .unwrap();
+}
+
+// Fork addition: the two halves of `input_while_scrolled` that Tab decides. `jump` drops the
+// viewport back to the bottom and flushes the output held while the pane was scrolled, before
+// the key reaches the pty. `stay` leaves both alone — which is why `stay` inherits upstream's
+// MAX_PENDING_VTE_EVENTS force-reset as its only backstop.
+fn scrolled_pane_with_held_output(input_while_scrolled: InputWhileScrolled) -> Tab {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, true);
+    *tab.input_while_scrolled.borrow_mut() = input_while_scrolled;
+
+    // Fill the scrollback so there is somewhere to scroll to.
+    let mut pane_contents = String::new();
+    for i in 0..40 {
+        pane_contents.push_str(&format!("line {}\n\r", i));
+    }
+    tab.handle_pty_bytes(1, pane_contents.into_bytes()).unwrap();
+    tab.scroll_active_terminal_up(1);
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the pane should be scrolled before the write"
+    );
+
+    // Output arriving now is held rather than rendered, because the pane is scrolled.
+    tab.handle_pty_bytes(1, b"held output\n\r".to_vec())
+        .unwrap();
+    assert_eq!(
+        tab.pending_vte_events.get(&1).map(|e| e.len()),
+        Some(1),
+        "output should be held while the pane is scrolled"
+    );
+    tab
+}
+
+#[test]
+fn writing_to_a_scrolled_pane_jumps_to_the_bottom_under_jump() {
+    let mut tab = scrolled_pane_with_held_output(InputWhileScrolled::Jump);
+    tab.write_to_pane_id(&None, vec![b'x'], false, PaneId::Terminal(1), Some(1), None)
+        .unwrap();
+    assert!(
+        !tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the write should have cleared the pane's scroll"
+    );
+    assert!(
+        tab.pending_vte_events
+            .get(&1)
+            .map(|e| e.is_empty())
+            .unwrap_or(true),
+        "the write should have flushed the held output"
+    );
+}
+
+#[test]
+fn writing_to_a_scrolled_pane_leaves_the_viewport_alone_under_stay() {
+    let mut tab = scrolled_pane_with_held_output(InputWhileScrolled::Stay);
+    tab.write_to_pane_id(&None, vec![b'x'], false, PaneId::Terminal(1), Some(1), None)
+        .unwrap();
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the write should have left the pane scrolled"
+    );
+    assert_eq!(
+        tab.pending_vte_events.get(&1).map(|e| e.len()),
+        Some(1),
+        "the write should have left the held output held"
+    );
+}
+
+#[test]
+fn writing_to_a_scrolled_pane_leaves_the_viewport_alone_under_scroll_mode() {
+    // The default value keeps upstream's behaviour: Tab does nothing, because the client is
+    // in Scroll mode and the key never reaches this path in the first place.
+    let mut tab = scrolled_pane_with_held_output(InputWhileScrolled::ScrollMode);
+    tab.write_to_pane_id(&None, vec![b'x'], false, PaneId::Terminal(1), Some(1), None)
+        .unwrap();
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the write should have left the pane scrolled"
+    );
+    assert_eq!(
+        tab.pending_vte_events.get(&1).map(|e| e.len()),
+        Some(1),
+        "the write should have left the held output held"
+    );
 }
 
 #[test]
@@ -21642,4 +21750,184 @@ pub fn making_a_pane_tiled_by_pane_id_hides_floating_panes_and_focuses_it() {
     assert!(tab.pane_id_is_floating(&other_floating_pane_id));
     assert!(!tab.are_floating_panes_visible());
     assert_eq!(tab.get_active_pane_id(client_id), Some(new_pane_id));
+}
+#[test]
+fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
+    for explicit_target in [true, false] {
+        for should_focus in [true, false] {
+            let (tx, rx) = unbounded();
+            let mut tab = create_new_tab_with_plugin_receiver_and_pty_writer(
+                Size { cols: 80, rows: 24 },
+                true,
+                Some(SenderWithContext::new(tx)),
+            )
+            .0;
+            drain_pty_writer(&rx);
+            tab.new_stacked_pane(
+                PaneId::Terminal(2),
+                None,
+                None,
+                false,
+                should_focus,
+                explicit_target.then_some(PaneId::Terminal(1)),
+                (!explicit_target).then_some(1),
+                None,
+                None,
+            )
+            .unwrap();
+            // a pane stacked without focus waits collapsed behind the focused one
+            let (front, back) = if should_focus { (2, 1) } else { (1, 2) };
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(front)).unwrap();
+            let expected = (expanded.get_content_rows(), expanded.get_content_columns());
+            assert_eq!(expected, (21, 78));
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
+            assert_eq!(collapsed.rows(), 1);
+            assert_eq!(
+                (
+                    collapsed.get_terminal_rows(),
+                    collapsed.get_terminal_columns()
+                ),
+                expected
+            );
+            let writes = drain_pty_writer(&rx);
+            for pid in [1, 2] {
+                assert!(
+                    writes.iter().any(|instruction| matches!(instruction,
+                        PtyWriteInstruction::ResizePty(id, cols, rows, _, _)
+                            if *id == pid && (*rows as usize, *cols as usize) == expected
+                    )),
+                    "stack creation sizes terminal {pid} before rendering"
+                );
+            }
+            tab.resize_whole_tab(Size {
+                cols: 100,
+                rows: 30,
+            })
+            .unwrap();
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(front)).unwrap();
+            let expected = (expanded.get_content_rows(), expanded.get_content_columns());
+            assert_eq!(expected, (27, 98));
+            let writes = drain_pty_writer(&rx);
+            for pid in [1, 2] {
+                let last_size = writes
+                    .iter()
+                    .filter_map(|instruction| match instruction {
+                        PtyWriteInstruction::ResizePty(id, cols, rows, _, _) if *id == pid => {
+                            Some((*rows as usize, *cols as usize))
+                        },
+                        _ => None,
+                    })
+                    .last();
+                assert_eq!(last_size, Some(expected));
+            }
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
+            assert_eq!(
+                (
+                    collapsed.get_terminal_rows(),
+                    collapsed.get_terminal_columns()
+                ),
+                expected
+            );
+            assert_eq!(collapsed.rows(), 1);
+            tab.handle_pty_bytes(back, format!("\x1b[{};1Hlast row", expected.0).into_bytes())
+                .unwrap();
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
+            assert!(collapsed.dump_screen(false, None).contains("last row"));
+            tab.tiled_panes.expand_pane_in_stack(PaneId::Terminal(back));
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
+            assert_eq!(
+                (
+                    expanded.get_terminal_rows(),
+                    expanded.get_terminal_columns()
+                ),
+                expected
+            );
+            tab.tiled_panes.focus_pane(PaneId::Terminal(1), 1);
+            tab.toggle_active_pane_fullscreen(1);
+            let fullscreen = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert_eq!(
+                (
+                    fullscreen.get_terminal_rows(),
+                    fullscreen.get_terminal_columns()
+                ),
+                (
+                    fullscreen.get_content_rows(),
+                    fullscreen.get_content_columns()
+                )
+            );
+            assert_eq!(
+                (
+                    fullscreen.get_terminal_rows(),
+                    fullscreen.get_terminal_columns()
+                ),
+                (28, 98)
+            );
+            tab.toggle_active_pane_fullscreen(1);
+            let restored = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert_eq!(
+                (
+                    restored.get_terminal_rows(),
+                    restored.get_terminal_columns()
+                ),
+                expected
+            );
+            tab.new_pane(
+                PaneId::Terminal(3),
+                None,
+                None,
+                false,
+                true,
+                NewPanePlacement::Tiled {
+                    direction: Some(Direction::Right),
+                    borderless: None,
+                    border_style: None,
+                },
+                Some(1),
+                None,
+            )
+            .unwrap();
+            for use_strategies in [false, true] {
+                let before_columns = tab
+                    .tiled_panes
+                    .panes
+                    .get(&PaneId::Terminal(1))
+                    .unwrap()
+                    .get_content_columns();
+                drain_pty_writer(&rx);
+                let strategy = ResizeStrategy::new(Resize::Increase, Some(Direction::Right));
+                if use_strategies {
+                    tab.tiled_panes
+                        .resize_pane_with_strategies(PaneId::Terminal(1), &[strategy], (5.0, 5.0))
+                        .unwrap();
+                } else {
+                    tab.tiled_panes
+                        .resize_pane_with_id(strategy, PaneId::Terminal(1), None)
+                        .unwrap();
+                }
+                let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+                let expected = (expanded.get_content_rows(), expanded.get_content_columns());
+                assert!(expected.1 > before_columns);
+                let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(2)).unwrap();
+                assert_eq!(collapsed.rows(), 1);
+                assert_eq!(
+                    (
+                        collapsed.get_terminal_rows(),
+                        collapsed.get_terminal_columns()
+                    ),
+                    expected
+                );
+                let writes = drain_pty_writer(&rx);
+                let last_size = writes
+                    .iter()
+                    .filter_map(|instruction| match instruction {
+                        PtyWriteInstruction::ResizePty(2, cols, rows, _, _) => {
+                            Some((*rows as usize, *cols as usize))
+                        },
+                        _ => None,
+                    })
+                    .last();
+                assert_eq!(last_size, Some(expected));
+            }
+        }
+    }
 }

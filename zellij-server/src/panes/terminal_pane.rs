@@ -221,12 +221,46 @@ impl Pane for TerminalPane {
         self.get_rows()
             .saturating_sub(self.content_offset.top + self.content_offset.bottom)
     }
+    fn get_terminal_rows(&self) -> usize {
+        if self.current_geom().is_collapsed_stack_member() {
+            self.stack_terminal_size
+                .map(|size| size.0)
+                .unwrap_or(self.grid.height)
+        } else {
+            self.get_content_rows()
+        }
+    }
+    fn get_terminal_columns(&self) -> usize {
+        if self.current_geom().is_collapsed_stack_member() {
+            self.stack_terminal_size
+                .map(|size| size.1)
+                .unwrap_or(self.grid.width)
+        } else {
+            self.get_content_columns()
+        }
+    }
+    fn set_stack_terminal_size(&mut self, size: Option<(usize, usize)>) {
+        let previous_size = self.stack_terminal_size;
+        self.stack_terminal_size = size;
+        if size.is_none() && previous_size.is_some() {
+            self.reflow_lines();
+        }
+        if let Some((rows, cols)) = size {
+            if self.grid.height != rows || self.grid.width != cols {
+                self.grid.change_size(rows, cols);
+                self.set_should_render(true);
+            }
+        }
+    }
     fn reset_size_and_position_override(&mut self) {
         self.geom_override = None;
         self.reflow_lines();
     }
     fn set_geom(&mut self, position_and_size: PaneGeom) {
         let is_pinned = self.geom.is_pinned;
+        if !position_and_size.is_stacked() {
+            self.stack_terminal_size = None;
+        }
         self.geom = position_and_size;
         self.geom.is_pinned = is_pinned;
         self.reflow_lines();
@@ -236,7 +270,10 @@ impl Pane for TerminalPane {
         self.geom_override = Some(pane_geom);
         self.reflow_lines();
     }
-    fn handle_pty_bytes(&mut self, bytes: VteBytes) {
+    fn handle_pty_bytes(&mut self, mut bytes: VteBytes) {
+        // fork addition: a trzsz trigger is marked as passing through a multiplexer, so a redraw
+        // of its row does not start the transfer again
+        crate::trzsz::mark_trzsz_triggers(&mut bytes);
         self.set_should_render(true);
         let bytes = if std::mem::take(&mut self.held_escape) {
             let mut joined = Vec::with_capacity(bytes.len() + 1);
@@ -1753,6 +1790,11 @@ impl TerminalPane {
         }
     }
     fn reflow_lines(&mut self) {
+        // fork: visible stack geometry can temporarily describe only its title.
+        // The frame pass synchronizes collapsed grids to the expanded terminal size.
+        if self.current_geom().is_collapsed_stack_member() {
+            return;
+        }
         let rows = self.program_rows();
         let cols = self.program_columns();
         if (self.grid.height, self.grid.width) != (rows, cols) {

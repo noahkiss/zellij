@@ -16,18 +16,21 @@ use std::env::temp_dir;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use uuid::Uuid;
-use zellij_utils::data::PaneContents;
 use zellij_utils::data::{
     bar_role_label, bar_shows_mode, BareKey, BorderStyle, BorderStyleOverride, Direction,
     HiddenBars, KeyModifier, KeyWithModifier, NewPanePlacement, PaneInfo, PermissionStatus,
     PermissionType, PluginPermission, RegexHighlight, ResizeStrategy, Style, StyledText,
     WebSharing,
 };
+use zellij_utils::data::{NoteColor, PaneCommandState, PaneContents};
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::MouseEvent;
 use zellij_utils::input::mousebinds::Mousebinds;
-use zellij_utils::input::options::{StackListOrientation, DEFAULT_WORD_SEPARATORS};
+use zellij_utils::input::options::{
+    CommandPaneOnCleanExit, DefaultFloatingSize, InputWhileScrolled, StackListOrientation,
+    DEFAULT_WORD_SEPARATORS,
+};
 use zellij_utils::position::Position;
 use zellij_utils::position::{Column, Line};
 use zellij_utils::shared::clean_string_from_control_and_linebreak;
@@ -571,6 +574,23 @@ pub trait Pane {
     popups: HashMap<ClientId, Vec<popup::Popup>>,
     live_views: crate::pane_mirror::SharedLiveViews,
 }
+
+pub trait Pane {
+    fn x(&self) -> usize;
+    fn y(&self) -> usize;
+    fn rows(&self) -> usize;
+    fn cols(&self) -> usize;
+    fn get_content_x(&self) -> usize;
+    fn get_content_y(&self) -> usize;
+    fn get_content_columns(&self) -> usize;
+    fn get_content_rows(&self) -> usize;
+    fn get_terminal_rows(&self) -> usize {
+        self.get_content_rows()
+    }
+    fn get_terminal_columns(&self) -> usize {
+        self.get_content_columns()
+    }
+    fn set_stack_terminal_size(&mut self, _size: Option<(usize, usize)>) {}
 
     fn reset_size_and_position_override(&mut self);
     fn set_geom(&mut self, position_and_size: PaneGeom);
@@ -5855,6 +5875,16 @@ impl Tab {
                                 self.typed_into.insert(pane_id);
                             }
                         }
+                        // fork addition: under `input_while_scrolled "jump"` a key sent to a
+                        // scrolled pane drops the viewport back to the bottom and flushes the
+                        // output held while it was scrolled, before the key reaches the pty —
+                        // the held output belongs above the echo of the key being sent. Only
+                        // this arm does it: the other AdjustedInput variants are not a byte
+                        // reaching the pty and must not move the viewport.
+                        if *self.input_while_scrolled.borrow() == InputWhileScrolled::Jump {
+                            self.clear_scroll_for_pane_id(pane_id)
+                                .with_context(err_context)?;
+                        }
                         self.senders
                             .send_to_pty_writer(PtyWriteInstruction::Write(
                                 adjusted_input,
@@ -8109,6 +8139,26 @@ impl Tab {
             active_pane.clear_scroll();
             if !active_pane.is_scrolled() {
                 if let PaneId::Terminal(raw_fd) = active_pane.pid() {
+                    self.process_pending_vte_events(raw_fd)
+                        .with_context(err_context)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fork addition: clear one pane's scroll and flush the output held while it was
+    /// scrolled, addressed by pane id rather than by which pane a client has focused.
+    /// `clear_active_terminal_scroll` is the client-focused twin; this one is what the
+    /// `input_while_scrolled "jump"` write path needs, because it runs for a pane the
+    /// writer named and no client need have it focused.
+    pub fn clear_scroll_for_pane_id(&mut self, pane_id: PaneId) -> Result<()> {
+        let err_context = || format!("failed to clear scroll in pane {pane_id:?}");
+
+        if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
+            pane.clear_scroll();
+            if !pane.is_scrolled() {
+                if let PaneId::Terminal(raw_fd) = pane.pid() {
                     self.process_pending_vte_events(raw_fd)
                         .with_context(err_context)?;
                 }

@@ -1,11 +1,13 @@
 use super::super::{
-    CharacterChunk, FloatingPanesStack, HostKittyState, KittyImageChunk, Output, OutputBuffer,
-    SixelImageChunk,
+    emit_kitty_transmit, CharacterChunk, FloatingPanesStack, HostKittyState, KittyImageChunk,
+    Output, OutputBuffer, SixelImageChunk,
 };
 use crate::panes::kitty_graphics::parser::{
     DecodedImage, KittyAction, KittyCommandParser, KittyFormat,
 };
-use crate::panes::kitty_graphics::store::{InternalImageId, KittyImageStore, ScaledImageKey};
+use crate::panes::kitty_graphics::store::{
+    InternalImageId, KittyImageStore, ScaledImageKey, TransmitPayload,
+};
 use crate::panes::kitty_graphics::KittyHostCapability;
 use crate::panes::sixel::{PixelRect, SixelImageStore};
 use crate::panes::terminal_character::AnsiCode;
@@ -1444,6 +1446,7 @@ fn store_test_kitty_image(
             width,
             height,
             format: KittyFormat::Rgba32,
+            png: None,
         })
         .unwrap()
 }
@@ -1461,6 +1464,7 @@ fn store_test_kitty_image_with_bytes(
             width,
             height,
             format: KittyFormat::Rgba32,
+            png: None,
         })
         .unwrap()
 }
@@ -2249,6 +2253,7 @@ fn kitty_cropped_placements_preserve_pixels_after_cell_resize() {
             width: 20,
             height: 40,
             format: KittyFormat::Rgba32,
+            png: None,
         };
         let image_id = grid
             .transmit(
@@ -3183,4 +3188,217 @@ fn graphics_media_files_are_private_and_never_reuse_an_existing_file() {
     }
     assert!(super::super::write_private_media(&path, b"other").is_err());
     assert_eq!(std::fs::read(&path).unwrap(), b"pixels");
+}
+
+/// Splits every kitty transmit in `output` into its first-chunk control data and the payload
+/// reassembled from all of its chunks, checking the `m=` continuation flags on the way.
+fn kitty_transmits(output: &str) -> Vec<(String, String)> {
+    let mut transmits = vec![];
+    let mut rest = output;
+    while let Some(start) = rest.find("\u{1b}_Ga=t,") {
+        rest = &rest[start + 3..];
+        let mut control = String::new();
+        let mut payload = String::new();
+        let mut first = true;
+        loop {
+            let end = rest.find("\u{1b}\\").expect("unterminated kitty APC");
+            let body = &rest[..end];
+            let (chunk_control, chunk_payload) = body.split_once(';').unwrap();
+            if first {
+                control = chunk_control.to_owned();
+            }
+            first = false;
+            payload.push_str(chunk_payload);
+            rest = &rest[end + 2..];
+            if chunk_control.ends_with("m=0") {
+                break;
+            }
+            assert!(chunk_control.ends_with("m=1"));
+            assert!(
+                rest.starts_with("\u{1b}_Gq=2,m="),
+                "continuation must follow"
+            );
+            rest = &rest[3..];
+        }
+        transmits.push((control, payload));
+    }
+    transmits
+}
+
+fn decode_transmit_payload(control: &str, payload: &str) -> Vec<u8> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::Engine as _;
+    use std::io::Read as _;
+    let bytes = STANDARD.decode(payload).unwrap();
+    if control.split(',').any(|key| key == "o=z") {
+        let mut decoded = vec![];
+        flate2::read::ZlibDecoder::new(bytes.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        decoded
+    } else {
+        bytes
+    }
+}
+
+/// Flat 16x16-pixel tiles, each a different colour: the shape of a screenshot, which zlib shrinks.
+fn tiled_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let (tile_x, tile_y) = (x / 16, y / 16);
+            rgba.extend_from_slice(&[
+                (tile_x * 37 % 256) as u8,
+                (tile_y * 59 % 256) as u8,
+                ((tile_x + tile_y) * 23 % 256) as u8,
+                255,
+            ]);
+        }
+    }
+    rgba
+}
+
+#[test]
+fn kitty_transmit_chunks_payload_into_4096_byte_parts() {
+    let payload = TransmitPayload {
+        base64: "A".repeat(4096 * 2 + 100),
+        zlib: true,
+        png: false,
+    };
+    let mut out = String::new();
+    emit_kitty_transmit(&mut out, 7, 3, 4, &payload).unwrap();
+    assert!(out.starts_with("\u{1b}_Ga=t,q=2,f=32,o=z,t=d,i=7,s=3,v=4,m=1;"));
+    assert_eq!(out.matches("\u{1b}_G").count(), 3);
+    assert_eq!(out.matches("\u{1b}_Gq=2,m=1;").count(), 1);
+    assert_eq!(out.matches("\u{1b}_Gq=2,m=0;").count(), 1);
+    let transmits = kitty_transmits(&out);
+    assert_eq!(transmits.len(), 1);
+    assert_eq!(transmits[0].1, payload.base64);
+    for chunk in out.split("\u{1b}\\").filter(|chunk| !chunk.is_empty()) {
+        let data = chunk.split_once(';').unwrap().1;
+        assert!(data.len() <= 4096);
+    }
+}
+
+#[test]
+fn kitty_transmit_without_compression_omits_o_flag() {
+    let payload = TransmitPayload {
+        base64: "AAAA".to_owned(),
+        zlib: false,
+        png: false,
+    };
+    let mut out = String::new();
+    emit_kitty_transmit(&mut out, 7, 1, 1, &payload).unwrap();
+    assert_eq!(out, "\u{1b}_Ga=t,q=2,f=32,t=d,i=7,s=1,v=1,m=0;AAAA\u{1b}\\");
+}
+
+#[test]
+fn kitty_transmit_payload_is_zlib_compressed_and_round_trips() {
+    let (width, height) = (410, 520);
+    let rgba = tiled_rgba(width, height);
+    let parts = create_test_kitty_parts();
+    let internal = parts
+        .0
+        .borrow_mut()
+        .store_image(DecodedImage {
+            bytes: rgba.clone(),
+            width,
+            height,
+            format: KittyFormat::Rgba32,
+            png: None,
+        })
+        .unwrap();
+    let output = run_kitty_frame(&parts, vec![kitty_chunk(internal, 1, 0, 0)], None);
+    let transmits = kitty_transmits(&output);
+    assert_eq!(transmits.len(), 1);
+    let (control, payload) = &transmits[0];
+    assert_eq!(control, "a=t,q=2,f=32,o=z,t=d,i=2000000000,s=410,v=520,m=1");
+    let uncompressed_base64_len = (rgba.len() + 2) / 3 * 4;
+    assert!(
+        payload.len() * 4 < uncompressed_base64_len,
+        "compressed payload {} should be far below raw base64 {}",
+        payload.len(),
+        uncompressed_base64_len
+    );
+    assert_eq!(decode_transmit_payload(control, payload), rgba);
+}
+
+/// A smooth gradient: PNG's row filters shrink it far more than zlib alone does on raw RGBA.
+fn gradient_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            rgba.extend_from_slice(&[x as u8, y as u8, (x + y) as u8, 255]);
+        }
+    }
+    rgba
+}
+
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut png = vec![];
+    let mut encoder = png::Encoder::new(&mut png, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(rgba).unwrap();
+    writer.finish().unwrap();
+    png
+}
+
+#[test]
+fn kitty_transmit_passes_a_program_png_through_and_it_decodes_to_the_same_pixels() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::Engine as _;
+    let (width, height) = (410, 520);
+    let rgba = gradient_rgba(width, height);
+    let png = encode_png(width, height, &rgba);
+    let mut parser = KittyCommandParser::new();
+    let incoming = format!("a=T,q=2,f=100;{}", STANDARD.encode(&png));
+    let image = parser
+        .parse(incoming.as_bytes())
+        .unwrap()
+        .unwrap()
+        .image
+        .unwrap();
+    assert_eq!(image.png.as_deref(), Some(png.as_slice()));
+    assert_eq!(image.bytes, rgba);
+    let parts = create_test_kitty_parts();
+    let internal = parts.0.borrow_mut().store_image(image).unwrap();
+    let output = run_kitty_frame(&parts, vec![kitty_chunk(internal, 1, 0, 0)], None);
+    let transmits = kitty_transmits(&output);
+    assert_eq!(transmits.len(), 1);
+    let (control, payload) = &transmits[0];
+    assert_eq!(control, "a=t,q=2,f=100,t=d,i=2000000000,m=1");
+    assert_eq!(STANDARD.decode(payload).unwrap(), png);
+    let zlib_payload = TransmitPayload::zlib(&rgba);
+    assert!(
+        payload.len() < zlib_payload.base64.len(),
+        "png payload {} should beat the zlib payload {}",
+        payload.len(),
+        zlib_payload.base64.len()
+    );
+    // What a kitty client does with it: decode the PNG. Run zellij's own decoder over the
+    // client-bound bytes and compare the pixels.
+    let mut client = KittyCommandParser::new();
+    let received = format!("a=T,q=2,f=100;{}", payload);
+    let decoded = client
+        .parse(received.as_bytes())
+        .unwrap()
+        .unwrap()
+        .image
+        .unwrap();
+    assert_eq!((decoded.width, decoded.height), (width, height));
+    assert_eq!(decoded.bytes, rgba);
+}
+
+#[test]
+fn kitty_transmit_of_a_png_omits_size_keys() {
+    let payload = TransmitPayload {
+        base64: "AAAA".to_owned(),
+        zlib: false,
+        png: true,
+    };
+    let mut out = String::new();
+    emit_kitty_transmit(&mut out, 7, 1, 1, &payload).unwrap();
+    assert_eq!(out, "\u{1b}_Ga=t,q=2,f=100,t=d,i=7,m=0;AAAA\u{1b}\\");
 }

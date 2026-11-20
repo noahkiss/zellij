@@ -14254,6 +14254,129 @@ fn assert_focus_change_syncs_scroll_mode(default_mode: InputMode) {
 }
 
 #[test]
+pub fn focusing_a_scrolled_pane_does_not_enter_scroll_mode_under_jump() {
+    assert_focus_change_does_not_sync_scroll_mode(InputWhileScrolled::Jump);
+}
+
+#[test]
+pub fn focusing_a_scrolled_pane_does_not_enter_scroll_mode_under_stay() {
+    assert_focus_change_does_not_sync_scroll_mode(InputWhileScrolled::Stay);
+}
+
+// Fork addition: `input_while_scrolled "jump"` and `"stay"` both turn the implicit sync off.
+// Scrolling a pane, and focusing one that is already scrolled, must emit no ChangeMode at all
+// — and neither must scrolling back to the bottom while the client sits in Scroll mode,
+// because a mode the user chose explicitly is not the option's to undo. Only the implicit
+// sync is governed; `jump` and `stay` differ later, in what a keypress does to the viewport.
+fn assert_focus_change_does_not_sync_scroll_mode(input_while_scrolled: InputWhileScrolled) {
+    let size = Size { cols: 80, rows: 10 };
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.config.options.input_while_scrolled = Some(input_while_scrolled);
+    let client_id = mock_screen.main_client_id;
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+    let change_mode_count = || -> usize {
+        received_server_instructions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|instruction| {
+                matches!(instruction, ServerInstruction::ChangeMode(cid, _, _) if *cid == client_id)
+            })
+            .count()
+    };
+
+    // Same shape as assert_focus_change_syncs_scroll_mode: fill the left pane, scroll it up
+    // from Scroll mode, then return to Normal, leaving the left pane scrolled and the right
+    // pane unscrolled.
+    let mut pane_contents = String::new();
+    for i in 0..20 {
+        pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
+    }
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+        0,
+        pane_contents.as_bytes().to_vec(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Scroll,
+        None,
+        client_id,
+        None,
+    ));
+    let scroll_up = CliAction::ScrollUp { pane_id: None };
+    for _ in 0..4 {
+        send_cli_action_to_server(&session_metadata, scroll_up.clone(), client_id);
+    }
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Normal,
+        None,
+        client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        change_mode_count(),
+        0,
+        "scrolling a pane should not switch the client's mode under {:?}",
+        input_while_scrolled,
+    );
+
+    // Focus away to the unscrolled pane, then back onto the scrolled one. Under scroll-mode
+    // the second move emits ChangeMode(Scroll); under jump and stay neither move emits
+    // anything.
+    for direction in [Direction::Right, Direction::Left] {
+        send_cli_action_to_server(
+            &session_metadata,
+            CliAction::MoveFocus { direction },
+            client_id,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        change_mode_count(),
+        0,
+        "focusing a scrolled pane should not switch the client's mode under {:?}",
+        input_while_scrolled,
+    );
+
+    // The implicit *exit* is off too: a client who chose Scroll explicitly stays in it when
+    // the pane scrolls back to the bottom.
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Scroll,
+        None,
+        client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::ScrollToBottom { pane_id: None },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        change_mode_count(),
+        0,
+        "scrolling back to the bottom should not drop the client out of Scroll under {:?}",
+        input_while_scrolled,
+    );
+
+    mock_screen.teardown(vec![server_thread, screen_thread]);
+}
+
+#[test]
 pub fn focusing_a_scrolled_pane_with_the_mouse_enters_scroll_mode() {
     // Same sync as the keyboard path, but the focus change comes from a mouse click. Any
     // mouse action that moves focus must sync the mode too. See #638.
@@ -22654,6 +22777,40 @@ pub fn jumping_to_a_pane_in_another_tab_brings_the_tab_with_it() {
 }
 
 #[test]
+fn a_tab_made_with_nobody_attached_holds_its_panes() {
+    // the ghost tab. A tab is sized from `client_sizes`, `remove_client` deletes the entry, and the
+    // fallback used to be `Size::default()` - 0x0, which holds no panes. So every tab-creating verb
+    // on a detached session built an EMPTY tab and reported a pane id for a pane no tab had taken
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0); // the session's own first tab, as at startup
+    screen.remove_client(1).expect("TEST"); // and now the last client detaches
+
+    new_tab(&mut screen, 2, 1);
+
+    let tab = screen
+        .tabs
+        .get(&1)
+        .expect("the tab a detached session was asked for");
+    assert_eq!(
+        tab.size, size,
+        "a tab made while detached is sized against the session, not against nothing"
+    );
+    let panes = screen.pane_infos_for_tab(tab);
+    assert_eq!(panes.len(), 1, "the tab took the pane it was given");
+    let pane = &panes[0];
+    assert_eq!((pane.pane_x, pane.pane_y), (0, 0));
+    assert_eq!(
+        (pane.pane_rows, pane.pane_columns),
+        (size.rows, size.cols),
+        "the pane fills the tab"
+    );
+}
+
+#[test]
 fn a_detached_clients_focus_is_not_reported_as_focus() {
     // `list-panes -a` read the focus map straight, and a client that detaches keeps its entry
     // there - so a pane nobody was looking at kept `FOCUSED=true` for the life of the session
@@ -22712,5 +22869,73 @@ fn one_client_detaching_does_not_unfocus_the_pane_another_is_on() {
             .any(|entry| entry.pane_info.is_focused),
         "the client that stayed is still looking at its pane"
     );
+}
+
+#[test]
+fn a_tab_made_while_detached_survives_the_next_client_to_attach() {
+    // the other half of the ghost: the empty tab was thrown away by the next attach, so a script
+    // got a success and an id and the human saw nothing. The tab has to still be there, hold its
+    // pane, and take the arriving client's size
+    let session_size = Size { cols: 50, rows: 50 };
+    let attaching_size = Size {
+        cols: 160,
+        rows: 40,
+    };
+    let mut screen = create_new_screen(session_size, true, true);
+    new_tab(&mut screen, 1, 0);
+    screen.remove_client(1).expect("TEST");
+    new_tab(&mut screen, 2, 1);
+
+    screen.set_client_size(2, attaching_size);
+    screen.add_client(2, false).expect("TEST");
+
+    let tab = screen.tabs.get(&1).expect("the tab survived the attach");
+    assert_eq!(
+        screen.pane_infos_for_tab(tab).len(),
+        1,
+        "and it still holds its pane"
+    );
+    let tab_the_client_landed_on = screen
+        .active_tab_ids
+        .get(&2)
+        .copied()
+        .expect("the client attached to a tab");
+    assert_eq!(
+        screen
+            .tabs
+            .get(&tab_the_client_landed_on)
+            .expect("TEST")
+            .size,
+        attaching_size,
+        "the tab is resized to the terminal that turned up"
+    );
+}
+
+#[test]
+fn the_session_keeps_the_size_of_the_last_client_to_leave() {
+    // what makes the tab above sized correctly rather than merely non-empty: a detached session
+    // lays out against the terminal it last had, so what a script builds now matches what the
+    // human sees when they attach again
+    let session_size = Size { cols: 50, rows: 50 };
+    let last_terminal = Size {
+        cols: 200,
+        rows: 60,
+    };
+    let mut screen = create_new_screen(session_size, true, true);
+    new_tab(&mut screen, 1, 0);
+    screen.set_client_size(1, last_terminal);
+    screen.remove_client(1).expect("TEST");
+
+    assert_eq!(
+        screen.size_for_client(None),
+        last_terminal,
+        "the size outlives the client that brought it"
+    );
+
+    // and a zero size is not a terminal anyone is looking at, so a client carrying one comes and
+    // goes without putting the session back where it started
+    screen.set_client_size(3, Size { cols: 0, rows: 0 });
+    screen.remove_client(3).expect("TEST");
+    assert_eq!(screen.size_for_client(None), last_terminal);
 }
 

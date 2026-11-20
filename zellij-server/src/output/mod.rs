@@ -6,7 +6,7 @@ use crate::panes::Row;
 use crate::panes::Selection;
 use crate::{
     panes::kitty_graphics::{
-        store::{InternalImageId, KittyImageStore, ScaledImageKey},
+        store::{InternalImageId, KittyImageStore, ScaledImageKey, TransmitPayload},
         KittyHostCapability,
     },
     panes::sixel::SixelImageStore,
@@ -1201,20 +1201,28 @@ fn pane_sort_key(pane_id: PaneId) -> (u8, u32) {
     }
 }
 
+const KITTY_TRANSMIT_CHUNK_BYTES: usize = 4096;
+
 fn emit_kitty_transmit(
     out: &mut String,
     host_image_id: u32,
     width: usize,
     height: usize,
-    b64: &str,
-    compressed: bool,
+    payload: &TransmitPayload,
 ) -> Result<()> {
     let err_context = "failed to serialize kitty transmit";
-    let compression = if compressed { "o=z," } else { "" };
+    let b64 = payload.base64.as_str();
+    // fork: a PNG carries its own size, so `s`/`v` go only with RGBA.
+    let (format, dimensions) = if payload.png {
+        (100, String::new())
+    } else {
+        (32, format!("s={},v={},", width, height))
+    };
+    let compression = if payload.zlib { "o=z," } else { "" };
     let mut parts: Vec<&str> = vec![];
     let mut index = 0;
     while index < b64.len() {
-        let end = std::cmp::min(index + 4096, b64.len());
+        let end = std::cmp::min(index + KITTY_TRANSMIT_CHUNK_BYTES, b64.len());
         parts.push(&b64[index..end]);
         index = end;
     }
@@ -1226,11 +1234,11 @@ fn emit_kitty_transmit(
         if part_index == 0 {
             write!(
                 out,
-                "\u{1b}_Ga=t,q=2,f=32,{}t=d,i={},s={},v={},m={};{}\u{1b}\\",
+                "\u{1b}_Ga=t,q=2,f={},{}t=d,i={},{}m={};{}\u{1b}\\",
+                format,
                 compression,
                 host_image_id,
-                width,
-                height,
+                dimensions,
                 if last == 0 { 0 } else { 1 },
                 part
             )
@@ -1434,22 +1442,15 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
                         }
                     }
                     if !emitted {
-                        let b64 = match kitty_image_store.base64_for(
+                        let payload = match kitty_image_store.transmit_payload_for(
                             chunk.internal_image_id,
                             variant,
                             compressed,
                         ) {
-                            Some(b64) => b64,
+                            Some(payload) => payload,
                             None => continue,
                         };
-                        emit_kitty_transmit(
-                            &mut out,
-                            host_image_id,
-                            width,
-                            height,
-                            &b64,
-                            compressed,
-                        )?;
+                        emit_kitty_transmit(&mut out, host_image_id, width, height, &payload)?;
                     }
                     host_state.next_host_image_id += 1;
                     host_state.transmitted.insert(image_key, host_image_id);

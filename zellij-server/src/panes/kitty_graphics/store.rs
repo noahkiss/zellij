@@ -24,12 +24,66 @@ pub struct KittyImage {
     pub scaled_variants: HashMap<ScaledImageKey, Vec<u8>>,
 }
 
+/// The pixel data of one image, encoded for the server-to-client kitty transmit: base64 of the
+/// PNG the program sent (`f=100`) when that is the smallest, else base64 of the zlib-compressed
+/// RGBA when that is smaller (`o=z`), else base64 of the raw RGBA.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransmitPayload {
+    pub base64: String,
+    pub zlib: bool,
+    pub png: bool,
+}
+
+impl TransmitPayload {
+    /// zlib, for a client that takes `o=z` (upstream compresses whenever the client can take it).
+    pub fn zlib(rgba: &[u8]) -> Self {
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            Vec::with_capacity(rgba.len() / 8),
+            flate2::Compression::fast(),
+        );
+        match encoder.write_all(rgba).and_then(|_| encoder.finish()) {
+            Ok(compressed) => TransmitPayload {
+                base64: BASE64_ENCODER.encode(compressed),
+                zlib: true,
+                png: false,
+            },
+            Err(_) => Self::raw(rgba),
+        }
+    }
+    /// The raw bytes, for a client that does not take `o=z`.
+    pub fn raw(rgba: &[u8]) -> Self {
+        TransmitPayload {
+            base64: BASE64_ENCODER.encode(rgba),
+            zlib: false,
+            png: false,
+        }
+    }
+    /// fork: the PNG the program sent instead of this payload, when it is no larger. Both decode
+    /// to the same pixels; the client decodes the PNG itself.
+    pub fn or_png(self, png: &[u8]) -> Self {
+        if (png.len() + 2) / 3 * 4 <= self.base64.len() {
+            TransmitPayload {
+                base64: BASE64_ENCODER.encode(png),
+                zlib: false,
+                png: true,
+            }
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StoredImage {
     image: KittyImage,
     refcount: usize,
     lru_stamp: u64,
-    base64_cache: HashMap<(Option<ScaledImageKey>, bool), String>,
+    /// fork: the payload, not only its base64, so a PNG passthrough says what it is. Keyed by
+    /// upstream's scaled variant and whether the client takes zlib.
+    transmit_cache: HashMap<(Option<ScaledImageKey>, bool), TransmitPayload>,
+    /// The PNG the program sent, held until the first unscaled transmit encodes it into
+    /// `transmit_cache` and drops it. Counted against the quota while held.
+    source_png: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,9 +118,10 @@ impl KittyImageStore {
         self.next_placement_uid += 1;
         uid
     }
-    pub fn store_image(&mut self, image: DecodedImage) -> Result<InternalImageId, KittyError> {
+    pub fn store_image(&mut self, mut image: DecodedImage) -> Result<InternalImageId, KittyError> {
+        let source_png = image.png.take();
         let (rgba, width, height) = Self::normalize_to_rgba(image);
-        let size = rgba.len();
+        let size = rgba.len() + source_png.as_ref().map(|png| png.len()).unwrap_or(0);
         if size > self.quota_bytes {
             return Err(KittyError {
                 code: KittyErrorCode::Einval,
@@ -102,7 +157,8 @@ impl KittyImageStore {
                 },
                 refcount: 0,
                 lru_stamp,
-                base64_cache: HashMap::new(),
+                transmit_cache: HashMap::new(),
+                source_png,
             },
         );
         self.total_bytes += size;
@@ -147,36 +203,37 @@ impl KittyImageStore {
             self.remove_entry(id);
         }
     }
-    pub fn base64_for(
+    pub fn transmit_payload_for(
         &mut self,
         id: InternalImageId,
         variant: Option<ScaledImageKey>,
         compressed: bool,
-    ) -> Option<String> {
+    ) -> Option<TransmitPayload> {
         let stored = self.images.get_mut(&id)?;
-        if let Some(cached) = stored.base64_cache.get(&(variant, compressed)) {
+        if let Some(cached) = stored.transmit_cache.get(&(variant, compressed)) {
             return Some(cached.clone());
         }
         let bytes = match variant {
             Some(key) => stored.image.scaled_variants.get(&key)?,
             None => &stored.image.rgba,
         };
-        let encoded = if compressed {
-            let mut encoder = flate2::write::ZlibEncoder::new(
-                Vec::with_capacity(bytes.len() / 8),
-                flate2::Compression::fast(),
-            );
-            let deflated = encoder
-                .write_all(bytes)
-                .and_then(|_| encoder.finish())
-                .ok()?;
-            BASE64_ENCODER.encode(&deflated)
+        let mut encoded = if compressed {
+            TransmitPayload::zlib(bytes)
         } else {
-            BASE64_ENCODER.encode(bytes)
+            TransmitPayload::raw(bytes)
         };
+        // fork: the PNG the program sent goes out instead when it is no larger
+        let mut released_bytes = 0;
+        if variant.is_none() {
+            if let Some(png) = stored.source_png.take() {
+                released_bytes = png.len();
+                encoded = encoded.or_png(&png);
+            }
+        }
         stored
-            .base64_cache
+            .transmit_cache
             .insert((variant, compressed), encoded.clone());
+        self.total_bytes -= released_bytes;
         Some(encoded)
     }
     pub fn add_scaled_variant(&mut self, id: InternalImageId, key: ScaledImageKey, bytes: Vec<u8>) {
@@ -191,7 +248,7 @@ impl KittyImageStore {
                     .map(|old| old.len())
                     .unwrap_or(0);
                 stored
-                    .base64_cache
+                    .transmit_cache
                     .retain(|(cached_variant, _), _| *cached_variant != Some(key));
                 stored.lru_stamp = lru_stamp;
                 Some((old_len, new_len))
@@ -233,7 +290,7 @@ impl KittyImageStore {
                 .map(|(_, bytes)| bytes.len())
                 .sum::<usize>();
             stored
-                .base64_cache
+                .transmit_cache
                 .retain(|(cached_variant, _), _| cached_variant.is_none());
         }
     }
@@ -252,6 +309,7 @@ impl KittyImageStore {
     }
     fn stored_image_bytes(stored: &StoredImage) -> usize {
         stored.image.rgba.len()
+            + stored.source_png.as_ref().map(|png| png.len()).unwrap_or(0)
             + stored
                 .image
                 .scaled_variants

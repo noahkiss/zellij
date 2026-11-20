@@ -621,7 +621,29 @@ impl TiledPanes {
             .map(|(pane_id, _pane)| *pane_id)
             .collect()
     }
+    fn synchronize_stack_terminal_sizes(&mut self) {
+        // Every stack member uses the expanded member's terminal content size.
+        // Visible geometry and frame offsets still describe the one-row header.
+        let stack_terminal_sizes: HashMap<_, _> = self
+            .panes
+            .values()
+            .filter_map(|pane| {
+                let geom = pane.current_geom();
+                geom.stacked
+                    .filter(|_| !geom.rows.is_fixed())
+                    .map(|id| (id, (pane.get_content_rows(), pane.get_content_columns())))
+            })
+            .collect();
+        for pane in self.panes.values_mut() {
+            let size = pane
+                .current_geom()
+                .stacked
+                .and_then(|id| stack_terminal_sizes.get(&id).copied());
+            pane.set_stack_terminal_size(size);
+        }
+    }
     pub fn resize_pty_all_panes(&mut self) -> Result<()> {
+        self.synchronize_stack_terminal_sizes();
         for pane in self.panes.values_mut() {
             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size)
                 .with_context(|| format!("failed to resize PTY in pane {:?}", pane.pid()))
@@ -771,6 +793,19 @@ impl TiledPanes {
                 }
             }
 
+            if pane.current_geom().is_collapsed_stack_member() {
+                let mut collapsed_offset = pane.get_content_offset();
+                collapsed_offset.top = collapsed_offset.top.max(1);
+                pane.set_content_offset(collapsed_offset);
+            }
+        }
+        self.synchronize_stack_terminal_sizes();
+        for pane in self.panes.values_mut() {
+            if matches!(pane.pid(), PaneId::Plugin(_))
+                && pane.current_geom().is_collapsed_stack_member()
+            {
+                continue;
+            }
             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
         }
         self.reset_boundaries();
@@ -1751,6 +1786,7 @@ impl TiledPanes {
                 *self.viewport.borrow(),
             );
             if let Some(pane_ids_to_resize) = pane_grid.stack_pane_up(&pane_id) {
+                self.synchronize_stack_terminal_sizes();
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
@@ -1781,6 +1817,7 @@ impl TiledPanes {
                 *self.viewport.borrow(),
             );
             if let Some(pane_ids_to_resize) = pane_grid.stack_pane_down(&pane_id) {
+                self.synchronize_stack_terminal_sizes();
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
@@ -1811,6 +1848,7 @@ impl TiledPanes {
                 *self.viewport.borrow(),
             );
             if let Some(pane_ids_to_resize) = pane_grid.stack_pane_left(&pane_id) {
+                self.synchronize_stack_terminal_sizes();
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
@@ -1841,6 +1879,7 @@ impl TiledPanes {
                 *self.viewport.borrow(),
             );
             if let Some(pane_ids_to_resize) = pane_grid.stack_pane_right(&pane_id) {
+                self.synchronize_stack_terminal_sizes();
                 for pane_id in pane_ids_to_resize {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         let _ =
@@ -2150,6 +2189,7 @@ impl TiledPanes {
             },
         }
 
+        self.synchronize_stack_terminal_sizes();
         for pane in self.panes.values_mut() {
             // TODO: only for the panes whose width/height actually changed
             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
@@ -2189,6 +2229,7 @@ impl TiledPanes {
                 .with_context(err_context);
         }
 
+        self.synchronize_stack_terminal_sizes();
         for pane in self.panes.values_mut() {
             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
         }

@@ -143,6 +143,39 @@ impl FromStr for OnQuit {
     }
 }
 
+/// What happens when a key is pressed in a pane whose viewport is scrolled up.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+pub enum InputWhileScrolled {
+    /// Scrolling or focusing a scrolled pane implicitly enters Scroll mode.
+    #[serde(alias = "scroll-mode")]
+    ScrollMode,
+    /// No implicit mode switch. A key clears the pane's scroll, flushes the held
+    /// output, then reaches the pty.
+    #[serde(alias = "jump")]
+    Jump,
+    /// No implicit mode switch. A key reaches the pty and the viewport stays put.
+    #[serde(alias = "stay")]
+    Stay,
+}
+
+impl Default for InputWhileScrolled {
+    fn default() -> Self {
+        Self::ScrollMode
+    }
+}
+
+impl FromStr for InputWhileScrolled {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ScrollMode" | "scroll-mode" => Ok(Self::ScrollMode),
+            "Jump" | "jump" => Ok(Self::Jump),
+            "Stay" | "stay" => Ok(Self::Stay),
+            _ => Err(format!("No such input_while_scrolled: {}", s)),
+        }
+    }
+}
+
 impl Default for OnForceClose {
     fn default() -> Self {
         Self::Detach
@@ -710,6 +743,17 @@ pub struct Options {
     )]
     #[serde(default)]
     pub mode_hints_when_bars_hidden: Option<bool>,
+    /// What a keypress does in a pane that is scrolled up
+    /// (scroll-mode, jump, stay)
+    #[clap(skip)]
+    #[serde(default)]
+    pub input_while_scrolled: Option<InputWhileScrolled>,
+
+    /// What a command pane does when its command exits with status 0
+    /// (hold, shell)
+    #[clap(skip)]
+    #[serde(default)]
+    pub command_pane_on_clean_exit: Option<CommandPaneOnCleanExit>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1005,6 +1049,8 @@ impl Options {
             bars_hidden_on_start,
             hidden_bars_notification,
             mode_hints_when_bars_hidden,
+            input_while_scrolled,
+            command_pane_on_clean_exit,
         }
     }
 
@@ -1237,6 +1283,8 @@ impl Options {
             bars_hidden_on_start,
             hidden_bars_notification,
             mode_hints_when_bars_hidden,
+            input_while_scrolled,
+            command_pane_on_clean_exit,
         }
     }
 

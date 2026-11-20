@@ -1327,6 +1327,15 @@ impl SessionMetaData {
                             .or_else(|| env_value(&pane_env, "VISUAL"))
                             .map(PathBuf::from)
                     }),
+                    default_floating_size: new_config.options.default_floating_size.clone(),
+                    input_while_scrolled: new_config
+                        .options
+                        .input_while_scrolled
+                        .unwrap_or_default(),
+                    command_pane_on_clean_exit: new_config
+                        .options
+                        .command_pane_on_clean_exit
+                        .unwrap_or_default(),
                     advanced_mouse_actions: new_config
                         .options
                         .advanced_mouse_actions
@@ -1336,6 +1345,7 @@ impl SessionMetaData {
                     mouse_hover_effects: new_config.options.mouse_hover_effects.unwrap_or(true),
                     mouse_hover_tips: new_config.options.mouse_hover_tips.unwrap_or(true),
                     visual_bell: new_config.options.visual_bell.unwrap_or(true),
+                    bell_clear_delay_ms: new_config.options.bell_clear_delay_ms.unwrap_or(0),
                     focus_follows_mouse: new_config.options.focus_follows_mouse.unwrap_or(false),
                     mouse_click_through: new_config.options.mouse_click_through.unwrap_or(false),
                     context_menu_enabled: new_config.options.context_menu_enabled.unwrap_or(true),

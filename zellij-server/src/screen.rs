@@ -2117,6 +2117,19 @@ pub(crate) struct Screen {
     /// The indices of this [`Screen`]'s active [`Tab`]s.
     active_tab_ids: BTreeMap<ClientId, usize>,
     client_sizes: HashMap<ClientId, Size>,
+    /// fork addition: the size a new tab is laid out against when nobody is attached.
+    ///
+    /// `client_sizes` is keyed by client and `remove_client` deletes the entry, so the last client
+    /// to detach used to take the session's only size with it and every tab made afterwards came
+    /// out 0x0 - which holds no panes. This is seeded from the size the session was started with
+    /// and then tracks the last real client, so a detached session lays out against the terminal it
+    /// last had rather than against nothing.
+    size_with_no_client: Size,
+    /// The terminal device each client is attached to, for the session's client list
+    client_ttys: HashMap<ClientId, String>,
+    /// What the server is currently telling every client about the session, carried to the bars
+    /// on `ModeInfo`
+    session_warnings: Vec<SessionWarning>,
     global_last_active_tab_id: usize,
     tab_history: BTreeMap<ClientId, Vec<usize>>,
     pane_history: BTreeMap<ClientId, Vec<PaneId>>,
@@ -2137,6 +2150,10 @@ pub(crate) struct Screen {
     session_rename_drafts: HashMap<ClientId, String>,
     style: Style,
     pane_frame_style: PaneFrameStyle,
+    /// Fork addition: the last frame style that was not `none`. `TogglePaneFrames` cycles
+    /// through upstream's three styles, which leaves no way back to `top_only`; this is how
+    /// a `top_only` user round-trips.
+    pane_frame_style_before_none: PaneFrameStyle,
     auto_layout: bool,
     session_serialization: bool,
     serialize_pane_viewport: bool,
@@ -2429,6 +2446,14 @@ mod typed_input_tests {
         assert!(!typed_input.output_answers_input(7, typed_at));
     }
 }
+/// What `go-to-tab-name` says when it has only a focus move left to do and nothing is attached.
+///
+/// Making the tab no longer needs a client - a detached session sizes one against itself - so
+/// `--create` is answered. Moving the focus is the half that cannot be done, because a detached
+/// session has no focused tab for the command to move.
+pub const NO_CLIENT_TO_MOVE_TO_A_TAB: &str =
+    "`go-to-tab-name` has no client to move: nothing is attached to this session.";
+
 
 impl Screen {
     /// Creates and returns a new [`Screen`].
@@ -2491,6 +2516,9 @@ impl Screen {
             pixel_dimensions: Default::default(),
             character_cell_size: Rc::new(RefCell::new(None)),
             stacked_resize: Rc::new(RefCell::new(stacked_resize)),
+            default_floating_size: Rc::new(RefCell::new(default_floating_size)),
+            input_while_scrolled: Rc::new(RefCell::new(input_while_scrolled)),
+            command_pane_on_clean_exit: Rc::new(RefCell::new(command_pane_on_clean_exit)),
             stacked_pane_list: Rc::new(RefCell::new(stacked_pane_list)),
             stacked_pane_list_orientation,
             sixel_image_store: Rc::new(RefCell::new(SixelImageStore::default())),
@@ -2509,9 +2537,13 @@ impl Screen {
             recently_disconnected_clients: VecDeque::new(),
             active_tab_ids: BTreeMap::new(),
             client_sizes: HashMap::new(),
+            size_with_no_client: client_attributes.size,
+            client_ttys: HashMap::new(),
+            session_warnings: vec![],
             global_last_active_tab_id: 0,
             tabs: BTreeMap::new(),
             last_single_pane_tab_names: HashMap::new(),
+            last_reported_focus: HashMap::new(),
             terminal_emulator_colors: Rc::new(RefCell::new(Palette::default())),
             terminal_emulator_color_codes: Rc::new(RefCell::new(HashMap::new())),
             tab_history: BTreeMap::new(),
@@ -2534,6 +2566,7 @@ impl Screen {
             session_rename_drafts: HashMap::new(),
             default_mode_info: mode_info,
             pane_frame_style,
+            pane_frame_style_before_none: pane_frame_style,
             auto_layout,
             session_is_mirrored,
             copy_options,
@@ -3213,6 +3246,24 @@ impl Screen {
             })
             .or_else(|| self.client_sizes.values().next().copied())
             .unwrap_or_default()
+        // fork addition: remember it for when this client goes. A zero size is not a terminal
+        // anyone is looking at, and adopting one would put the session back where it started
+        if size.rows > 0 && size.cols > 0 {
+            self.size_with_no_client = size;
+        }
+    }
+
+    fn size_for_client(&self, client_id: Option<ClientId>) -> Size {
+        client_id
+            .and_then(|client_id| self.client_sizes.get(&client_id).copied())
+            .or_else(|| {
+                self.get_first_client_id()
+                    .and_then(|client_id| self.client_sizes.get(&client_id).copied())
+            })
+            .or_else(|| self.client_sizes.values().next().copied())
+            // fork addition: nobody is attached, so fall back to the size the session last had
+            // rather than to `Size::default()`, which is 0x0 and holds no panes
+            .unwrap_or(self.size_with_no_client)
     }
 
     fn size_of_tab_of_client(&self, client_id: ClientId) -> Size {
@@ -8788,6 +8839,14 @@ impl Screen {
         if !self.scroll_mode_sync {
             return Ok(());
         }
+        // fork addition: `input_while_scrolled` decides whether the implicit sync runs at
+        // all. Guarding here disables every call site at once, because both
+        // sync_scroll_mode_if_scroll_changed and sync_scroll_mode_for_pane_id funnel through
+        // this function. An explicit SwitchToMode "Scroll" goes through change_mode and is
+        // untouched by the option.
+        if !self.implicit_scroll_mode_sync_enabled() {
+            return Ok(());
+        }
         // base_mode is the default config reloads keep current; .mode is the fallback.
         let default_mode = self
             .default_mode_info
@@ -8815,6 +8874,12 @@ impl Screen {
             .senders
             .send_to_server(ServerInstruction::ChangeMode(client_id, new_mode, None))
             .with_context(|| format!("failed to sync scroll mode on focus for client {client_id}"))
+    }
+    // fork addition: true only under `input_while_scrolled "scroll-mode"`, the upstream
+    // behaviour. `jump` and `stay` both mean "no implicit mode switch"; they differ only in
+    // what a keypress does to the viewport, which Tab decides.
+    fn implicit_scroll_mode_sync_enabled(&self) -> bool {
+        *self.input_while_scrolled.borrow() == InputWhileScrolled::ScrollMode
     }
     fn active_pane_is_scrolled(&self, client_id: ClientId) -> bool {
         self.get_active_tab(client_id)
@@ -13526,6 +13591,7 @@ pub(crate) fn screen_thread_main(
                 tab_name,
                 default_shell,
                 create,
+                no_focus,
                 client_id,
                 mut completion_tx,
             ) => {
@@ -13533,6 +13599,7 @@ pub(crate) fn screen_thread_main(
                     screen.default_layout.swap_tiled_layouts.clone(),
                     screen.default_layout.swap_floating_layouts.clone(),
                 );
+                let asking_client_id = client_id;
                 let client_id = match client_id {
                     None => None,
                     Some(client_id) if screen.active_tab_ids.contains_key(&client_id) => {
@@ -13540,6 +13607,62 @@ pub(crate) fn screen_thread_main(
                     },
                     Some(_) => screen.active_tab_ids.keys().next().copied(),
                 };
+                // fork addition: with nobody attached, the two halves of this command part company.
+                // `--create` no longer needs a client - a tab is sized against the session now -
+                // and the focus move has nothing to move, because a detached session has no focused
+                // tab at all. So the create is done and the vacuous focus move is passed over; a
+                // bare `go-to-tab-name`, which is only a focus move, has nothing left to do and
+                // says so
+                if client_id.is_none() {
+                    let existing_tab_id = screen
+                        .tabs
+                        .values()
+                        .find(|t| t.name == tab_name)
+                        .map(|t| t.id);
+                    match (existing_tab_id, create) {
+                        (Some(existing_tab_id), _) => {
+                            completion_tx
+                                .as_mut()
+                                .map(|c| c.set_affected_tab_id(existing_tab_id));
+                            if !create && !no_focus {
+                                if let Some(c) = completion_tx.as_mut() {
+                                    c.set_error_message(NO_CLIENT_TO_MOVE_TO_A_TAB.to_owned());
+                                }
+                            }
+                        },
+                        (None, true) => {
+                            let tab_index = screen.get_new_tab_id();
+                            screen.new_tab(tab_index, swap_layouts, Some(tab_name), None)?;
+                            screen
+                                .bus
+                                .senders
+                                .send_to_plugin(PluginInstruction::NewTab(
+                                    None,
+                                    default_shell,
+                                    None,
+                                    vec![],
+                                    tab_index,
+                                    None,  // initial_panes
+                                    false, // block_on_first_terminal
+                                    false, // nothing is attached, so no focus to change
+                                    // whoever asked, attached or not: `route.rs` always names a
+                                    // client, and the layout applier needs an id to place under
+                                    (asking_client_id.unwrap_or_default(), false),
+                                    completion_tx,
+                                ))?;
+                            continue; // so we don't get to the completion signalling below
+                        },
+                        (None, false) => {
+                            if let Some(c) = completion_tx.as_mut() {
+                                // `--no-focus` is the probe form and answers with an empty stdout
+                                // either way, so only the moving form reports a miss
+                                if !no_focus {
+                                    c.set_error_message(NO_CLIENT_TO_MOVE_TO_A_TAB.to_owned());
+                                }
+                            }
+                        },
+                    }
+                }
                 if let Some(client_id) = client_id {
                     let is_web_client = screen
                         .connected_clients
@@ -13547,26 +13670,52 @@ pub(crate) fn screen_thread_main(
                         .get(&client_id)
                         .copied()
                         .unwrap_or(false);
-                    if let Ok(tab_exists) = screen.go_to_tab_name(tab_name.clone(), client_id) {
+                    // `no_focus` asks only whether the tab is there, so the existence check and
+                    // the focus switch are two calls rather than one
+                    let from = screen.tab_summary_for_client(client_id);
+                    let tab_lookup = if no_focus {
+                        Ok(screen.tabs.values().any(|t| t.name == tab_name))
+                    } else {
+                        screen.go_to_tab_name(tab_name.clone(), client_id)
+                    };
+                    if let Ok(tab_exists) = tab_lookup {
                         screen.render(None)?;
                         if tab_exists {
-                            // Tab already exists - find its ID and set in completion
-                            if let Some(existing_tab) =
-                                screen.tabs.values().find(|t| t.name == tab_name)
-                            {
-                                completion_tx
-                                    .as_mut()
-                                    .map(|c| c.set_affected_tab_id(existing_tab.id));
+                            if no_focus {
+                                // the probe: nothing moved, so the answer is the tab's id and
+                                // nothing about focus
+                                if let Some(existing_tab) =
+                                    screen.tabs.values().find(|t| t.name == tab_name)
+                                {
+                                    completion_tx
+                                        .as_mut()
+                                        .map(|c| c.set_affected_tab_id(existing_tab.id));
+                                }
+                            } else {
+                                let to = screen.tab_summary_for_client(client_id);
+                                report_focus_switch(completion_tx.as_mut(), from, to);
+                            }
+                        } else if !create && !no_focus {
+                            // asked to go somewhere that is not there: a miss, which the probe
+                            // form (`--no-focus`) deliberately does not make - it answers with an
+                            // empty stdout and exit 0 either way
+                            if let Some(c) = completion_tx.as_mut() {
+                                c.set_error_message(format!("No tab named '{}'", tab_name));
                             }
                         }
                         if create && !tab_exists {
                             let tab_index = screen.get_new_tab_id();
-                            let should_change_focus_to_new_tab = true;
+                            let should_change_focus_to_new_tab = !no_focus;
+                            let client_id_for_new_tab = if should_change_focus_to_new_tab {
+                                Some(client_id)
+                            } else {
+                                None
+                            };
                             screen.new_tab(
                                 tab_index,
                                 swap_layouts,
                                 Some(tab_name),
-                                Some(client_id),
+                                client_id_for_new_tab,
                             )?;
                             screen
                                 .bus
