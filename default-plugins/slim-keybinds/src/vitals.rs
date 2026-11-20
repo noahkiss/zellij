@@ -10,8 +10,11 @@
 //!   finds none of these tools and the probe silently returns nothing — no error, just no vitals.
 //! - **BSD and GNU userland differ.** `pgrep` has no `-c` on BSD; `df` column positions differ
 //!   unless you ask for POSIX output.
-//! - **macOS `top -l 2`'s FIRST sample is a since-boot average**, so the second one is the only
-//!   usable reading. That costs ~1s, which is fine for an async probe on a 10s cadence.
+//! - **A CPU reading needs two samples, and the first of a pair is a since-boot average.** Both
+//!   platforms take the pair inside one probe, a second apart: macOS with `iostat -c 2 -w 1`, Linux
+//!   with two reads of `/proc/stat`. That costs ~1s, which is fine for an async probe on a 10s
+//!   cadence. macOS used `top -l 2`, which walks every process twice: about 0.4 s of CPU per probe,
+//!   against none for `iostat`.
 //!
 //! Two divergences from claude-bar, both deliberate — see the notes on `probe_command` and
 //! `parse` below.
@@ -152,7 +155,7 @@ pub fn guarded(body: &str, window_s: u32) -> String {
 fn probe_body() -> String {
     "case \"$(uname)\" in \
        Darwin) \
-         echo \"CPUMAC $(top -l 2 -n 0 -s 1 | grep 'CPU usage' | tail -1)\"; \
+         echo \"CPUIO $(iostat -n 0 -c 2 -w 1 | tail -1)\"; \
          echo \"MEMTOTAL $(sysctl -n hw.memsize)\"; \
          vm_stat; \
          echo \"BAT $(pmset -g batt | grep -Eo '[0-9]+%' | head -1)\"; \
@@ -339,8 +342,7 @@ impl Vitals {
                 // shell spawns read as 100%. Nothing is carried between ticks now, so every
                 // instance measures the same kind of interval and they agree.
                 //
-                // This is what the macOS branch above always did (`top -l 2 -s 1`, take the
-                // second) — the two platforms now work the same way.
+                // The macOS branch below does the same: `iostat -c 2 -w 1`, the second line.
                 if let (Some((pb, pt)), Some((busy, total))) =
                     (cpu_first, parse_proc_stat_cpu(rest))
                 {
@@ -349,17 +351,14 @@ impl Vitals {
                         self.cpu_pct = Some((db as f64 * 100.0 / dt as f64).round() as u8);
                     }
                 }
-            } else if let Some(rest) = line.strip_prefix("CPUMAC ") {
-                // macOS: "CPU usage: 4.16% user, 8.33% sys, 87.50% idle" — from the SECOND
-                // `top` sample; the first is a since-boot average and is useless here.
-                if let Some(idle) = rest.split(',').find_map(|p| {
-                    p.trim()
-                        .strip_suffix("idle")?
-                        .trim()
-                        .strip_suffix('%')?
-                        .parse::<f64>()
-                        .ok()
-                }) {
+            } else if let Some(rest) = line.strip_prefix("CPUIO ") {
+                // macOS: the SECOND line of `iostat -n 0 -c 2 -w 1`, "us sy id 1m 5m 15m", e.g.
+                // "29 12 59  2.47 1.98 1.61". The first line is a since-boot average.
+                if let Some(idle) = rest
+                    .split_whitespace()
+                    .nth(2)
+                    .and_then(|v| v.parse::<f64>().ok())
+                {
                     self.cpu_pct = Some((100.0 - idle).clamp(0.0, 100.0).round() as u8);
                 }
             } else if let Some(v) = line.strip_prefix("MemTotal:") {
@@ -502,6 +501,16 @@ impl Vitals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_macos_cpu_reading_is_the_busy_share_of_the_second_iostat_line() {
+        let mut vitals = Vitals::default();
+        assert!(vitals.parse(b"CPUIO  29 12 59  24.74 9.82 6.47\n"));
+        assert_eq!(vitals.cpu_pct, Some(41));
+        // a missing or short line keeps the last reading
+        assert!(!vitals.parse(b"CPUIO \n"));
+        assert_eq!(vitals.cpu_pct, Some(41));
+    }
 
     #[test]
     fn a_probe_in_flight_skips_the_tick() {
