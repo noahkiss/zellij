@@ -1033,6 +1033,62 @@ fn remove_session_info_folder(
     Ok(())
 }
 
+/// One session as `zellij ls --json` reports it.
+///
+/// The first four fields are what the human listing shows. The rest come from the session's own
+/// `session-metadata.kdl`, which the server already writes and `ls` never read: they are absent for
+/// a dead session, which has no metadata to read, and for a live session whose metadata this scan
+/// could not parse.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionListEntry {
+    pub name: String,
+    /// Age of the session's socket, in seconds. The human listing formats this same number.
+    pub created_seconds_ago: u64,
+    /// True for the session this command was run from.
+    pub is_current: bool,
+    /// True for a resurrectable session - one with a saved layout and no server.
+    pub is_dead: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_clients: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_client_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_clients_allowed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_count: Option<usize>,
+    /// The executable the session's server is actually running, read out of the OS by pid.
+    ///
+    /// Absent for a dead session, which has no server, and for a live one whose pid the platform
+    /// will not answer about or which has two servers for its name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_exe: Option<String>,
+    /// The build identity of that executable, hex: the Mach-O `LC_UUID` on macOS, the GNU build-id
+    /// on Linux. **This, and not the path, is what says which BUILD a session is on** - a pinned
+    /// copy and the binary it was copied from are two files holding one program, and they agree
+    /// here and nowhere else. Absent when the toolchain stamped none, or the file could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_build_id: Option<String>,
+    /// Whether that build is the one running this command: `same`, `different`, or `unknown`.
+    ///
+    /// `unknown` is a real answer and not a failure - see `compare_builds`, which reports it rather
+    /// than guess, because a wrong "different" sends someone to restart a session that was fine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_build: Option<String>,
+    /// The file the server started from is no longer at its path: an upgrade wrote over it in
+    /// place. Linux says so through `/proc/<pid>/exe`; every platform says so when the file at
+    /// that path was modified after the session's socket was bound. The field is there only when
+    /// the answer is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_exe_replaced: Option<bool>,
+    /// The version the session's server is running: what its `zellij --version` prints after
+    /// "zellij ". Absent for a dead session, and whenever it is not known - see
+    /// `server_identity_fields` for the two ways it is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
+}
+
 /// What `ls --json` reports about the binary behind one live session.
 ///
 /// **Nothing here crosses a contract.** The answer is read from the OS by pid, on the side that
@@ -1167,6 +1223,15 @@ pub fn remove_own_server_version_stamp(session_name: &str) {
     if ours {
         let _ = fs::remove_file(&stamp);
     }
+}
+
+#[derive(Default)]
+struct ServerIdentityFields {
+    server_exe: Option<String>,
+    server_build_id: Option<String>,
+    server_build: Option<String>,
+    server_exe_replaced: Option<bool>,
+    server_version: Option<String>,
 }
 
 /// Build the `ls --json` listing from the session names and the metadata each live session wrote.

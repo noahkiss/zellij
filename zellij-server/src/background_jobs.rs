@@ -506,6 +506,23 @@ pub(crate) fn background_jobs_main(
     }
 
     let session_metadata_writer_stopped = Arc::new(Mutex::new(false));
+    {
+        // The two facts the session warnings report can both change under a running server: an FDA
+        // toggle takes effect immediately, and an upgrade can replace the binary this server was
+        // started from at any time. Asked on a slow timer rather than per frame - one file open
+        // and, at most, one executable header read.
+        let senders = bus.senders.clone();
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                SESSION_WARNINGS_INTERVAL_MS,
+            ));
+            loop {
+                ticker.tick().await;
+                let _ = senders.send_to_screen(ScreenInstruction::RecheckSessionWarnings);
+            }
+        });
+    }
+
     if !disable_session_metadata {
         let current_session_name = current_session_name.clone();
         let current_session_info = current_session_info.clone();

@@ -703,6 +703,14 @@ pub enum ScreenInstruction {
         Option<usize>,       // tab position to focus
         Option<(u32, bool)>, // (pane_id, is_plugin) => pane_id to focus
     ),
+    /// The terminal device a client is attached to, as the client reported it at startup.
+    ///
+    /// Its own instruction because the two ways a client arrives - creating the session and
+    /// attaching to one - reach `Screen` through different messages, and the tty is equally true
+    /// of both. `None` is a client with no controlling terminal.
+    SetClientTty(ClientId, Option<String>),
+    /// Re-ask the session-wide warning questions - both can change under a running server.
+    RecheckSessionWarnings,
     RemoveClient(ClientId),
     UpdateSearch(Vec<u8>, ClientId, Option<NotificationEnd>),
     SearchDown(ClientId, Option<NotificationEnd>),
@@ -1470,6 +1478,8 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::Copy(..) => ScreenContext::Copy,
             ScreenInstruction::ToggleTab(..) => ScreenContext::ToggleTab,
             ScreenInstruction::AddClient(..) => ScreenContext::AddClient,
+            ScreenInstruction::SetClientTty(..) => ScreenContext::SetClientTty,
+            ScreenInstruction::RecheckSessionWarnings => ScreenContext::RecheckSessionWarnings,
             ScreenInstruction::RemoveClient(..) => ScreenContext::RemoveClient,
             ScreenInstruction::UpdateSearch(..) => ScreenContext::UpdateSearch,
             ScreenInstruction::SearchDown(..) => ScreenContext::SearchDown,
@@ -2234,12 +2244,28 @@ pub(crate) struct Screen {
     web_server_ip: IpAddr,
     web_server_port: u16,
     render_blocker: RenderBlocker,
+    /// The tab list as the plugins in EVERY tab last saw it: (id, position, name) per tab.
+    ///
+    /// A `TabUpdate` normally reaches only the active tab's plugins (upstream #4918 - the frequent
+    /// case is a tab switch, and updating every tab's plugins on each one was a measured
+    /// regression). That leaves every other tab's tab-bar holding a stale list, which is drawn for
+    /// one frame when the user arrives there. Comparing against this tells the rare case - the tab
+    /// list actually changed - from the frequent one, so only the rare case pays for the broadcast.
+    last_reported_tab_structure: Option<Vec<(usize, usize, String)>>,
     watcher_clients: HashMap<ClientId, WatcherState>,
     followed_client_id: Option<ClientId>,
     watcher_followed_content: Option<(ClientId, Option<Size>)>,
     cached_layouts: Vec<LayoutInfo>,
     cached_layout_errors: Vec<LayoutWithError>,
     pane_render_subscribers: HashMap<ClientId, PaneRenderSubscription>,
+    /// fork addition: `zellij action watch`, one stream per subscribed client.
+    session_event_streams: HashMap<ClientId, EventStream>,
+    /// New for every server, on every line of every stream.
+    session_event_epoch: String,
+    /// When the streams last looked at the session, for the render path's rate limit.
+    session_event_last_look: Option<Instant>,
+    /// Cleared to stop the tick thread once the last stream is gone.
+    session_event_ticker: Option<Arc<AtomicBool>>,
     background_plugin_subscriptions: HashMap<(PluginId, ClientId), HashSet<EventType>>,
     last_reported_plugin_tab_indices: HashMap<PluginId, usize>,
     pub(crate) pending_session_card: Option<ClientId>,
@@ -3378,6 +3404,13 @@ impl Screen {
         for tab in self.tabs.values_mut() {
             let _ = tab.update_input_modes();
         }
+    }
+
+    pub fn set_client_tty(&mut self, client_id: ClientId, tty: Option<String>) {
+        match tty {
+            Some(tty) => self.client_ttys.insert(client_id, tty),
+            None => self.client_ttys.remove(&client_id),
+        };
     }
 
     fn size_for_client(&self, client_id: Option<ClientId>) -> Size {
@@ -7590,6 +7623,22 @@ impl Screen {
             };
             tab_infos_for_screen_state.insert(tab.position, tab_info_for_screen);
         }
+        // the tab list itself changed - so every tab's plugins need to hear it, not just the
+        // active one's, or the tabs the user is not looking at keep drawing the old list until
+        // they are visited (and then visibly correct themselves)
+        let tab_structure = self.tab_structure();
+        let tab_structure_changed = self
+            .last_reported_tab_structure
+            .as_ref()
+            .map(|last| last != &tab_structure)
+            .unwrap_or(true);
+        // a report aimed at one plugin reaches no other, so it must not use up a structure change
+        // the rest have not heard yet
+        if self.state_report_target.is_none() {
+            self.last_reported_tab_structure = Some(tab_structure);
+        }
+
+        let mut tab_updates_by_client: HashMap<ClientId, Vec<TabInfo>> = HashMap::new();
         for (client_id, active_tab_index) in self.active_tab_ids.iter() {
             let mut plugin_tab_updates = vec![];
             for tab in self.tabs.values() {
@@ -11020,6 +11069,29 @@ impl Screen {
         if tab_index.is_none() {
             session_layout_metadata.set_session_attention_muted(self.attention.session_is_muted());
         }
+        // the client list is built in the plugin thread, which cannot see these sizes otherwise
+        session_layout_metadata.set_client_sizes(
+            self.client_sizes
+                .iter()
+                .map(|(client_id, size)| (*client_id, *size))
+                .collect(),
+        );
+        // and which rootshell tab each one came from, for list-clients --json
+        session_layout_metadata.set_client_rootshell_panes(
+            self.client_host_terminal_env
+                .iter()
+                .filter_map(|(client_id, env)| {
+                    crate::session_layout_metadata::rootshell_pane_of(env)
+                        .map(|pane| (*client_id, pane))
+                })
+                .collect(),
+        );
+        session_layout_metadata.set_client_ttys(
+            self.client_ttys
+                .iter()
+                .map(|(client_id, tty)| (*client_id, tty.clone()))
+                .collect(),
+        );
         let first_client_id = self.get_first_client_id();
         let active_tab_index =
             first_client_id.and_then(|client_id| self.active_tab_ids.get(&client_id));
@@ -14777,6 +14849,12 @@ pub(crate) fn screen_thread_main(
                 screen.toggle_tab(client_id)?;
                 screen.render(None)?;
             },
+            ScreenInstruction::SetClientTty(client_id, tty) => {
+                screen.set_client_tty(client_id, tty);
+            },
+            ScreenInstruction::RecheckSessionWarnings => {
+                screen.recheck_session_warnings();
+            },
             ScreenInstruction::AddClient(
                 client_id,
                 is_web_client,
@@ -15273,9 +15351,12 @@ pub(crate) fn screen_thread_main(
                 drop(completion_tx); // action ends here, notify the action initiator
             },
             ScreenInstruction::QueryTabNames(client_id, completion_tx) => {
-                let tab_names = screen
-                    .get_tabs_mut()
-                    .values()
+                // in the order the tab bar draws them: the map is keyed by stable id, which stops
+                // matching the display order the moment a tab is moved
+                let mut tabs: Vec<_> = screen.get_tabs_mut().values().collect();
+                tabs.sort_by_key(|tab| tab.position);
+                let tab_names = tabs
+                    .iter()
                     .map(|tab| tab.name.clone())
                     .collect::<Vec<String>>();
                 screen.bus.senders.send_to_server(ServerInstruction::Log(

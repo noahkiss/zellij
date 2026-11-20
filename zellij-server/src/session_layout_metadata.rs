@@ -105,44 +105,88 @@ impl SessionLayoutMetadata {
             }
         }
     }
-    pub fn list_clients_metadata(&self) -> String {
-        let mut clients_metadata: BTreeMap<ClientId, ClientMetadata> = BTreeMap::new();
-        for tab in &self.tabs {
-            let panes = if tab.hide_floating_panes {
-                &tab.tiled_panes
-            } else {
-                &tab.floating_panes
-            };
-            for pane in panes {
-                for focused_client in &pane.focused_clients {
-                    clients_metadata.insert(
-                        *focused_client,
-                        ClientMetadata {
-                            pane_id: pane.id.clone(),
-                            command: pane.run.clone(),
-                        },
-                    );
-                }
-            }
-        }
-
-        ClientMetadata::render_many(clients_metadata, &self.default_editor)
+    /// The client table. `requesting_client_id` is the client the `CURRENT` column marks - a
+    /// `zellij action` client is its own short-lived client, so a CLI query marks no row.
+    pub fn list_clients_metadata(&self, requesting_client_id: ClientId) -> String {
+        ClientMetadata::render_many(
+            self.all_clients_metadata(),
+            &self.default_editor,
+            requesting_client_id,
+        )
     }
+    /// The same client list as `list_clients_metadata`, as the `ClientInfo` array plugins already
+    /// receive in `Event::ListClients`.
+    ///
+    /// `requesting_client_id` marks `is_current_client`. A `zellij action` client is its own
+    /// short-lived client that is focused on no pane, so a CLI query marks no row.
+    ///
+    /// Each row is a [`ClientListEntry`]: the `ClientInfo` keys, flattened, and `rootshell_pane`
+    /// where the client had one.
+    pub fn list_clients_metadata_json(&self, requesting_client_id: ClientId) -> String {
+        let clients: Vec<ClientListEntry> = self
+            .client_infos(requesting_client_id)
+            .into_iter()
+            .map(|client| ClientListEntry {
+                rootshell_pane: self.client_rootshell_panes.get(&client.client_id).cloned(),
+                client,
+            })
+            .collect();
+        serde_json::to_string_pretty(&clients).unwrap_or_else(|_| "[]".to_string())
+    }
+    /// Every client this layout knows about, in the shape `Event::ListClients` uses.
+    pub fn client_infos(&self, requesting_client_id: ClientId) -> Vec<ClientInfo> {
+        self.all_clients_metadata()
+            .into_iter()
+            .map(|(client_id, client_metadata)| {
+                ClientInfo::new(
+                    client_id,
+                    client_metadata.get_pane_id().into(),
+                    client_metadata.stringify_command(&self.default_editor),
+                    client_id == requesting_client_id,
+                )
+                .with_terminal_size(client_metadata.terminal_size())
+                .with_tty(client_metadata.tty())
+            })
+            .collect()
+    }
+    /// Record the terminal size of every attached client, keyed by client id.
+    pub fn set_client_sizes(&mut self, client_sizes: BTreeMap<ClientId, Size>) {
+        self.client_sizes = client_sizes;
+    }
+    pub fn set_client_ttys(&mut self, client_ttys: BTreeMap<ClientId, String>) {
+        self.client_ttys = client_ttys;
+    }
+    pub fn set_client_rootshell_panes(
+        &mut self,
+        client_rootshell_panes: BTreeMap<ClientId, String>,
+    ) {
+        self.client_rootshell_panes = client_rootshell_panes;
+    }
+    /// Every client this layout knows about, and the pane each one is focused on.
+    ///
+    /// Both pane layers are read, not just the one on screen: floating panes are visible per tab
+    /// while focus is per client, so a client focused on a tiled pane in a tab where someone else
+    /// has floating panes up is a client with no row at all if only one layer is read. The layer
+    /// that is off screen goes in first, so a client that appears in both - its focus in the
+    /// hidden layer being only a memory of where it will return - is described by the layer it is
+    /// actually looking at.
     pub fn all_clients_metadata(&self) -> BTreeMap<ClientId, ClientMetadata> {
         let mut clients_metadata: BTreeMap<ClientId, ClientMetadata> = BTreeMap::new();
         for tab in &self.tabs {
-            let panes = if tab.hide_floating_panes {
-                &tab.tiled_panes
+            let (hidden_panes, visible_panes) = if tab.hide_floating_panes {
+                (&tab.floating_panes, &tab.tiled_panes)
             } else {
-                &tab.floating_panes
+                (&tab.tiled_panes, &tab.floating_panes)
             };
-            for pane in panes {
+            for pane in hidden_panes.iter().chain(visible_panes.iter()) {
                 for focused_client in &pane.focused_clients {
                     clients_metadata.insert(
                         *focused_client,
                         ClientMetadata {
                             pane_id: pane.id.clone(),
                             command: pane.run.clone(),
+                            terminal_size: self.client_sizes.get(focused_client).copied(),
+                            tty: self.client_ttys.get(focused_client).cloned(),
                         },
                     );
                 }
@@ -169,6 +213,51 @@ impl SessionLayoutMetadata {
                         .any(|p| p.attention_muted || p.ignore_output)
             })
     }
+    /// A digest of everything this metadata contributes to the serialized layout.
+    ///
+    /// `is_dirty` answers a different question - whether the session has diverged from the layout
+    /// that built it - and a session can be clean and still have changed. Renaming a pane changes
+    /// no pane count, no tab and no command, so a clean session that renames a pane is dirty by
+    /// nothing and its resurrection cache keeps the old name for as long as the session stays
+    /// clean. Every serialized attribute has that shape: cwd, geometry, pinning, borderlessness,
+    /// focus, uuid, handle, colours, viewport contents.
+    ///
+    /// So the caller compares this digest against the one at the last write instead of asking
+    /// whether the session diverges from its layout. It is computed from the metadata the
+    /// serialization tick has already gathered - no serialization, no extra work in the panes.
+    ///
+    /// What goes in is exactly what reaches `GlobalLayoutManifest`, and both structs are
+    /// destructured field by field so that a field added later fails to compile until someone
+    /// decides which side of this it belongs on.
+    ///
+    /// Two fields are deliberately left out:
+    /// - `default_layout`: `Screen` hands the same layout to every tick, so it cannot change
+    ///   between two of them. Hashing its template and both swap-layout lists every tick would
+    ///   cost more than the whole rest of the digest.
+    /// - `default_editor`: it is not serialized. What it decides - whether a pane's command is
+    ///   rewritten into `Run::EditFile` - is already in that pane's `run`.
+    pub fn serialization_fingerprint(&self) -> u64 {
+        let SessionLayoutMetadata {
+            default_layout: _,
+            global_cwd,
+            default_shell,
+            default_editor: _,
+            tabs,
+            client_sizes: _,
+            client_ttys: _,
+            client_rootshell_panes: _,
+            session_attention_muted,
+        } = self;
+        let mut hasher = DefaultHasher::new();
+        session_attention_muted.hash(&mut hasher);
+        global_cwd.hash(&mut hasher);
+        default_shell.hash(&mut hasher);
+        tabs.len().hash(&mut hasher);
+        for tab in tabs {
+            tab.hash_serialized_fields(&mut hasher);
+        }
+        hasher.finish()
+    }
     pub fn is_dirty(&self) -> bool {
         if self.has_attention_flags()
             || self.tabs.iter().any(|tab| {
@@ -184,9 +273,14 @@ impl SessionLayoutMetadata {
         // 1. The current number of panes is different than the number of panes in the base layout
         //    (meaning a pane was opened or closed)
         // 2. One or more terminal panes are running a command that is not the default shell
+        // 3. The tabs no longer match the base layout's tabs - one was renamed, added, closed or
+        //    MOVED
         let base_layout_pane_count = self.default_layout.pane_count();
         let current_pane_count = self.pane_count();
         if current_pane_count != base_layout_pane_count {
+            return true;
+        }
+        if self.tabs_diverge_from_base_layout() {
             return true;
         }
         for tab in &self.tabs {
@@ -817,6 +911,30 @@ impl Into<TabLayoutManifest> for TabLayoutMetadata {
 }
 
 impl TabLayoutMetadata {
+    /// Every field of this tab that `TabLayoutManifest` carries into the serialized layout.
+    /// See `SessionLayoutMetadata::serialization_fingerprint`.
+    fn hash_serialized_fields(&self, hasher: &mut DefaultHasher) {
+        let TabLayoutMetadata {
+            name,
+            tiled_panes,
+            floating_panes,
+            is_focused,
+            hide_floating_panes,
+            attention_muted,
+        } = self;
+        name.hash(hasher);
+        is_focused.hash(hasher);
+        hide_floating_panes.hash(hasher);
+        attention_muted.hash(hasher);
+        tiled_panes.len().hash(hasher);
+        for pane in tiled_panes {
+            pane.hash_serialized_fields(hasher);
+        }
+        floating_panes.len().hash(hasher);
+        for pane in floating_panes {
+            pane.hash_serialized_fields(hasher);
+        }
+    }
     fn to_tab_metadata(&self) -> TabMetadata {
         let mut panes = Vec::new();
 
@@ -924,6 +1042,8 @@ impl PaneLayoutMetadata {
             border_style,
             attention_muted: false,
             ignore_output: false,
+            pane_uuid,
+            pane_handle,
         }
     }
     pub fn with_stack_orientation(
@@ -937,6 +1057,53 @@ impl PaneLayoutMetadata {
         self.attention_muted = attention_muted;
         self.ignore_output = ignore_output;
         self
+    }
+    /// Every field of this pane that `PaneLayoutManifest` carries into the serialized layout.
+    /// See `SessionLayoutMetadata::serialization_fingerprint`.
+    ///
+    /// The geometry is hashed through its `Debug` rendering rather than its `Hash`, on purpose:
+    /// `PaneGeom`'s `PartialEq` and `Hash` both ignore `is_pinned` (see `pane_size.rs`), and the
+    /// serialized layout writes `pinned`. Hashing the geometry as a geometry would therefore be
+    /// blind to the one attribute of it a user can toggle from the CLI.
+    ///
+    /// `focused_clients` is left out: it is not serialized. `is_focused`, which is derived from it
+    /// and is serialized, is included.
+    fn hash_serialized_fields(&self, hasher: &mut DefaultHasher) {
+        let PaneLayoutMetadata {
+            id,
+            geom,
+            run,
+            cwd,
+            is_borderless,
+            title,
+            is_focused,
+            pane_contents,
+            focused_clients: _,
+            default_fg,
+            default_bg,
+            border_style,
+            attention_muted,
+            ignore_output,
+            stack_orientation,
+            pane_uuid,
+            pane_handle,
+        } = self;
+        id.hash(hasher);
+        format!("{:?}", border_style).hash(hasher);
+        attention_muted.hash(hasher);
+        ignore_output.hash(hasher);
+        format!("{:?}", stack_orientation).hash(hasher);
+        format!("{:?}", geom).hash(hasher);
+        format!("{:?}", run).hash(hasher);
+        cwd.hash(hasher);
+        is_borderless.hash(hasher);
+        title.hash(hasher);
+        is_focused.hash(hasher);
+        pane_contents.hash(hasher);
+        default_fg.hash(hasher);
+        default_bg.hash(hasher);
+        pane_uuid.hash(hasher);
+        pane_handle.hash(hasher);
     }
     fn to_pane_metadata(&self) -> PaneMetadata {
         // Try to extract a meaningful name from the pane
@@ -1903,6 +2070,155 @@ mod tests {
         assert!(
             meta.is_dirty(),
             "and `is_dirty` now reaches the tab comparison to see it"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_session_keeps_its_fingerprint() {
+        let meta = session_matching_layout(&["one", "two"]);
+        assert_eq!(
+            meta.serialization_fingerprint(),
+            meta.serialization_fingerprint(),
+            "the fingerprint of a session that has not changed is the same fingerprint"
+        );
+        let identical = session_matching_layout(&["one", "two"]);
+        assert_eq!(
+            meta.serialization_fingerprint(),
+            identical.serialization_fingerprint(),
+            "and two ticks that gather the same session agree, or every tick would rewrite"
+        );
+    }
+
+    #[test]
+    fn every_serialized_pane_attribute_moves_the_fingerprint() {
+        // the regression this guards is F2: a session in the shape of its layout is CLEAN, so
+        // `is_dirty` is false for every one of these and the cache would never be rewritten. Each
+        // case asserts both halves - the session really is clean, and the fingerprint sees the
+        // change anyway.
+        let mutations: Vec<(&str, fn(&mut PaneLayoutMetadata))> = vec![
+            ("title", |pane| {
+                pane.title = Some("renamed-here".to_string())
+            }),
+            ("cwd", |pane| {
+                pane.cwd = Some(PathBuf::from("/somewhere/else"))
+            }),
+            ("geometry", |pane| pane.geom.x += 1),
+            ("pinning", |pane| pane.geom.is_pinned = !pane.geom.is_pinned),
+            ("borderlessness", |pane| {
+                pane.is_borderless = !pane.is_borderless
+            }),
+            ("focus", |pane| pane.is_focused = !pane.is_focused),
+            ("viewport contents", |pane| {
+                pane.pane_contents = Some("what the pane was showing".to_string())
+            }),
+            ("default foreground", |pane| {
+                pane.default_fg = Some("#ff0000".to_string())
+            }),
+            ("default background", |pane| {
+                pane.default_bg = Some("#00ff00".to_string())
+            }),
+            ("uuid", |pane| {
+                pane.pane_uuid = Some("a-brand-new-uuid".to_string())
+            }),
+            ("handle", |pane| {
+                pane.pane_handle = Some("a-brand-new-handle".to_string())
+            }),
+            ("run instruction", |pane| {
+                pane.run = Some(Run::Cwd(PathBuf::from("/somewhere/else")))
+            }),
+        ];
+        for (what, mutate) in mutations {
+            let mut meta = session_matching_layout(&["one", "two"]);
+            let before = meta.serialization_fingerprint();
+            mutate(&mut meta.tabs[0].tiled_panes[0]);
+            assert!(
+                !meta.is_dirty(),
+                "changing the {} leaves the session clean, which is exactly why `is_dirty` cannot \
+                 be what decides whether the cache is rewritten",
+                what
+            );
+            assert_ne!(
+                before,
+                meta.serialization_fingerprint(),
+                "the {} of a pane is serialized, so changing it has to change the fingerprint",
+                what
+            );
+        }
+    }
+
+    #[test]
+    fn every_serialized_tab_attribute_moves_the_fingerprint() {
+        let mutations: Vec<(&str, fn(&mut TabLayoutMetadata))> = vec![
+            ("focus", |tab| tab.is_focused = !tab.is_focused),
+            ("floating pane visibility", |tab| {
+                tab.hide_floating_panes = !tab.hide_floating_panes
+            }),
+        ];
+        for (what, mutate) in mutations {
+            let mut meta = session_matching_layout(&["one", "two"]);
+            let before = meta.serialization_fingerprint();
+            mutate(&mut meta.tabs[1]);
+            assert!(!meta.is_dirty(), "the {} leaves the session clean", what);
+            assert_ne!(
+                before,
+                meta.serialization_fingerprint(),
+                "the {} of a tab is serialized, so changing it has to change the fingerprint",
+                what
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_pane_between_the_two_layers_moves_the_fingerprint() {
+        // the pane count is the same on both sides of the move, and so is every command, so this
+        // is another change no `is_dirty` check can see
+        let mut meta = session_matching_layout(&["one"]);
+        let before = meta.serialization_fingerprint();
+        let pane = meta.tabs[0].tiled_panes.remove(0);
+        meta.tabs[0].floating_panes.push(pane);
+        assert!(!meta.is_dirty(), "the same panes, on the other layer");
+        assert_ne!(
+            before,
+            meta.serialization_fingerprint(),
+            "a pane that floats is serialized in the floating list, not the tiled one"
+        );
+    }
+
+    #[test]
+    fn the_global_cwd_moves_the_fingerprint() {
+        let mut meta = session_matching_layout(&["one"]);
+        let before = meta.serialization_fingerprint();
+        meta.global_cwd = Some(PathBuf::from("/somewhere/else"));
+        assert_ne!(
+            before,
+            meta.serialization_fingerprint(),
+            "the global cwd is written at the top of the serialized layout"
+        );
+    }
+
+    #[test]
+    fn what_is_not_serialized_leaves_the_fingerprint_alone() {
+        // the other half of the contract: a fingerprint that moves for something the layout does
+        // not carry puts the session back to rewriting its cache on every tick. Client bookkeeping
+        // is gathered by the same tick and serialized by nothing.
+        let mut meta = session_matching_layout(&["one"]);
+        let before = meta.serialization_fingerprint();
+        let mut client_sizes = BTreeMap::new();
+        client_sizes.insert(
+            1,
+            Size {
+                rows: 50,
+                cols: 200,
+            },
+        );
+        meta.set_client_sizes(client_sizes);
+        let mut client_ttys = BTreeMap::new();
+        client_ttys.insert(1, "/dev/pts/9".to_string());
+        meta.set_client_ttys(client_ttys);
+        assert_eq!(
+            before,
+            meta.serialization_fingerprint(),
+            "a client arriving changes nothing the resurrection cache holds"
         );
     }
 

@@ -8,6 +8,14 @@ mod os_input_output_windows;
 pub mod host_query;
 pub mod os_input_output;
 pub mod output;
+mod pane_handles;
+// fork addition: the integration harness asks for in-order pane handles, so a snapshot of a
+// rendered frame is the same on every run
+pub use pane_handles::SEQUENTIAL_HANDLES_VAR;
+pub mod panes;
+pub mod tab;
+pub mod vt_parser;
+
 pub mod agent_mail;
 pub mod attention;
 pub mod background_jobs;
@@ -1243,6 +1251,16 @@ impl SessionMetaData {
                 .take_base_mode_change(client_id, base_mode);
             if new_plugin_config.is_none() {
                 new_plugin_config = Some(new_config.plugins.clone());
+
+                // Two settings the server keeps as process globals, because their readers are
+                // nowhere near a config: the title format is read by a pane while it renders, and
+                // the snapshot settings are read on the way out, after the session data has gone.
+                // Everything else here travels to a client through `Reconfigure`; these two have no
+                // per-client home to travel in, so they are rewritten from the FIRST config of the
+                // change set and are the same for every client - which is what they already were,
+                // fixed at `FirstClientConnected` and unchanged for the life of the session.
+                set_snapshot_settings(SnapshotSettings::from_options(Some(&new_config.options)));
+                set_terminal_title_format(TerminalTitleFormat::from_options(&new_config.options));
             }
 
             self.default_shell = new_config.options.default_shell.as_ref().map(|shell| {
@@ -3440,12 +3458,30 @@ theme \"first\"
     }
 }
 
+/// The snapshot archive settings of the session running in this server.
+///
+/// First set when the first client connects and the config file has been read, set again on every
+/// live reload, and read again on the way out - long after the session data has been dropped, which
+/// is why it is a global rather than a field.
+///
+/// **A `RwLock` and not a `OnceLock`.** It was the latter, so an edited `snapshot_*` setting did
+/// nothing until the session was recreated, which is the one thing a person editing snapshot
+/// retention is least likely to want to do.
+static SNAPSHOT_SETTINGS: std::sync::RwLock<Option<SnapshotSettings>> =
+    std::sync::RwLock::new(None);
+
 pub(crate) fn snapshot_settings() -> SnapshotSettings {
     SNAPSHOT_SETTINGS
         .read()
         .ok()
         .and_then(|settings| settings.clone())
         .unwrap_or_else(SnapshotSettings::default)
+}
+
+fn set_snapshot_settings(settings: SnapshotSettings) {
+    if let Ok(mut slot) = SNAPSHOT_SETTINGS.write() {
+        *slot = Some(settings);
+    }
 }
 
 /// Archive any `session_info` folder left behind by a server that is no longer running.
@@ -4356,6 +4392,7 @@ pub fn start_server_impl(
 
                 let client_attributes = ClientAttributes {
                     size: cli_assets.terminal_window_size,
+                    tty: cli_assets.tty.clone(),
                     style: Style {
                         colors: config
                             .theme_config(runtime_config_options.theme.as_ref())
@@ -4432,6 +4469,17 @@ pub fn start_server_impl(
                     .send_to_screen(ScreenInstruction::RecomputeTabSize(
                         client_id,
                         client_attributes.size,
+                    ))
+                    .unwrap();
+                session_data
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .senders
+                    .send_to_screen(ScreenInstruction::SetClientTty(
+                        client_id,
+                        client_attributes.tty.clone(),
                     ))
                     .unwrap();
 
@@ -4634,6 +4682,7 @@ pub fn start_server_impl(
 
                 let client_attributes = ClientAttributes {
                     size: cli_assets.terminal_window_size,
+                    tty: cli_assets.tty.clone(),
                     style: Style {
                         colors: config
                             .theme_config(runtime_config_options.theme.as_ref())
@@ -4672,6 +4721,13 @@ pub fn start_server_impl(
                     .send_to_screen(ScreenInstruction::SetClientHostTerminalEnv(
                         client_id,
                         host_terminal_env,
+                    ))
+                    .unwrap();
+                session_data
+                    .senders
+                    .send_to_screen(ScreenInstruction::SetClientTty(
+                        client_id,
+                        client_attributes.tty.clone(),
                     ))
                     .unwrap();
                 session_data
@@ -6155,6 +6211,18 @@ fn init_session(
                 .clone()
                 .or_else(|| default_layout_dir());
             let background_plugins = config.background_plugins.clone();
+            let plugin_permissions = std::sync::Arc::new(config.plugin_permissions.clone());
+            // this fork watches loaded plugin .wasm files by default - it is the point of the fork
+            let plugin_watch = config_options.plugin_watch.unwrap_or(true);
+            // `pin_exe` is the config saying where the binary is kept; the session warnings are
+            // asked from Screen, whose constructor takes thirty arguments already, so they are
+            // recorded here, where the config is
+            let pinned_exe = configured_pinned_exe(config_options.session_service.as_ref());
+            crate::session_warnings::record_settings(crate::session_warnings::WarningSettings {
+                expect_full_disk_access: config_options.expect_full_disk_access.unwrap_or(false),
+                stale_build_notice: config_options.stale_build_notice.unwrap_or(true),
+                pinned_exe,
+            });
             let session_env_vars = session_env_vars.clone();
             move || {
                 plugin_thread_main(

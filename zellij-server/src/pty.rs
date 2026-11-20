@@ -276,6 +276,12 @@ impl From<&PtyInstruction> for PtyContext {
     }
 }
 
+/// Whether panes are checked for a coding agent when the configuration does not say.
+///
+/// On, because the check that decides whether to do any work at all is a string compare, and a
+/// session with no agent pane in it reads nothing.
+pub const DETECT_AGENTS_DEFAULT: bool = true;
+
 /// What a held pane keeps of the agent it ran, once its process has exited.
 ///
 /// The pid goes, because the OS may hand it to another process; the session the agent held does
@@ -1049,7 +1055,8 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
             PtyInstruction::LogLayoutToHd(mut session_layout_metadata) => {
                 let err_context = || format!("Failed to dump layout");
                 pty.populate_session_layout_metadata(&mut session_layout_metadata);
-                if session_layout_metadata.is_dirty() {
+                let fingerprint = session_layout_metadata.serialization_fingerprint();
+                if pty.should_serialize_layout(session_layout_metadata.is_dirty(), fingerprint) {
                     match session_serialization::serialize_session_layout(
                         session_layout_metadata.into(),
                     ) {
@@ -1231,6 +1238,9 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         pane_env: PaneEnv,
+        resurrect_command_hints: Option<ResurrectCommandHints>,
+        resurrect_commands: Option<ResurrectCommands>,
+        detect_agents: Option<bool>,
     ) -> Self {
         Pty {
             active_panes: HashMap::new(),
@@ -1243,6 +1253,20 @@ impl Pty {
             origin_pane_ids: HashMap::new(),
             post_command_discovery_hook,
             pane_env,
+            resurrect_command_hints,
+            resurrect_mode: resurrect_commands.unwrap_or(ResurrectCommands::All),
+            pending_prefills: Vec::new(),
+            detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
+            pane_frame_agent_name: false,
+            last_reported_pane_frame_agent_name: None,
+            terminal_agent_envs: HashMap::new(),
+            agent_env_probes: HashMap::new(),
+            agent_record_cache: HashMap::new(),
+            resume_misses: HashMap::new(),
+            osc_agent_sessions: HashMap::new(),
+            held_panes: HashMap::new(),
+            last_reported_detect_agents: None,
+            last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
             pane_activity_flags: HashMap::new(),
@@ -1252,7 +1276,34 @@ impl Pty {
             terminals_with_prompt_markers: HashSet::new(),
             terminals_with_shell_cwd: HashSet::new(),
             resurrect_commands: HashMap::new(),
+            command_terminal_ids: HashSet::new(),
+            pending_layout_serialization: true,
+            last_serialized_layout_fingerprint: None,
         }
+    }
+    /// Whether this serialization tick writes the resurrection cache.
+    ///
+    /// Three things make a tick write, and the third is the one that makes the cache trustworthy:
+    ///
+    /// 1. The session has diverged from the layout that built it (`is_dirty`).
+    /// 2. The tick before it had, even though this one has not: the session has returned to its
+    ///    base shape and the cache still holds the diverged one, so it has to be overwritten once.
+    /// 3. Anything that gets serialized has changed since the last write (`fingerprint`).
+    ///
+    /// Without (3) a session that is clean and stays clean never writes again, and every
+    /// serialized attribute `is_dirty` does not look at - a pane title, a cwd, geometry, pinning,
+    /// focus - is lost to the next resurrection. `is_dirty` cannot answer that question: it
+    /// compares the session against its base layout, and the cache is a copy of the session, not
+    /// of the layout.
+    ///
+    /// A clean, unchanging session still writes nothing, which is the whole point of (1) and (2):
+    /// its fingerprint is the one already on disk.
+    fn should_serialize_layout(&mut self, is_dirty: bool, fingerprint: u64) -> bool {
+        let fingerprint_changed = self.last_serialized_layout_fingerprint != Some(fingerprint);
+        let should_serialize = is_dirty || self.pending_layout_serialization || fingerprint_changed;
+        self.pending_layout_serialization = is_dirty;
+        self.last_serialized_layout_fingerprint = Some(fingerprint);
+        should_serialize
     }
     pub fn get_default_terminal(
         &self,
@@ -2826,6 +2877,18 @@ impl Pty {
         self.expire_osc_agent_sessions();
         self.refresh_agent_identities();
         self.report_pane_process_info();
+    }
+
+    /// The command this tick would report for a pane: its foreground process, or its shell.
+    ///
+    /// The one place that rule is written down, so agent detection and the report below cannot
+    /// disagree about what a pane is running.
+    fn reported_command_for(&self, terminal_id: u32) -> Option<&Vec<String>> {
+        self.terminal_foreground_cmds
+            .get(&terminal_id)
+            .filter(|cmd| !cmd.is_empty())
+            .or_else(|| self.terminal_cmds.get(&terminal_id))
+            .filter(|cmd| !cmd.is_empty())
     }
 
     fn refresh_cwds_and_commands(&mut self) {

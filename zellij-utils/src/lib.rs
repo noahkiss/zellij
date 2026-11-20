@@ -36,6 +36,18 @@ pub mod common_path;
 #[cfg(not(target_family = "wasm"))]
 pub mod downloader; // Requires tokio
 #[cfg(not(target_family = "wasm"))]
+// The following modules can't be used when targeting wasm
+#[cfg(not(target_family = "wasm"))]
+pub mod app_control;
+#[cfg(not(target_family = "wasm"))]
+pub mod channels; // Requires tokio
+#[cfg(not(target_family = "wasm"))]
+pub mod common_path;
+#[cfg(not(target_family = "wasm"))]
+pub mod downloader; // Requires tokio
+#[cfg(not(target_family = "wasm"))]
+pub mod event_stream;
+#[cfg(not(target_family = "wasm"))]
 pub mod ipc; // Requires interprocess
 #[cfg(not(target_family = "wasm"))]
 pub mod logging; // Requires log4rs
@@ -49,10 +61,20 @@ pub mod pipe_access;
 pub mod pipe_pairs;
 #[cfg(all(not(target_family = "wasm"), feature = "web_server_capability"))]
 pub mod remote_session_tokens;
+pub mod resurrect_command_hints;
+#[cfg(not(target_family = "wasm"))]
+pub mod session_doctor;
 #[cfg(not(target_family = "wasm"))]
 pub mod session_index;
 #[cfg(not(target_family = "wasm"))]
+pub mod session_lifecycle;
+#[cfg(not(target_family = "wasm"))]
 pub mod session_link;
+pub mod session_service;
+#[cfg(not(target_family = "wasm"))]
+pub mod session_signing;
+#[cfg(not(target_family = "wasm"))]
+pub mod session_snapshot;
 #[cfg(not(target_family = "wasm"))]
 pub mod sessions;
 #[cfg(all(not(target_family = "wasm"), feature = "web_server_capability"))]

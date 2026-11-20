@@ -2,17 +2,29 @@ pub mod commands;
 mod double_click;
 #[cfg(target_os = "macos")]
 mod macos_app;
+mod mcp;
+mod new_pane_default;
+mod pane_default;
+mod session_commands;
+mod session_doctor_command;
+#[cfg(target_os = "linux")]
+mod session_doctor_linux;
+#[cfg(target_os = "macos")]
+mod session_doctor_macos;
+mod session_doctor_probe;
 #[cfg(test)]
 mod tests;
 
 use zellij_utils::{
     cli::{CliAction, CliArgs, Command, Sessions, TerminalArgs},
+    cli_surface::parse_cli_args,
     consts::{create_config_and_cache_folders, VERSION},
     data::UnblockCondition,
     distribution::set_distribution,
     envs,
     input::config::Config,
     logging::*,
+    sessions::KillWait,
     setup::Setup,
     shared::web_server_base_url_from_config,
 };

@@ -1,6 +1,6 @@
 mod pinned_executor;
 mod pipes;
-mod plugin_loader;
+pub(crate) mod plugin_loader;
 mod plugin_map;
 mod plugin_worker;
 mod prompt_requests;
@@ -8,6 +8,7 @@ mod settings_entries;
 mod shared;
 mod wasm_bridge;
 mod watch_filesystem;
+mod watch_plugin_files;
 mod zellij_exports;
 use log::info;
 

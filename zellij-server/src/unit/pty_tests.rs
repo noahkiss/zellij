@@ -937,6 +937,10 @@ fn make_bare_pty() -> Pty {
     Pty::new(bus, false, None, None, Default::default(), None, None, None)
 }
 
+/// A fingerprint that stands for "nothing that gets serialized has changed", so that these tests
+/// exercise the dirty/latch arms of `should_serialize_layout` on their own.
+const UNCHANGED: u64 = 7;
+
 #[test]
 fn the_first_tick_writes_the_cache_even_though_the_session_is_clean() {
     // a session that never diverges from its layout would otherwise never write a resurrection
@@ -992,6 +996,40 @@ fn returning_to_the_base_shape_rewrites_the_cache_once() {
     assert!(
         !pty.should_serialize_layout(false, UNCHANGED),
         "and only once: the cache already matches"
+    );
+}
+
+#[test]
+fn a_clean_session_writes_the_cache_when_a_serialized_attribute_changes() {
+    // the regression this guards: a session that stays in the shape of its layout is never dirty,
+    // so before the fingerprint it wrote its cache once and then went silent forever - and a pane
+    // renamed after that point was lost to the next resurrection.
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false, UNCHANGED); // the first tick
+    assert!(
+        !pty.should_serialize_layout(false, UNCHANGED),
+        "still clean and still identical"
+    );
+    assert!(
+        pty.should_serialize_layout(false, UNCHANGED + 1),
+        "the session is clean, but something it serializes is not what is on disk"
+    );
+    assert!(
+        !pty.should_serialize_layout(false, UNCHANGED + 1),
+        "and only once: the cache now matches again"
+    );
+}
+
+#[test]
+fn a_serialized_attribute_that_changes_back_writes_both_times() {
+    // a fingerprint the cache has seen before is not the fingerprint the cache HOLDS: renaming a
+    // pane and renaming it back has to reach disk twice, or the cache keeps the middle name.
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false, UNCHANGED);
+    assert!(pty.should_serialize_layout(false, UNCHANGED + 1), "renamed");
+    assert!(
+        pty.should_serialize_layout(false, UNCHANGED),
+        "renamed back - the cache holds the middle name and has to be overwritten"
     );
 }
 

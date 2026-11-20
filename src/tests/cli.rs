@@ -680,6 +680,45 @@ fn session_up_restore_defaults_to_the_newest_snapshot() {
     }
 }
 
+/// The three switches doctor is driven by, and the shape of each one's default.
+///
+/// `--fix` and `--sign` are the defaults, so the flags that matter are their negations - which is
+/// why the command reads `no_fix` and `no_sign` rather than a pair of booleans that could disagree
+/// with each other.
+#[test]
+fn session_doctor_fixes_and_signs_unless_told_otherwise() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "work"]) {
+        SessionLifecycleCli::Doctor {
+            session_name,
+            dry_run,
+            no_fix,
+            no_sign,
+            exe,
+            ..
+        } => {
+            assert_eq!(session_name.as_deref(), Some("work"));
+            assert!(!dry_run);
+            assert!(!no_fix);
+            assert!(!no_sign);
+            assert_eq!(exe, None);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_doctor_takes_its_negations_and_the_short_dry_run() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "-n", "--no-sign"]) {
+        SessionLifecycleCli::Doctor {
+            dry_run, no_sign, ..
+        } => {
+            assert!(dry_run);
+            assert!(no_sign);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+}
+
 /// `enable` installs unless `--dry-run` or `-n` is typed.
 #[test]
 fn session_enable_installs_unless_told_to_dry_run() {
@@ -692,6 +731,19 @@ fn session_enable_installs_unless_told_to_dry_run() {
             SessionLifecycleCli::Enable { dry_run, .. } => assert!(dry_run),
             other => panic!("Expected `enable`, got {:?}", other),
         }
+    }
+}
+
+/// `--regranted` is off unless typed: it records a re-grant as made, which only a person can know.
+#[test]
+fn session_doctor_takes_regranted_and_defaults_to_not() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "work"]) {
+        SessionLifecycleCli::Doctor { regranted, .. } => assert!(!regranted),
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--fix", "--regranted"]) {
+        SessionLifecycleCli::Doctor { regranted, .. } => assert!(regranted),
+        other => panic!("Expected `doctor`, got {:?}", other),
     }
 }
 
@@ -716,6 +768,34 @@ fn session_restart_cannot_be_both_fresh_and_restored() {
         "abc123",
     ])
     .is_err());
+}
+
+/// The order the two halves of a switch are typed in decides it, which is what `overrides_with`
+/// buys and what a plain pair of booleans would not: with both spelled out, the last one wins in
+/// both directions, and neither flag can be silently ignored.
+#[test]
+fn the_last_of_fix_and_no_fix_wins_whichever_it_is() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--fix", "--no-fix"]) {
+        SessionLifecycleCli::Doctor { fix, no_fix, .. } => {
+            assert!(no_fix);
+            assert!(!fix);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--no-fix", "--fix"]) {
+        SessionLifecycleCli::Doctor { fix, no_fix, .. } => {
+            assert!(fix);
+            assert!(!no_fix);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--no-sign", "--sign"]) {
+        SessionLifecycleCli::Doctor { sign, no_sign, .. } => {
+            assert!(sign);
+            assert!(!no_sign);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
 }
 
 /// The session lifecycle verbs that cannot be undone each take `--yes`, and none of them assumes

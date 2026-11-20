@@ -360,6 +360,8 @@ pub enum ScreenContext {
     Copy,
     ToggleTab,
     AddClient,
+    SetClientTty,
+    RecheckSessionWarnings,
     RemoveClient,
     UpdateSearch,
     SearchDown,
