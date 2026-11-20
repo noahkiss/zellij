@@ -762,6 +762,59 @@ fn individual_messages_client(
             ..
         }
     );
+/// Asks the running session one question, on a connection opened for it and closed after it.
+///
+/// The CLI holds a string; only the server holds the panes and the tabs. So a question that has to
+/// be answered before the real action can be built is asked here, ahead of it, and what comes back
+/// is the report's own lines - `Ok(vec![])` when the command found nothing to report, which is how
+/// a probe says "not there".
+///
+/// `subject` is what the question was about, and appears in the message if the session does not
+/// answer. `Err` carries the server's own words wherever it had any.
+fn ask(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    action: Action,
+    subject: &str,
+) -> Result<Vec<String>, String> {
+    let zellij_ipc_pipe: PathBuf = {
+        let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+        fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
+        zellij_utils::shared::set_permissions(&sock_dir, 0o700).map_err(|e| e.to_string())?;
+        sock_dir.push(zellij_utils::sessions::session_id_for(session_name));
+        sock_dir
+    };
+    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
+    os_input
+        .connect_to_server(&*zellij_ipc_pipe)
+        .map_err(|e| e.to_string())?;
+    os_input.send_to_server(ClientToServerMsg::Action {
+        action,
+        terminal_id: None,
+        client_id: None,
+        is_cli_client: true,
+    });
+    let answer = loop {
+        match os_input.recv_from_server() {
+            Some((ServerToClientMsg::Log { lines }, _)) => break Ok(lines),
+            // the server is free again and said nothing: the command reported nothing, which for a
+            // question means the thing it asked about is not there
+            Some((ServerToClientMsg::UnblockInputThread, _)) => break Ok(Vec::new()),
+            Some((ServerToClientMsg::LogError { lines }, _)) => break Err(lines.join("\n")),
+            Some((ServerToClientMsg::Exit { exit_reason }, _)) => {
+                break Err(match exit_reason {
+                    ExitReason::Error(e) => e,
+                    _ => format!("The session exited while asking about '{}'", subject),
+                });
+            },
+            Some(_) => {},
+            None => break Err(format!("The session did not answer for '{}'", subject)),
+        }
+    };
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    answer
+}
+
     let msg = ClientToServerMsg::Action {
         action,
         terminal_id: pane_id,

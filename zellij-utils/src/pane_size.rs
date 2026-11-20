@@ -407,6 +407,10 @@ impl PaneGeom {
     pub fn is_stacked(&self) -> bool {
         self.stacked.is_some()
     }
+    /// A stack member collapsed to its header: one fixed row, showing a title and no content.
+    pub fn is_collapsed_stack_member(&self) -> bool {
+        self.is_stacked() && self.rows.is_fixed() && self.rows.as_usize() <= 1
+    }
 }
 
 impl Display for PaneGeom {

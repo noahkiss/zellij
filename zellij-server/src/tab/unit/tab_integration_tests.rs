@@ -145,6 +145,7 @@ impl ServerOsApi for FakeInputOutput {
 
 struct MockPtyInstructionBus {
     output: Arc<Mutex<Vec<String>>>,
+    resizes: Arc<Mutex<Vec<(u32, u16, u16)>>>, // (terminal_id, cols, rows)
     pty_writer_sender: SenderWithContext<PtyWriteInstruction>,
     pty_writer_receiver: Arc<Receiver<(PtyWriteInstruction, ErrorContext)>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -153,6 +154,7 @@ struct MockPtyInstructionBus {
 impl MockPtyInstructionBus {
     fn new() -> Self {
         let output = Arc::new(Mutex::new(vec![]));
+        let resizes = Arc::new(Mutex::new(vec![]));
         let (pty_writer_sender, pty_writer_receiver): ChannelWithContext<PtyWriteInstruction> =
             channels::unbounded();
         let pty_writer_sender = SenderWithContext::new(pty_writer_sender);
@@ -160,6 +162,7 @@ impl MockPtyInstructionBus {
 
         Self {
             output,
+            resizes,
             pty_writer_sender,
             pty_writer_receiver,
             handle: None,
@@ -168,6 +171,7 @@ impl MockPtyInstructionBus {
 
     fn start(&mut self) {
         let output = self.output.clone();
+        let resizes = self.resizes.clone();
         let pty_writer_receiver = self.pty_writer_receiver.clone();
         let handle = std::thread::Builder::new()
             .name("pty_writer".to_string())
@@ -181,6 +185,9 @@ impl MockPtyInstructionBus {
                             .lock()
                             .unwrap()
                             .push(String::from_utf8_lossy(&msg).to_string()),
+                        PtyWriteInstruction::ResizePty(terminal_id, cols, rows, _, _) => {
+                            resizes.lock().unwrap().push((terminal_id, cols, rows))
+                        },
                         PtyWriteInstruction::Exit => break,
                         _ => {},
                     }
@@ -204,6 +211,27 @@ impl MockPtyInstructionBus {
 
     fn clone_output(&self) -> Vec<String> {
         self.output.lock().unwrap().clone()
+    }
+
+    fn clone_resizes(&self) -> Vec<(u32, u16, u16)> {
+        self.resizes.lock().unwrap().clone()
+    }
+
+    /// Forget every resize sent so far. Instructions are read in the order they were sent, so a
+    /// write sent first and waited for means the reader is past everything the test set up.
+    fn forget_resizes(&self) {
+        let marker = "__resizes_forgotten__";
+        self.pty_writer_sender
+            .send(PtyWriteInstruction::Write(
+                marker.as_bytes().to_vec(),
+                0,
+                None,
+            ))
+            .unwrap();
+        while self.clone_output().last().map(|s| s.as_str()) != Some(marker) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.resizes.lock().unwrap().clear();
     }
 }
 
@@ -251,6 +279,9 @@ fn create_new_tab(size: Size, default_mode: ModeInfo) -> Tab {
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -351,6 +382,9 @@ fn create_new_tab_with_stacked_pane_list(
         stacked_resize,
         stacked_pane_list,
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -447,6 +481,9 @@ fn create_new_tab_without_pane_frames(size: Size, default_mode: ModeInfo) -> Tab
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -556,6 +593,9 @@ fn create_new_tab_with_swap_layouts(
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -670,6 +710,9 @@ fn create_new_tab_with_os_api(
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -766,6 +809,9 @@ fn create_new_tab_with_layout(size: Size, default_mode: ModeInfo, layout: &str) 
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -832,6 +878,20 @@ fn create_new_tab_with_mock_pty_writer(
     default_mode: ModeInfo,
     mock_pty_writer: SenderWithContext<PtyWriteInstruction>,
 ) -> Tab {
+    create_new_tab_with_frame_style_and_mock_pty_writer(
+        size,
+        default_mode,
+        PaneFrameStyle::Full,
+        mock_pty_writer,
+    )
+}
+
+fn create_new_tab_with_frame_style_and_mock_pty_writer(
+    size: Size,
+    default_mode: ModeInfo,
+    pane_frame_style: PaneFrameStyle,
+    mock_pty_writer: SenderWithContext<PtyWriteInstruction>,
+) -> Tab {
     set_session_name("test".into());
     let index = 0;
     let position = 0;
@@ -842,7 +902,7 @@ fn create_new_tab_with_mock_pty_writer(
     let max_panes = None;
     let mode_info = default_mode;
     let style = Style::default();
-    let draw_pane_frames = PaneFrameStyle::Full;
+    let draw_pane_frames = pane_frame_style;
     let auto_layout = true;
     let client_id = 1;
     let session_is_mirrored = true;
@@ -876,6 +936,9 @@ fn create_new_tab_with_mock_pty_writer(
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -977,6 +1040,9 @@ fn create_new_tab_with_sixel_support(
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -1635,6 +1701,149 @@ fn kitty_visible_panes_exclude_collapsed_stack_members() {
         vec![PaneId::Terminal(2)],
         "kitty visibility follows the expanded stack member"
     );
+}
+
+#[test]
+fn focus_moves_within_a_stack_do_not_resize_member_ptys() {
+    // A focus move inside a stack collapses one member to its title row and expands another, but
+    // the outer geometry does not change. The members' terminals must hear nothing about it: a pty
+    // resize is a SIGWINCH, and a shell answers a SIGWINCH by reprinting its prompt. Every frame
+    // style, because each one gives the collapsed member a different content offset.
+    for pane_frame_style in [
+        PaneFrameStyle::Full,
+        PaneFrameStyle::Titles,
+        PaneFrameStyle::TopOnly,
+        PaneFrameStyle::None,
+    ] {
+        let size = Size {
+            cols: 121,
+            rows: 20,
+        };
+        let client_id = 1;
+        let mut pty_instruction_bus = MockPtyInstructionBus::new();
+        pty_instruction_bus.start();
+        let mut tab = create_new_tab_with_frame_style_and_mock_pty_writer(
+            size,
+            ModeInfo::default(),
+            pane_frame_style,
+            pty_instruction_bus.pty_write_sender(),
+        );
+        tab.new_pane(
+            PaneId::Terminal(2),
+            None,
+            None,
+            false,
+            true,
+            NewPanePlacement::Stacked {
+                pane_id_to_stack_under: None,
+                borderless: None,
+                border_style: None,
+            },
+            Some(client_id),
+            None,
+        )
+        .unwrap();
+        pty_instruction_bus.forget_resizes();
+
+        for _ in 0..3 {
+            tab.focus_pane_with_id(PaneId::Terminal(1), false, false, client_id)
+                .unwrap();
+            tab.focus_pane_with_id(PaneId::Terminal(2), false, false, client_id)
+                .unwrap();
+        }
+        pty_instruction_bus.exit();
+
+        let mut sizes_per_pane: BTreeMap<u32, BTreeSet<(u16, u16)>> = BTreeMap::new();
+        for (terminal_id, cols, rows) in pty_instruction_bus.clone_resizes() {
+            sizes_per_pane
+                .entry(terminal_id)
+                .or_default()
+                .insert((cols, rows));
+        }
+        for (terminal_id, sizes) in sizes_per_pane {
+            assert_eq!(
+                sizes.len(),
+                1,
+                "with {:?} frames, terminal {} was given more than one size while focus moved: {:?}",
+                pane_frame_style,
+                terminal_id,
+                sizes
+            );
+            let (_cols, rows) = sizes.into_iter().next().unwrap();
+            assert!(
+                rows > 1,
+                "with {:?} frames, terminal {} was shrunk to its stack header ({} rows)",
+                pane_frame_style,
+                terminal_id,
+                rows
+            );
+        }
+    }
+}
+
+#[test]
+fn a_collapsed_stack_member_picks_up_a_real_resize_when_it_is_focused() {
+    // The other side of the coin: a stack that really did change size while a member was collapsed
+    // must reach that member's terminal, once, on the way out of the header.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut pty_instruction_bus = MockPtyInstructionBus::new();
+    pty_instruction_bus.start();
+    let mut tab = create_new_tab_with_frame_style_and_mock_pty_writer(
+        size,
+        ModeInfo::default(),
+        PaneFrameStyle::Titles,
+        pty_instruction_bus.pty_write_sender(),
+    );
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::Stacked {
+            pane_id_to_stack_under: None,
+            borderless: None,
+            border_style: None,
+        },
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+    // terminal 2 is focused, so terminal 1 is the one collapsed to its header
+    tab.resize_whole_tab(Size {
+        cols: 100,
+        rows: 20,
+    })
+    .unwrap();
+    pty_instruction_bus.forget_resizes();
+    tab.focus_pane_with_id(PaneId::Terminal(1), false, false, client_id)
+        .unwrap();
+    pty_instruction_bus.exit();
+
+    let sizes_of_expanded_pane: Vec<(u16, u16)> = pty_instruction_bus
+        .clone_resizes()
+        .iter()
+        .filter(|(terminal_id, _cols, _rows)| *terminal_id == 1)
+        .map(|(_terminal_id, cols, rows)| (*cols, *rows))
+        .collect();
+    assert!(
+        !sizes_of_expanded_pane.is_empty(),
+        "the expanded pane was told nothing about the new tab width"
+    );
+    for (cols, rows) in sizes_of_expanded_pane {
+        assert_eq!(
+            cols, 100,
+            "expanded pane kept the width it had before the resize"
+        );
+        assert!(
+            rows > 1,
+            "expanded pane was left at its stack header height"
+        );
+    }
 }
 
 #[test]
@@ -14752,6 +14961,27 @@ fn two_singleton_stacks_render_and_resize_like_plain_panes() {
             Palette::default(),
         ));
     }
+    // fork: each tab hands out its own pane handles, so the handle text is not compared
+    let without_handles = |snapshot: &str| -> String {
+        let mut out = String::new();
+        let mut rest = snapshot;
+        while let Some(start) = rest.find("[ ") {
+            match rest[start..].find(" ]") {
+                Some(end) if rest[start + 2..start + end].contains('-') => {
+                    out.push_str(&rest[..start]);
+                    out.push_str("[ handle ]");
+                    rest = &rest[start + end + 2..];
+                },
+                _ => {
+                    out.push_str(&rest[..start + 2]);
+                    rest = &rest[start + 2..];
+                },
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+    let outputs: Vec<String> = outputs.iter().map(|o| without_handles(o)).collect();
     assert_eq!(
         outputs[0], outputs[1],
         "singleton stack titles and boundaries must render like plain panes"
@@ -15630,6 +15860,9 @@ fn create_new_tab_with_plugin_receiver(
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -17422,6 +17655,9 @@ fn create_new_tab_with_server_receiver(
         stacked_resize,
         Rc::new(RefCell::new(false)),
         StackListOrientation::default(),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -20562,3 +20798,66 @@ fn leaving_a_tab_forgets_the_last_click_so_returning_cannot_double_click() {
     tab.add_multiple_clients(drained).unwrap();
     assert!(!tab.mouse_click_tracker.contains_key(&client_id));
 }
+// Fork addition: the stack list draws its rows through a `PaneContentsAndUi` of its own, which
+// used to be the one place in a tab that never learned the frame style.
+#[test]
+fn stack_list_rows_follow_the_top_only_frame_style() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab_with_stacked_pane_list(size, ModeInfo::default(), true, None);
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+    tab.new_pane(
+        PaneId::Terminal(3),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::Stacked {
+            pane_id_to_stack_under: None,
+            borderless: None,
+            border_style: None,
+        },
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+    assert!(tab.has_stack_lists(), "the test needs a stack list to draw");
+    tab.set_pane_frames(PaneFrameStyle::TopOnly);
+    let mut output = Output::default();
+    tab.render(&mut output, None).unwrap();
+    let snapshot = take_snapshot(
+        output.serialize().unwrap().get(&client_id).unwrap().ansi(),
+        size.rows,
+        size.cols,
+        Palette::default(),
+    );
+    // `top_only` draws no separators between panes, so the only `│` left on screen is the pair
+    // bracketing a stack list entry - which makes those rows the ones carrying it
+    let entry_rows: Vec<&str> = snapshot.lines().filter(|line| line.contains('│')).collect();
+    assert!(
+        !entry_rows.is_empty(),
+        "the stack list drew no entries at all, got: {:?}",
+        snapshot
+    );
+    for entry_row in &entry_rows {
+        assert!(
+            entry_row.contains('─'),
+            "a stack list row must carry top_only's rule, got: {:?}",
+            entry_row
+        );
+    }
+}
+

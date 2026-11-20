@@ -2452,6 +2452,9 @@ impl Screen {
         stacked_pane_list: bool,
         stacked_pane_list_orientation: StackListOrientation,
         default_editor: Option<PathBuf>,
+        default_floating_size: Option<DefaultFloatingSize>,
+        input_while_scrolled: InputWhileScrolled,
+        command_pane_on_clean_exit: CommandPaneOnCleanExit,
         web_clients_allowed: bool,
         web_sharing: WebSharing,
         advanced_mouse_actions: bool,
@@ -2462,6 +2465,7 @@ impl Screen {
         mouse_hover_effects: bool,
         mouse_hover_tips: bool,
         visual_bell: bool,
+        bell_clear_delay_ms: u64,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
         web_server_ip: IpAddr,
@@ -6275,6 +6279,54 @@ impl Screen {
         }
     }
 
+    /// The display position of the tab a client is looking at.
+    pub fn tab_position_for_client(&self, client_id: ClientId) -> Option<usize> {
+        self.get_active_tab(client_id).ok().map(|tab| tab.position)
+    }
+
+    /// The tab a client is looking at, as the `<id> <name>` a switch report names it by.
+    ///
+    /// A client with no active tab - one that has not attached yet - has no answer, and a report
+    /// built from it says nothing rather than guessing.
+    pub fn tab_summary_for_client(&self, client_id: ClientId) -> Option<String> {
+        self.get_active_tab(client_id)
+            .ok()
+            .map(|tab| format!("{} {}", tab.id, tab.name))
+    }
+
+    /// A pane as the `<pane_id> <handle>` a jump report names it by.
+    ///
+    /// The id comes first for the same reason it does in a tab summary: one field split reads it.
+    /// The handle follows because that is the word a human types to come back here.
+    pub fn pane_summary(&self, pane_id: PaneId) -> String {
+        let printed_id = match pane_id {
+            PaneId::Terminal(id) => format!("terminal_{}", id),
+            PaneId::Plugin(id) => format!("plugin_{}", id),
+        };
+        match self.get_pane_info(pane_id) {
+            Some(pane_info) if !pane_info.handle.is_empty() => {
+                format!("{} {}", printed_id, pane_info.handle)
+            },
+            _ => printed_id,
+        }
+    }
+
+    /// The pane a client is focused on, in the tab it is looking at.
+    ///
+    /// A client that is looking at nothing - a transient CLI connection that never attached - is
+    /// answered for by an attached client instead, the same fallback a tab switch already makes.
+    /// The alternative is a `from:` that goes missing precisely when a script asked from outside a
+    /// pane, which is when it is most wanted.
+    pub fn pane_summary_for_client(&self, client_id: ClientId) -> Option<String> {
+        let client_id = if self.active_tab_ids.contains_key(&client_id) {
+            client_id
+        } else {
+            *self.active_tab_ids.keys().next()?
+        };
+        self.get_active_pane_id(&client_id)
+            .map(|pane_id| self.pane_summary(pane_id))
+    }
+
     pub fn get_client_input_mode(&self, client_id: ClientId) -> Option<InputMode> {
         self.get_active_tab(client_id)
             .ok()
@@ -6663,6 +6715,9 @@ impl Screen {
             self.stacked_resize.clone(),
             self.stacked_pane_list.clone(),
             self.stacked_pane_list_orientation,
+            self.default_floating_size.clone(),
+            self.input_while_scrolled.clone(),
+            self.command_pane_on_clean_exit.clone(),
             self.sixel_image_store.clone(),
             self.kitty_image_store.clone(),
             self.bus
@@ -7519,6 +7574,55 @@ impl Screen {
 
         sort_panes_by_tab_and_type(&mut pane_entries);
         Ok(pane_entries)
+    }
+
+    /// Which pane, if any, a CLI target names.
+    ///
+    /// The handle and uuid forms are resolved here because here is where the live panes are - the
+    /// CLI holds a string and no way to turn it into a pane. An id form needs no lookup and is
+    /// returned as given, which deliberately means an id for a pane that does not exist resolves:
+    /// "does this id name a live pane" is a different question, and the commands that care already
+    /// answer it themselves.
+    ///
+    /// Non-selectable panes are searched too. They have handles like any other pane, and a target
+    /// naming one should reach it rather than silently miss.
+    pub fn resolve_pane_target(&self, target: &PaneTarget) -> Option<PaneId> {
+        let matches: Box<dyn Fn(&PaneInfo) -> bool> = match target {
+            // an id nothing answers to is a miss like a handle nothing holds. It used to be handed
+            // straight back, and `wait` - the one caller that asks the server about an id form -
+            // then polled a list the pane was not in and read that as an exit: `waited_ms: 0` and
+            // `exit_status: -` for a pane that never existed. The pane list is what `wait` polls,
+            // so resolving against it is the same question asked once instead of forever
+            PaneTarget::Id(pane_id) => {
+                let wanted: PaneId = (*pane_id).into();
+                let (is_plugin, id) = match wanted {
+                    PaneId::Plugin(id) => (true, id),
+                    PaneId::Terminal(id) => (false, id),
+                };
+                Box::new(move |pane_info: &PaneInfo| {
+                    pane_info.is_plugin == is_plugin && pane_info.id == id
+                })
+            },
+            PaneTarget::Handle(handle) => {
+                let handle = handle.clone();
+                Box::new(move |pane_info| pane_info.handle == handle)
+            },
+            PaneTarget::Uuid(uuid) => {
+                let uuid = uuid.clone();
+                Box::new(move |pane_info| pane_info.uuid == uuid)
+            },
+        };
+        self.tabs
+            .values()
+            .flat_map(|tab| self.pane_infos_for_tab(tab))
+            .find(|pane_info| matches(pane_info))
+            .map(|pane_info| {
+                if pane_info.is_plugin {
+                    PaneId::Plugin(pane_info.id)
+                } else {
+                    PaneId::Terminal(pane_info.id)
+                }
+            })
     }
 
     fn collect_tab_list(&self, _client_id: ClientId) -> Result<ListTabsResponse> {
@@ -9803,6 +9907,15 @@ impl Screen {
         {
             *self.stacked_pane_list.borrow_mut() = stacked_pane_list;
         }
+        {
+            *self.default_floating_size.borrow_mut() = default_floating_size;
+        }
+        {
+            *self.input_while_scrolled.borrow_mut() = input_while_scrolled;
+        }
+        {
+            *self.command_pane_on_clean_exit.borrow_mut() = command_pane_on_clean_exit;
+        }
         if let Some(copy_to_clipboard) = copy_to_clipboard {
             self.copy_options.clipboard = copy_to_clipboard;
         }
@@ -10482,6 +10595,11 @@ impl Screen {
                         default_fg,
                         default_bg,
                         p.border_style_override(),
+                        Some(p.pane_uuid().to_string()),
+                        // a pane that never got a handle - the trait default - has an empty one,
+                        // and serializing that would put a handle nothing can address into the
+                        // snapshot
+                        Some(p.pane_handle()).filter(|handle| !handle.is_empty()),
                     )
                     .with_stack_orientation(stack_orientation)
                     .with_attention_flags(
@@ -10529,6 +10647,11 @@ impl Screen {
                         default_fg,
                         default_bg,
                         p.border_style_override(),
+                        Some(p.pane_uuid().to_string()),
+                        // a pane that never got a handle - the trait default - has an empty one,
+                        // and serializing that would put a handle nothing can address into the
+                        // snapshot
+                        Some(p.pane_handle()).filter(|handle| !handle.is_empty()),
                     )
                     .with_attention_flags(
                         self.attention.pane_is_muted(&pane_id.into()),
@@ -11321,6 +11444,11 @@ pub(crate) fn screen_thread_main(
     }
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
+    // The handles every pending tab is coming back under, held out of the generator's reach for as
+    // long as any tab is still pending. A restore announces all of its tabs before the first tab's
+    // panes exist, so reserving per tab - at the moment that tab's panes are built - would leave a
+    // handle-less pane in an early tab free to take a name a later tab is restoring under.
+    let mut restore_reservation = crate::pane_handles::Reservation::default();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the
                                                                                // tab_index
     let mut pending_events_waiting_for_tab: Vec<ScreenInstruction> = vec![];
@@ -13082,11 +13210,8 @@ pub(crate) fn screen_thread_main(
                 screen.switch_tab_prev(None, true, client_id)?;
                 screen.render(None)?;
             },
-            ScreenInstruction::CloseTab(
-                client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
-                                // waiting for it
-            ) => {
+            ScreenInstruction::CloseTab(client_id, mut completion_tx) => {
+                let closed = screen.tab_summary_for_client(client_id);
                 screen.close_tab(client_id)?;
                 let connected_client_ids: Vec<ClientId> =
                     screen.active_tab_ids.keys().copied().collect();
@@ -13094,6 +13219,9 @@ pub(crate) fn screen_thread_main(
                     screen.sync_scroll_mode_on_focus(connected_client_id)?;
                 }
                 screen.render(None)?;
+                if let (Some(closed), Some(c)) = (closed, completion_tx.as_mut()) {
+                    c.set_stdout_message(format!("closed: {}", closed));
+                }
             },
             ScreenInstruction::NewTab(
                 cwd,
@@ -13110,6 +13238,16 @@ pub(crate) fn screen_thread_main(
             ) => {
                 let tab_index = screen.get_new_tab_id();
                 pending_tab_ids.insert(tab_index);
+                restore_reservation.extend(
+                    layout
+                        .iter()
+                        .flat_map(|layout| layout.pane_handles())
+                        .chain(
+                            floating_panes_layout
+                                .iter()
+                                .filter_map(|pane| pane.pane_handle.clone()),
+                        ),
+                );
                 let client_id_for_new_tab = if should_change_focus_to_new_tab {
                     Some(client_id)
                 } else {
@@ -13278,8 +13416,11 @@ pub(crate) fn screen_thread_main(
                     // the client focus, which should have happened before this instruction and not
                     // after)
                     Some(client_id) if pending_tab_ids.is_empty() => {
+                        let from = screen.tab_summary_for_client(client_id);
                         screen.go_to_tab(tab_index as usize, client_id)?;
                         screen.render(None)?;
+                        let to = screen.tab_summary_for_client(client_id);
+                        report_focus_switch(completion_tx.as_mut(), from, to);
                     },
                     _ => {
                         if let Some(client_id) = client_id {
@@ -13374,20 +13515,26 @@ pub(crate) fn screen_thread_main(
                 screen.undo_active_rename_tab(client_id)?;
                 screen.render(None)?;
             },
-            ScreenInstruction::MoveTabLeft(client_id, completion_tx) => {
+            ScreenInstruction::MoveTabLeft(client_id, mut completion_tx) => {
                 if pending_tab_ids.is_empty() {
+                    let from = screen.tab_position_for_client(client_id);
                     screen.move_active_tab_to_left(client_id)?;
                     screen.render(None)?;
+                    let to = screen.tab_position_for_client(client_id);
+                    report_tab_move(completion_tx.as_mut(), from, to);
                 } else {
                     // Defer execution, forward completion_tx
                     pending_events_waiting_for_tab
                         .push(ScreenInstruction::MoveTabLeft(client_id, completion_tx));
                 }
             },
-            ScreenInstruction::MoveTabRight(client_id, completion_tx) => {
+            ScreenInstruction::MoveTabRight(client_id, mut completion_tx) => {
                 if pending_tab_ids.is_empty() {
+                    let from = screen.tab_position_for_client(client_id);
                     screen.move_active_tab_to_right(client_id)?;
                     screen.render(None)?;
+                    let to = screen.tab_position_for_client(client_id);
+                    report_tab_move(completion_tx.as_mut(), from, to);
                 } else {
                     // Defer execution, forward completion_tx
                     pending_events_waiting_for_tab
@@ -14719,21 +14866,22 @@ pub(crate) fn screen_thread_main(
                     .iter()
                     .any(|(_, tab)| tab.has_pane_with_pid(&pane_id));
                 if !pane_exists {
+                    // an id no live pane answers to is a miss, not a failure: the handle and uuid
+                    // forms are caught by the resolver before they get here, so what lands here is
+                    // an id form for a pane that has since closed
                     if let Some(c) = completion_tx.as_mut() {
-                        c.set_exit_status(1);
-                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
+                        c.set_error_message(format!(
+                            "No pane answers to '{}'",
+                            screen.pane_summary(pane_id)
+                        ));
                     }
                 } else {
+                    let from = screen.pane_summary_for_client(client_id);
                     let already_focused = screen
                         .get_active_pane_id(&client_id)
                         .map(|active| active == pane_id)
                         .unwrap_or(false);
-                    if already_focused {
-                        if let Some(c) = completion_tx.as_mut() {
-                            c.set_exit_status(1);
-                            c.set_error_message(format!("Pane {:?} is already focused", pane_id));
-                        }
-                    } else {
+                    if !already_focused {
                         screen.focus_pane_with_id(
                             pane_id,
                             should_float_if_hidden,
@@ -14745,6 +14893,17 @@ pub(crate) fn screen_thread_main(
                         screen.sync_scroll_mode_on_focus(client_id)?;
                         screen.log_and_report_session_state()?;
                     }
+                    // a jump that landed where it started reports only `to:`, exactly as a tab
+                    // switch does - it went where it was asked to go, and there is no "from" to
+                    // put focus back on
+                    // `to:` names the pane the command was given, not the one a client happens to
+                    // be looking at afterwards - that is the answer even for a caller with no
+                    // focus of its own
+                    report_focus_switch(
+                        completion_tx.as_mut(),
+                        from,
+                        Some(screen.pane_summary(pane_id)),
+                    );
                 }
             },
             ScreenInstruction::RenamePane(
@@ -14819,6 +14978,7 @@ pub(crate) fn screen_thread_main(
                 if let Some(client_id) = client_id_to_switch {
                     // Get the position from the ID
                     if let Some(tab_position) = screen.get_tab_position_by_id(tab_id) {
+                        let from = screen.tab_summary_for_client(client_id);
                         // switch_active_tab expects 0-based position
                         screen.switch_active_tab(tab_position, None, true, client_id)?;
                         screen.render(None)?;
@@ -14828,12 +14988,22 @@ pub(crate) fn screen_thread_main(
                             .entry(client_id)
                             .or_insert_with(Vec::new)
                             .push(tab_id);
+                        let to = screen.tab_summary_for_client(client_id);
+                        report_focus_switch(completion_tx.as_mut(), from, to);
                     } else {
                         log::error!("Tab with ID {} not found", tab_id);
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!("No tab with id {}", tab_id));
+                        }
                     }
+                } else if let Some(c) = completion_tx.as_mut() {
+                    // the tab is there and nothing is attached, so the whole of this command is a
+                    // focus move with no focus to move. `go-to-tab-name` refuses in this state
+                    // already; staying silent here exits 0 on a session that did not move
+                    c.set_error_message(NO_CLIENT_TO_MOVE_TO_A_TAB_BY_ID.to_owned());
                 }
             },
-            ScreenInstruction::RenameTabWithId(tab_id, new_name, _completion_tx) => {
+            ScreenInstruction::RenameTabWithId(tab_id, new_name, mut completion_tx) => {
                 // Use get_tab_by_id_mut() helper method
                 if let Some(tab) = screen.get_tab_by_id_mut(tab_id) {
                     tab.name = clean_string_from_control_and_linebreak(&String::from_utf8_lossy(
@@ -14841,14 +15011,30 @@ pub(crate) fn screen_thread_main(
                     ));
                     screen.log_and_report_session_state()?;
                 } else {
+                    // an id no tab answers to is a miss, and the same one `close-tab --tab-id`
+                    // and `undo-rename-tab --tab-id` report. Silence here reads as a rename that
+                    // happened
                     log::error!("Failed to find tab with ID: {}", tab_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!("No tab with id {}", tab_id));
+                    }
                 }
             },
-            ScreenInstruction::CloseTabWithId(tab_id, _completion_tx) => {
-                if screen.get_tab_by_id(tab_id).is_some() {
-                    screen.close_tab_by_id(tab_id).non_fatal();
-                } else {
-                    log::error!("Failed to find tab with ID: {}", tab_id);
+            ScreenInstruction::CloseTabWithId(tab_id, mut completion_tx) => {
+                match screen.get_tab_by_id(tab_id) {
+                    Some(tab) => {
+                        let closed = format!("{} {}", tab.id, tab.name);
+                        screen.close_tab_by_id(tab_id).non_fatal();
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_stdout_message(format!("closed: {}", closed));
+                        }
+                    },
+                    None => {
+                        log::error!("Failed to find tab with ID: {}", tab_id);
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!("No tab with id {}", tab_id));
+                        }
+                    },
                 }
             },
             ScreenInstruction::BreakPanesToTabWithId {
@@ -14858,10 +15044,24 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 mut completion_tx,
             } => {
+                let missing_panes = screen.panes_not_found(&pane_ids);
                 // Verify tab exists
                 if screen.get_tab_by_id(tab_id).is_none() {
                     log::error!("Tab with ID {} not found", tab_id);
                     // Don't set affected_tab_id, it will remain None to signal failure
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Tab with id {} not found", tab_id));
+                    }
+                } else if !missing_panes.is_empty() {
+                    log::error!("Pane with id {:?} not found", missing_panes[0]);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!(
+                            "Pane with id {:?} not found",
+                            missing_panes[0]
+                        ));
+                    }
                 } else {
                     // break_multiple_panes_to_tab_with_index uses tab ID
                     screen.break_multiple_panes_to_tab_with_index(
@@ -16801,14 +17001,19 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::MoveTabWithTabId(tab_id, direction, mut _completion_tx) => {
                 if pending_tab_ids.is_empty() {
-                    let tab_found = screen.move_tab_by_id(tab_id, direction).unwrap_or(true);
-                    if !tab_found {
+                    let from = screen.get_tab_position_by_id(tab_id);
+                    if from.is_none() {
+                        // fork: the miss text every by-id tab verb uses
                         mark_action_as_failed(
                             &mut _completion_tx,
-                            &format!("Tab with id {} not found", tab_id),
+                            &format!("No tab with id {}", tab_id),
                         );
+                        continue;
                     }
+                    screen.move_tab_by_id(tab_id, direction)?;
                     screen.render(None)?;
+                    let to = screen.get_tab_position_by_id(tab_id);
+                    report_tab_move(_completion_tx.as_mut(), from, to);
                 } else {
                     pending_events_waiting_for_tab.push(ScreenInstruction::MoveTabWithTabId(
                         tab_id,
@@ -16819,6 +17024,8 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::MoveTabToPosition(tab_id, position, mut _completion_tx) => {
                 if pending_tab_ids.is_empty() {
+                    // fork: `move-tab --to-index` reports where the tab was and where it went
+                    let from = screen.get_tab_position_by_id(tab_id);
                     let tab_found = screen.move_tab_to_position(tab_id, position);
                     if !tab_found {
                         mark_action_as_failed(
@@ -16827,6 +17034,10 @@ pub(crate) fn screen_thread_main(
                         );
                     }
                     screen.render(None)?;
+                    if tab_found {
+                        let to = screen.get_tab_position_by_id(tab_id);
+                        report_tab_move(_completion_tx.as_mut(), from, to);
+                    }
                 } else {
                     pending_events_waiting_for_tab.push(ScreenInstruction::MoveTabToPosition(
                         tab_id,
@@ -16916,12 +17127,42 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::SetAttentionConfig(config) => {
                 screen.reconfigure_attention(config);
             },
-        }
-        screen.process_attention();
+/// Report a focus switch as what it left and what it landed on.
+///
+/// Serves tabs (`<id> <name>`) and panes (`<pane_id> <handle>`) alike: id first, so that a script
+/// reads it with one field split and a name with spaces in it stays whole. A switch that landed
+/// where it started reports only `to:` - there is no "from" to go back to, and printing the same
+/// thing twice would suggest there is.
+fn report_focus_switch(
+    completion_tx: Option<&mut NotificationEnd>,
+    from: Option<String>,
+    to: Option<String>,
+) {
+    let Some(completion_tx) = completion_tx else {
+        return;
+    };
+    let Some(to) = to else {
+        return;
+    };
+    match from {
+        Some(from) if from != to => {
+            completion_tx.set_stdout_lines(vec![format!("from: {}", from), format!("to: {}", to)]);
+        },
+        _ => completion_tx.set_stdout_lines(vec![format!("to: {}", to)]),
     }
-    Ok(())
 }
 
-#[path = "./unit/screen_tests.rs"]
-#[cfg(test)]
-mod screen_tests;
+/// Report a tab move as the position it left and the position it holds now.
+///
+/// Positions are 0-based, the same numbers the `POSITION` column of `list-tabs` prints. A move that
+/// went nowhere - the leftmost tab asked to go further left, in a build where that does not wrap -
+/// still reports both, because "it is where it was" is the answer to where it went.
+fn report_tab_move(
+    completion_tx: Option<&mut NotificationEnd>,
+    from: Option<usize>,
+    to: Option<usize>,
+) {
+    if let (Some(completion_tx), Some(from), Some(to)) = (completion_tx, from, to) {
+        completion_tx.set_stdout_lines(vec![format!("from: {}", from), format!("to: {}", to)]);
+    }
+}

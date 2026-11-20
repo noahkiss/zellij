@@ -1,4 +1,5 @@
 use crate::output::{CharacterChunk, KittyImageChunk, SixelImageChunk};
+use crate::pane_handles::HeldHandle;
 use crate::panes::kitty_graphics::{
     InterceptorResult, KittyApcInterceptor, KittyHostSupport, KittyImageStore,
 };

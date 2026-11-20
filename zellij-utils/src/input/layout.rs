@@ -946,6 +946,18 @@ pub struct TiledPaneLayout {
 }
 
 impl TiledPaneLayout {
+impl TiledPaneLayout {
+    /// Every handle this layout and its descendants carry.
+    ///
+    /// The applier reserves these before it builds the first pane, so a handle-less pane in the
+    /// same layout cannot be handed a name a later pane is restoring under.
+    pub fn pane_handles(&self) -> Vec<String> {
+        let mut handles: Vec<String> = self.pane_handle.iter().cloned().collect();
+        for child in &self.children {
+            handles.extend(child.pane_handles());
+        }
+        handles
+    }
     pub fn insert_children_layout(
         &mut self,
         children_layout: &mut TiledPaneLayout,

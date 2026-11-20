@@ -8,7 +8,7 @@ use zellij_client::os_input_output::SignalEvent;
 use zellij_client::ClientInfo;
 use zellij_utils::cli::{CliAction, CliArgs, Command};
 use zellij_utils::data::{CommandOrPlugin, ConnectToSession, LayoutInfo};
-use zellij_utils::input::actions::{Action, RunCommandAction};
+use zellij_utils::input::actions::{pane_ids_only, Action, RunCommandAction};
 use zellij_utils::input::options::Options;
 use zellij_utils::pane_size::Size;
 use zellij_utils::setup::Setup;

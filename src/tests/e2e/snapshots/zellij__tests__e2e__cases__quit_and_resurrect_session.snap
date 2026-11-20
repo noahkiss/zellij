@@ -3,18 +3,18 @@ source: src/tests/e2e/cases.rs
 expression: last_snapshot
 ---
  Zellij (e2e-test)  Tab #1  Tab #2  Tab #3  Tab #4  +        <ENTER> run, <ESC> drop to shell, <Ctrl-c> exit  
-                           Pane #1                         │                           Pane #2                          
+                           Pane #1         [ apt-anteater ]│                           Pane #2         [ coy-backpack ] 
 $                                                          │$                                                           
                                                            │                                                            
                                                            │                                                            
                                                            │                                                            
-                             ┌ Pane #4 ────────────────────────────────────── PIN [ ] ┐                                 
+                             ┌ Pane #4 ─────────────────────── fab-barnacle | PIN [ ] ┐                                 
                              │$                                                       │                                 
-                             │ ┌ top ────────────────────────────────────────── PIN [ ] ┐                               
+                             │ ┌ top ─────────────────────────── fit-birdcage | PIN [ ] ┐                               
                              │ │                                                        │                               
                              │ │                                                        │ ┐                             
                              │ │                                                        │ │─────────────────────────────
-                             │ │                  Waiting to run: top                   │ │ #3                          
+                             │ │                  Waiting to run: top                   │ │ #3         [ dry-backyard ] 
                              │ │                                                        │ │                             
                              │ │    <ENTER> run, <ESC> drop to shell, <Ctrl-c> exit     │ │                             
                              └─│                                                        │ │                             

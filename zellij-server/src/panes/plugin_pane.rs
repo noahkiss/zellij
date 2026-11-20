@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use crate::output::{CharacterChunk, KittyImageChunk, SixelImageChunk};
+use crate::pane_handles::HeldHandle;
 use crate::panes::{
     grid::Grid,
     kitty_graphics::KittyImageStore,

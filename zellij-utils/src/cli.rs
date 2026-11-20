@@ -2482,4 +2482,121 @@ mod tests {
     fn set_resurrect_command_requires_command_or_clear() {
         assert!(parse_set_resurrect_command(&[]).is_err());
     }
+    #[test]
+    fn a_targetless_close_from_outside_a_pane_is_refused() {
+        for args in [
+            vec!["close-pane"],
+            vec!["close-tab"],
+            vec!["move-tab", "left"],
+            vec!["write", "27"],
+            vec!["write-chars", "hello"],
+            vec!["clear"],
+            vec!["edit-scrollback"],
+            vec!["rename-pane", "build"],
+        ] {
+            let action = parse_action(&args);
+            assert!(
+                missing_target(&action, false).is_some(),
+                "expected `{}` to need a target",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_commands_are_untouched_from_inside_a_pane() {
+        // class 2 inside the session: "focused" is the pane the hands are on, which is what the
+        // caller meant. Class 3 is NOT here - it names its target from inside too, because there
+        // "the focused pane" is the shell that ran the command
+        for args in [
+            vec!["move-tab", "left"],
+            vec!["clear"],
+            vec!["edit-scrollback"],
+            vec!["rename-pane", "build"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                missing_target(&action, true),
+                None,
+                "`{}` should be untouched from inside a pane",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_names_its_target_is_never_refused() {
+        for args in [
+            vec!["close-pane", "--pane-id", "terminal_1"],
+            vec!["close-tab", "--tab-id", "2"],
+            vec!["move-tab", "left", "--tab-id", "2"],
+            vec!["write", "27", "--pane-id", "terminal_1"],
+            vec!["write-chars", "hello", "--pane-id", "sunny-otter"],
+            vec!["clear", "--pane-id", "terminal_1"],
+            vec!["edit-scrollback", "--pane-id", "terminal_1"],
+            vec!["rename-pane", "build", "--pane-id", "terminal_1"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                missing_target(&action, false),
+                None,
+                "`{}` names its target",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_mutates_nothing_is_never_refused() {
+        // reading and creating are not the footgun: a query has no target to get wrong, and a new
+        // pane in the wrong tab is visible and undoable in a way a closed one is not
+        for args in [
+            vec!["list-panes"],
+            vec!["list-tabs"],
+            vec!["new-pane"],
+            vec!["new-tab"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(missing_target(&action, false), None);
+        }
+    }
+
+    #[test]
+    fn dump_screen_takes_its_path_as_an_argument() {
+        match parse_action(&["dump-screen", "--pane-id", "terminal_1", "/tmp/dump"]) {
+            CliAction::DumpScreen { file, path, .. } => {
+                assert_eq!(file, Some(PathBuf::from("/tmp/dump")));
+                assert_eq!(path, None);
+            },
+            other => panic!("Expected DumpScreen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dump_screen_still_takes_its_path_as_a_flag() {
+        match parse_action(&[
+            "dump-screen",
+            "--pane-id",
+            "terminal_1",
+            "--path",
+            "/tmp/dump",
+        ]) {
+            CliAction::DumpScreen { file, path, .. } => {
+                assert_eq!(file, None);
+                assert_eq!(path, Some(PathBuf::from("/tmp/dump")));
+            },
+            other => panic!("Expected DumpScreen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dump_screen_refuses_both_spellings_of_the_path() {
+        assert!(action_parse_fails(&[
+            "dump-screen",
+            "/tmp/dump",
+            "--path",
+            "/tmp/other"
+        ]));
+    }
+
 }

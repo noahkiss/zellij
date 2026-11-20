@@ -1,5 +1,6 @@
 use zellij_utils::errors::prelude::*;
 
+use crate::pane_handles::Reservation;
 use crate::resize_pty;
 use crate::tab::{get_next_terminal_position, HoldForCommand, Pane};
 
@@ -128,6 +129,21 @@ impl<'a> LayoutApplier<'a> {
     ) -> Result<(bool, HashMap<usize, StackListOrientation>)> {
         // true => should_show_floating_panes
         let hide_floating_panes = layout.hide_floating_panes;
+        // Reserve the layout's handles before building anything, so the panes coming back under
+        // them win over any handle generated for a pane in the same pass. Dropped at the end of
+        // this call: whatever a pane claimed stays claimed, the rest is released.
+        //
+        // This reservation covers THIS tab's layout, which is all a tab knows about. A multi-tab
+        // restore is covered by the session-scoped reservation `Screen` holds from the moment it
+        // is told about a tab until the last one has been applied; reserving the same names twice
+        // is free, and this one still stands alone for a layout applied to a single tab.
+        let _reserved_handles = Reservation::hold(
+            layout.pane_handles().into_iter().chain(
+                floating_panes_layout
+                    .iter()
+                    .filter_map(|p| p.pane_handle.clone()),
+            ),
+        );
         let result = self
             .apply_tiled_panes_layout(
                 layout,
@@ -172,6 +188,21 @@ impl<'a> LayoutApplier<'a> {
     ) -> Result<(bool, HashMap<usize, StackListOrientation>)> {
         // true => should_show_floating_panes
         let hide_floating_panes = tiled_panes_layout.hide_floating_panes;
+        // Reserve the layout's handles before building anything, so the panes coming back under
+        // them win over any handle generated for a pane in the same pass. Dropped at the end of
+        // this call: whatever a pane claimed stays claimed, the rest is released.
+        //
+        // This reservation covers THIS tab's layout, which is all a tab knows about. A multi-tab
+        // restore is covered by the session-scoped reservation `Screen` holds from the moment it
+        // is told about a tab until the last one has been applied; reserving the same names twice
+        // is free, and this one still stands alone for a layout applied to a single tab.
+        let _reserved_handles = Reservation::hold(
+            tiled_panes_layout.pane_handles().into_iter().chain(
+                floating_panes_layout
+                    .iter()
+                    .filter_map(|p| p.pane_handle.clone()),
+            ),
+        );
         let result = self
             .override_tiled_panes_layout_for_existing_panes(
                 &tiled_panes_layout,
@@ -609,6 +640,15 @@ impl<'a> LayoutApplier<'a> {
             new_plugin.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_plugin.handle_pty_bytes("\n\r".as_bytes().into());
         }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_plugin.set_restored_from(layout.restored_from.clone());
+        // The handle, unlike the uuid, is the pane's own and comes back with it. A layout that
+        // carries none - hand-written, or saved before handles existed - leaves the pane at the
+        // handle it generated for itself, which is why a restored pane is never handle-less.
+        if let Some(handle) = layout.pane_handle.as_deref() {
+            new_plugin.set_pane_handle(handle);
+        }
 
         new_plugin.set_borderless(layout.borderless.unwrap_or(false));
         new_plugin.set_border_style_override(layout.border_style.unwrap_or_default());
@@ -659,6 +699,15 @@ impl<'a> LayoutApplier<'a> {
         if let Some(pane_initial_contents) = &floating_pane_layout.pane_initial_contents {
             new_pane.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_pane.handle_pty_bytes("\n\r".as_bytes().into());
+        }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_pane.set_restored_from(floating_pane_layout.restored_from.clone());
+        // The handle, unlike the uuid, is the pane's own and comes back with it. A layout that
+        // carries none - hand-written, or saved before handles existed - leaves the pane at the
+        // handle it generated for itself, which is why a restored pane is never handle-less.
+        if let Some(handle) = floating_pane_layout.pane_handle.as_deref() {
+            new_pane.set_pane_handle(handle);
         }
         if floating_pane_layout.borderless.unwrap_or(false) {
             new_pane.set_borderless(true);
@@ -719,6 +768,15 @@ impl<'a> LayoutApplier<'a> {
         if let Some(pane_initial_contents) = &floating_pane_layout.pane_initial_contents {
             new_pane.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_pane.handle_pty_bytes("\n\r".as_bytes().into());
+        }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_pane.set_restored_from(floating_pane_layout.restored_from.clone());
+        // The handle, unlike the uuid, is the pane's own and comes back with it. A layout that
+        // carries none - hand-written, or saved before handles existed - leaves the pane at the
+        // handle it generated for itself, which is why a restored pane is never handle-less.
+        if let Some(handle) = floating_pane_layout.pane_handle.as_deref() {
+            new_pane.set_pane_handle(handle);
         }
         if floating_pane_layout.borderless.unwrap_or(false) {
             new_pane.set_borderless(true);
@@ -807,6 +865,15 @@ impl<'a> LayoutApplier<'a> {
         if let Some(pane_initial_contents) = &layout.pane_initial_contents {
             new_pane.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_pane.handle_pty_bytes("\n\r".as_bytes().into());
+        }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_pane.set_restored_from(layout.restored_from.clone());
+        // The handle, unlike the uuid, is the pane's own and comes back with it. A layout that
+        // carries none - hand-written, or saved before handles existed - leaves the pane at the
+        // handle it generated for itself, which is why a restored pane is never handle-less.
+        if let Some(handle) = layout.pane_handle.as_deref() {
+            new_pane.set_pane_handle(handle);
         }
         new_pane.set_borderless(layout.borderless.unwrap_or(false));
         new_pane.set_border_style_override(layout.border_style.unwrap_or_default());

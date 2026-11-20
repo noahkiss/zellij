@@ -2638,9 +2638,13 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::Copy
             | Action::DumpLayout
             | Action::CliPipe { .. }
-            | Action::ListClients
+            | Action::ListClients { .. }
             | Action::ListPanes { .. }
             | Action::WaitForPaneExit { .. }
+            | Action::ListTree { .. }
+            | Action::ResolvePaneTarget { .. }
+            | Action::SendMessage { .. }
+            | Action::MessageStatus { .. }
             | Action::StackPanes { pane_ids: _ }
             | Action::ChangeFloatingPaneCoordinates {
                 pane_id: _,

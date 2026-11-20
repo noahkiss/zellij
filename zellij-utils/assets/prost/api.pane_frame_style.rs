@@ -16,6 +16,7 @@ impl PaneFrameStyle {
             PaneFrameStyle::Full => "Full",
             PaneFrameStyle::Titles => "Titles",
             PaneFrameStyle::None => "None",
+            PaneFrameStyle::TopOnly => "TopOnly",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -24,6 +25,7 @@ impl PaneFrameStyle {
             "Full" => Some(Self::Full),
             "Titles" => Some(Self::Titles),
             "None" => Some(Self::None),
+            "TopOnly" => Some(Self::TopOnly),
             _ => None,
         }
     }

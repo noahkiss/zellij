@@ -39,6 +39,7 @@ fn pane_frame_style_text(style: &PaneFrameStyle) -> String {
         PaneFrameStyle::Full => "full",
         PaneFrameStyle::Titles => "titles",
         PaneFrameStyle::None => "none",
+        PaneFrameStyle::TopOnly => "top_only",
     }
     .to_owned()
 }

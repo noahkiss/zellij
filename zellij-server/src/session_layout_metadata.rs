@@ -992,6 +992,29 @@ mod tests {
             ))
         );
     }
+    #[test]
+    fn a_panes_handle_reaches_the_serialized_layout() {
+        // the wiring the snapshot rests on: what `Pane::pane_handle` reports at save time is what
+        // the pane comes back under, so a handle dropped anywhere along here is a broken address
+        let pane = PaneLayoutMetadata::new(
+            PaneId::Terminal(1),
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            false,
+            None,
+            vec![],
+            None,
+            None,
+            Default::default(),
+            None,
+            Some("sunny-otter".to_owned()),
+        );
+        let manifest: PaneLayoutManifest = pane.into();
+        assert_eq!(manifest.pane_handle.as_deref(), Some("sunny-otter"));
+    }
+
     fn pane_focused_by(terminal_id: u32, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {
         PaneLayoutMetadata::new(
             PaneId::Terminal(terminal_id),

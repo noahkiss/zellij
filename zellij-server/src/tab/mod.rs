@@ -466,6 +466,15 @@ pub(crate) struct Tab {
     pane_frame_style: PaneFrameStyle,
     hidden_bars: HiddenBars,
     auto_layout: bool,
+    /// Fork addition: the fallback size for a floating pane that carries no coordinates of its
+    /// own. Shared with `Screen` so a config reload reaches every tab without a per-tab update.
+    default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
+    /// Fork addition: what a keypress does in a pane that is scrolled up. Shared with `Screen`
+    /// the same way, so a config reload reaches every tab.
+    input_while_scrolled: Rc<RefCell<InputWhileScrolled>>,
+    /// Fork addition: what a command pane does when its command exits with status 0. Shared with
+    /// `Screen` the same way, so a config reload reaches every tab.
+    command_pane_on_clean_exit: Rc<RefCell<CommandPaneOnCleanExit>>,
     pending_vte_events: HashMap<u32, Vec<VteBytes>>,
     pub selecting_with_mouse_in_pane: Option<PaneId>, // this is only pub for the tests
     pane_being_resized_with_mouse: Option<PaneResizeState>,
@@ -1032,6 +1041,10 @@ pub trait Pane {
     fn clear_pane_frame_color_override(&mut self, _client_id: Option<ClientId>);
     fn frame_color_override(&self) -> Option<PaletteColor>;
     fn invoked_with(&self) -> &Option<Run>;
+    /// fork addition: say what the pane is running now, when that stopped being what it was opened
+    /// with - see [`Tab::record_drop_to_shell`]. A no-op for a plugin pane, which cannot be handed
+    /// a new pty.
+    fn set_invoked_with(&mut self, _invoked_with: Option<Run>) {}
     fn set_title(&mut self, title: String);
     fn update_loading_indication(&mut self, _loading_indication: LoadingIndication) {} // only relevant for plugins
     fn start_loading_indication(&mut self, _loading_indication: LoadingIndication) {} // only relevant for plugins
@@ -1046,6 +1059,58 @@ pub trait Pane {
     fn stack_list_entry_label(&self) -> String {
         self.current_title()
     }
+    /// The title the program running in this pane set for itself (OSC 0/2), regardless of any
+    /// user-assigned pane name
+    fn program_title(&self) -> Option<String> {
+        None
+    }
+    /// Whether `program_title` changed since this was last asked, clearing the flag.
+    fn take_program_title_changed(&mut self) -> bool {
+        false
+    }
+    /// Whether the program in this pane has turned bracketed paste on. A shell's line editor - zsh's
+    /// ZLE, bash's readline, fish - turns it on when it starts reading a line, so the first time it
+    /// is on, the shell is sitting at a prompt.
+    fn bracketed_paste_enabled(&self) -> bool {
+        false
+    }
+    /// The uuid given to this pane when it was created. Unlike the pane id, it is never reused.
+    fn pane_uuid(&self) -> Uuid;
+    /// The uuid of the pane this one continues, when it was built from a serialized session.
+    ///
+    /// A restored pane is a new pane and says so with a new `pane_uuid`; this names what it came
+    /// from, for a consumer that wants to carry state across the restart deliberately.
+    fn restored_from(&self) -> Option<String> {
+        None
+    }
+    fn set_restored_from(&mut self, _restored_from: Option<String>) {}
+    /// The two-word name a human addresses this pane by, eg. `sunny-otter`.
+    ///
+    /// Unique among the session's live panes, and unlike the uuid it CARRIES across a snapshot
+    /// restore - the whole point of an address is that it still reaches the same pane after the
+    /// session comes back. Empty only for a pane that is not a real one; every terminal and plugin
+    /// pane has a handle from the moment it is built.
+    fn pane_handle(&self) -> String {
+        String::new()
+    }
+    /// Puts this pane back under the handle a serialized session recorded for it.
+    ///
+    /// Update the live name displayed before the pane frame title.
+    fn set_frame_agent_name(&mut self, _name: Option<String>) {}
+    /// Called on the restore path only. If a live pane already answers to `handle` the pane keeps
+    /// a freshly generated one instead, because a restore must not end with two panes at one
+    /// address.
+    fn set_pane_handle(&mut self, _handle: &str) {}
+    /// The short note somebody left on this pane, and what colour it says it is.
+    ///
+    /// Unlike the handle, a note is about what is happening in the pane rather than about which
+    /// pane this is: it is set and cleared while the pane lives, and a pane that comes back from a
+    /// snapshot comes back without one.
+    fn pane_note(&self) -> Option<(String, NoteColor)> {
+        None
+    }
+    /// Leaves a note on this pane, or clears the one it has.
+    fn set_pane_note(&mut self, _note: Option<(String, NoteColor)>) {}
     fn custom_title(&self) -> Option<String>;
     fn has_explicit_title(&self) -> bool {
         false
@@ -1208,6 +1273,9 @@ impl Tab {
         stacked_resize: Rc<RefCell<bool>>,
         stacked_pane_list: Rc<RefCell<bool>>,
         stacked_pane_list_orientation: StackListOrientation,
+        default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
+        input_while_scrolled: Rc<RefCell<InputWhileScrolled>>,
+        command_pane_on_clean_exit: Rc<RefCell<CommandPaneOnCleanExit>>,
         sixel_image_store: Rc<RefCell<SixelImageStore>>,
         kitty_image_store: Rc<RefCell<KittyImageStore>>,
         os_api: Box<dyn ServerOsApi>,
@@ -1346,6 +1414,9 @@ impl Tab {
             pane_frame_style,
             hidden_bars: HiddenBars::default(),
             auto_layout,
+            default_floating_size,
+            input_while_scrolled,
+            command_pane_on_clean_exit,
             pending_vte_events: HashMap::new(),
             connected_clients,
             selecting_with_mouse_in_pane: None,
@@ -2222,6 +2293,10 @@ impl Tab {
         }
         let multiple_users_exist_in_session = { self.connected_clients_in_app.borrow().len() > 1 };
         let should_draw_pane_frames = self.pane_frame_style.draws_full_frames();
+        // fork addition: the third render path that builds a `PaneContentsAndUi` of its own, after
+        // the tiled and floating ones. Without this the stack list is the one place `top_only`
+        // visibly does not hold
+        let top_only_frames = self.pane_frame_style.is_top_only();
         let session_is_mirrored = self.stack_list_session_is_mirrored;
         let current_pane_group: HashMap<ClientId, Vec<PaneId>> =
             { self.current_pane_group.borrow().clone_inner() };
@@ -2342,6 +2417,7 @@ impl Tab {
                     &self.client_display_slots.borrow(),
                 );
                 pane_contents_and_ui.set_frame_geom_override(Some(header_geom));
+                pane_contents_and_ui.set_top_only_frames(top_only_frames);
                 pane_contents_and_ui.set_stack_list_entry(
                     Some(entry.label_width),
                     entry.member == list.visible,
@@ -8895,6 +8971,15 @@ impl Tab {
         if self.floating_panes.fullscreen_is_active() {
             self.floating_panes.unset_fullscreen();
         }
+        // fork addition: `default_floating_size` fills in the axes the caller left open, so a
+        // pane that asked for nothing gets the configured size instead of half the viewport.
+        // Anything explicit still wins, and an unset config leaves the coordinates untouched.
+        let floating_pane_coordinates = match self.default_floating_size.borrow().as_ref() {
+            Some(default_floating_size) => {
+                default_floating_size.apply_to(floating_pane_coordinates)
+            },
+            None => floating_pane_coordinates,
+        };
         if let Some(mut new_pane_geom) = self.floating_panes.find_room_for_new_pane() {
             if let Some(floating_pane_coordinates) = &floating_pane_coordinates {
                 let viewport = self.viewport.borrow();
