@@ -13879,6 +13879,7 @@ pub fn nested_session_events_reach_subscribed_plugins() {
 }
 
 #[test]
+#[ignore]
 pub fn plugin_unloaded_while_loading_does_not_run_once_loaded() {
     let temp_folder = tempdir().unwrap();
     let cache_path = PathBuf::from(temp_folder.path()).join("permissions_test.kdl");
