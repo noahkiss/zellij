@@ -232,6 +232,36 @@ impl From<&PtyInstruction> for PtyContext {
     }
 }
 
+/// What the pty thread knows about the process it started in a terminal pane.
+///
+/// The detection tick refreshes command and agent caches even without pane output.
+/// CWD and ordinary environment caches retain their existing policies.
+/// Reporting the caches to Screen costs a message, not another probe. This is the
+/// snapshot half of the pair whose push half is `Event::CwdChanged` / `Event::CommandChanged`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PaneProcessInfo {
+    /// The pid of the pane's own child - the shell, not what the shell is running.
+    pub pid: Option<u32>,
+    pub cwd: Option<PathBuf>,
+    /// The foreground command if there is one, otherwise the pane's shell.
+    pub command: Option<Vec<String>>,
+    /// The session-id variables a coding harness exports, found in the pane's processes. Read only
+    /// for a pane whose own command already matched a harness, and only for the fixed names in
+    /// `agent_detect`.
+    ///
+    /// This map goes no further than the CLI-only pane list.
+    pub agent_env: BTreeMap<String, String>,
+    /// Claude’s current messaging name from its live process record.
+    pub agent_name: Option<String>,
+    /// Where the harness's own session id in `agent_env` was found, when the pty found it itself:
+    /// `record` or `open-file`. `None` when the id, if any, came from the environment.
+    pub agent_session_source: Option<String>,
+    /// The session the pane's agent reported itself with `OSC 1337`, which beats both. Carried
+    /// apart from `agent_env` because the pane may be detected as an agent from the line it was
+    /// STARTED with while its live argv is something else, and the report belongs to the pane.
+    pub osc_agent_session: Option<String>,
+}
+
 pub(crate) struct Pty {
     pub active_panes: HashMap<ClientId, PaneId>,
     pub bus: Bus<PtyInstruction>,
@@ -2321,6 +2351,15 @@ impl Pty {
     }
 
     pub fn update_and_report_cwds(&mut self) {
+    /// The once-a-second tick: refresh what the active panes are doing, then tell Screen.
+    pub fn update_and_report_cwds(&mut self) {
+        self.refresh_cwds_and_commands();
+        self.expire_osc_agent_sessions();
+        self.refresh_agent_identities();
+        self.report_pane_process_info();
+    }
+
+    fn refresh_cwds_and_commands(&mut self) {
         use std::sync::atomic::Ordering;
 
         let active_terminal_ids: Vec<u32> = self
@@ -2473,6 +2512,14 @@ impl Pty {
     pub fn notify_cwd_from_osc7(&mut self, terminal_id: u32, path: PathBuf) {
         use std::sync::atomic::Ordering;
 
+    /// A shell told us its cwd directly, so we do not have to read it off the process.
+    ///
+    /// This used to clear the pane's activity flag, on the reasoning that the cwd was now known and
+    /// needed no probing. But that flag gates the whole tick for the pane, command discovery
+    /// included - so a shell emitting OSC 7 at every prompt could starve its own `pane_command` of
+    /// refreshes. The flag says "this pane produced output", which is still true, and the cost of
+    /// leaving it set is one cwd read the tick would have done for any active pane anyway.
+    pub fn notify_cwd_from_osc7(&mut self, terminal_id: u32, path: PathBuf) {
         self.terminals_with_shell_cwd.insert(terminal_id);
 
         if self.terminal_cwds.get(&terminal_id) != Some(&path) {

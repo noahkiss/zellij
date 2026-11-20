@@ -25,6 +25,23 @@ pub struct SessionLayoutMetadata {
     pub default_editor: Option<PathBuf>,
     tabs: Vec<TabLayoutMetadata>,
     session_attention_muted: bool,
+#[derive(Default, Debug, Clone)]
+pub struct SessionLayoutMetadata {
+    default_layout: Box<Layout>,
+    global_cwd: Option<PathBuf>,
+    pub default_shell: Option<PathBuf>,
+    pub default_editor: Option<PathBuf>,
+    tabs: Vec<TabLayoutMetadata>,
+    session_attention_muted: bool,
+    /// Terminal size per attached client, as `Screen` last recorded it. Carried here because the
+    /// client list is assembled in the plugin thread, which has no view of `Screen`'s state.
+    client_sizes: BTreeMap<ClientId, Size>,
+    /// Terminal device per attached client, same reason as `client_sizes`: assembled in the
+    /// plugin thread, which has no view of `Screen`'s state.
+    client_ttys: BTreeMap<ClientId, String>,
+    /// The rootshell tab per attached client (`LC_ROOTSHELL_PANE`), same reason again. Only the
+    /// JSON client list reads it.
+    client_rootshell_panes: BTreeMap<ClientId, String>,
 }
 
 impl SessionLayoutMetadata {
@@ -686,8 +703,16 @@ impl PaneLayoutMetadata {
 pub struct ClientMetadata {
     pane_id: PaneId,
     command: Option<Run>,
+    terminal_size: Option<Size>,
+    tty: Option<String>,
 }
 impl ClientMetadata {
+    pub fn terminal_size(&self) -> Option<Size> {
+        self.terminal_size
+    }
+    pub fn tty(&self) -> Option<String> {
+        self.tty.clone()
+    }
     pub fn stringify_pane_id(&self) -> String {
         match self.pane_id {
             PaneId::Terminal(terminal_id) => format!("terminal_{}", terminal_id),
@@ -967,4 +992,71 @@ mod tests {
             ))
         );
     }
+    fn pane_focused_by(terminal_id: u32, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {
+        PaneLayoutMetadata::new(
+            PaneId::Terminal(terminal_id),
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            !focused_clients.is_empty(),
+            None,
+            focused_clients,
+            None,
+            None,
+            Default::default(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn each_client_carries_the_size_of_its_own_terminal() {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            true,
+            vec![pane_focused_by(1, vec![1]), pane_focused_by(2, vec![2])],
+            vec![],
+        );
+        let mut client_sizes = BTreeMap::new();
+        client_sizes.insert(
+            1,
+            Size {
+                rows: 50,
+                cols: 200,
+            },
+        );
+        client_sizes.insert(2, Size { rows: 20, cols: 60 });
+        meta.set_client_sizes(client_sizes);
+
+        let clients = meta.all_clients_metadata();
+        assert_eq!(
+            clients.get(&1).and_then(|c| c.terminal_size()),
+            Some(Size {
+                rows: 50,
+                cols: 200
+            })
+        );
+        assert_eq!(
+            clients.get(&2).and_then(|c| c.terminal_size()),
+            Some(Size { rows: 20, cols: 60 })
+        );
+    }
+
+    #[test]
+    fn a_client_the_server_has_not_sized_reports_no_size() {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            true,
+            vec![pane_focused_by(1, vec![1])],
+            vec![],
+        );
+        let clients = meta.all_clients_metadata();
+        assert_eq!(clients.get(&1).and_then(|c| c.terminal_size()), None);
+    }
+
 }

@@ -50,7 +50,7 @@ pub use super::generated_api::api::{
         PluginSettingsEntry as ProtobufPluginSettingsEntry,
         PromptResultPayload as ProtobufPromptResultPayload,
         ResurrectableSession as ProtobufResurrectableSession, SelectedText as ProtobufSelectedText,
-        SessionManifest as ProtobufSessionManifest,
+        SessionManifest as ProtobufSessionManifest, SessionWarning as ProtobufSessionWarning,
         SoftKeyboardVisibilityChangedPayload as ProtobufSoftKeyboardVisibilityChangedPayload,
         SyntaxError as ProtobufSyntaxError, TabInfo as ProtobufTabInfo,
         TabMetadata as ProtobufTabMetadata, UserActionPayload as ProtobufUserActionPayload,
@@ -73,8 +73,8 @@ use crate::data::{
     LayoutInfo, LayoutMetadata, ModeInfo, Mouse, NestedSessionEndReason, NestedSessionKeybinds,
     NestedSessionKeybindsError, NestedSessionKeybindsResponse, PaneContents, PaneId, PaneInfo,
     PaneManifest, PaneMetadata, PaneScrollbackResponse, PermissionStatus, PluginCapabilities,
-    PluginInfo, PluginSettingsEntry, SelectedText, SessionInfo, SettingKey, Style, StyledText,
-    TabInfo, TabMetadata, WebServerStatus, WebSharing,
+    PluginInfo, PluginSettingsEntry, SelectedText, SessionInfo, SessionWarning, SettingKey, Style,
+    StyledText, TabInfo, TabMetadata, WebServerStatus, WebSharing,
 };
 #[allow(hidden_glob_reexports)]
 use crate::data::{HostId, LiveViewRelease, MirrorClosedReason, MirrorState, PaneAddress};
@@ -1084,7 +1084,8 @@ impl TryFrom<ProtobufClientInfo> for ClientInfo {
                 .try_into()?,
             protobuf_client_info.running_command,
             protobuf_client_info.is_current_client,
-        ))
+        )
+        .with_tty(protobuf_client_info.tty))
     }
 }
 
@@ -1096,6 +1097,7 @@ impl TryFrom<ClientInfo> for ProtobufClientInfo {
             pane_id: Some(client_info.pane_id.try_into()?),
             running_command: client_info.running_command,
             is_current_client: client_info.is_current_client,
+            tty: client_info.tty,
         })
     }
 }
@@ -2571,6 +2573,19 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
                 .into_iter()
                 .map(|r| r.into())
                 .collect(),
+            program_title: protobuf_pane_info.program_title,
+            stack_id: protobuf_pane_info.stack_id.map(|s| s as usize),
+            index_in_stack: protobuf_pane_info.index_in_stack.map(|i| i as usize),
+            is_expanded_in_stack: protobuf_pane_info.is_expanded_in_stack,
+            uuid: protobuf_pane_info.uuid,
+            restored_from: protobuf_pane_info.restored_from,
+            handle: protobuf_pane_info.handle,
+            tab_id: protobuf_pane_info.tab_id as usize,
+            pane_cwd: protobuf_pane_info.pane_cwd,
+            pane_pid: protobuf_pane_info.pane_pid,
+            pane_command: protobuf_pane_info.pane_command,
+            last_output_at: protobuf_pane_info.last_output_at,
+            has_pending_bell: protobuf_pane_info.has_pending_bell,
         })
     }
 }
@@ -2625,6 +2640,19 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
                 .into_iter()
                 .map(|r| r.into())
                 .collect(),
+            program_title: pane_info.program_title,
+            stack_id: pane_info.stack_id.map(|s| s as u32),
+            index_in_stack: pane_info.index_in_stack.map(|i| i as u32),
+            is_expanded_in_stack: pane_info.is_expanded_in_stack,
+            uuid: pane_info.uuid,
+            restored_from: pane_info.restored_from,
+            handle: pane_info.handle,
+            tab_id: pane_info.tab_id as u32,
+            pane_cwd: pane_info.pane_cwd,
+            pane_pid: pane_info.pane_pid,
+            pane_command: pane_info.pane_command,
+            last_output_at: pane_info.last_output_at,
+            has_pending_bell: pane_info.has_pending_bell,
         })
     }
 }
@@ -3756,8 +3784,23 @@ fn serialize_session_update_event_with_non_default_values() {
             attention: Default::default(),
             command_state: Default::default(),
             program_status: Default::default(),
+            program_title: Some("i am an osc title".to_owned()),
+            stack_id: Some(1),
+            index_in_stack: Some(0),
+            is_expanded_in_stack: true,
+            uuid: String::new(),
+            restored_from: String::new(),
+            handle: String::new(),
+            pane_cwd: Some("/home/user/develop/thing".to_owned()),
+            pane_pid: Some(90210),
+            pane_command: Some("claude --resume".to_owned()),
+            last_output_at: Some(1_760_000_000_000),
+            has_pending_bell: true,
         },
         PaneInfo {
+            note: String::new(),
+            note_color: Default::default(),
+            tab_id: 7,
             id: 1,
             is_plugin: true,
             is_focused: true,
@@ -3788,6 +3831,20 @@ fn serialize_session_update_event_with_non_default_values() {
             attention: Default::default(),
             command_state: Default::default(),
             program_status: Default::default(),
+            program_title: None,
+            stack_id: Some(1),
+            index_in_stack: Some(1),
+            is_expanded_in_stack: false,
+            uuid: String::new(),
+            restored_from: String::new(),
+            handle: String::new(),
+            // a plugin pane has no process of its own
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
+            last_output_at: None,
+            has_pending_bell: false,
+            // a plugin pane draws its own contents, so it has none of this either
         },
     ];
     panes.insert(0, panes_list);
@@ -3946,6 +4003,7 @@ impl Into<ProtobufPaneFrameStyle> for crate::input::options::PaneFrameStyle {
             crate::input::options::PaneFrameStyle::Full => ProtobufPaneFrameStyle::Full,
             crate::input::options::PaneFrameStyle::Titles => ProtobufPaneFrameStyle::Titles,
             crate::input::options::PaneFrameStyle::None => ProtobufPaneFrameStyle::None,
+            crate::input::options::PaneFrameStyle::TopOnly => ProtobufPaneFrameStyle::TopOnly,
         }
     }
 }
@@ -3956,6 +4014,7 @@ impl Into<crate::input::options::PaneFrameStyle> for ProtobufPaneFrameStyle {
             ProtobufPaneFrameStyle::Full => crate::input::options::PaneFrameStyle::Full,
             ProtobufPaneFrameStyle::Titles => crate::input::options::PaneFrameStyle::Titles,
             ProtobufPaneFrameStyle::None => crate::input::options::PaneFrameStyle::None,
+            ProtobufPaneFrameStyle::TopOnly => crate::input::options::PaneFrameStyle::TopOnly,
         }
     }
 }

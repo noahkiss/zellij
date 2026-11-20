@@ -78,6 +78,14 @@ pub struct CliAssets {
     pub initial_panes: Option<Vec<CommandOrPlugin>>,
     #[serde(default)]
     pub switch_context: Option<crate::session_history::SwitchContext>,
+    /// The terminal device this client is attached to, as the client saw it (`/dev/ttys004`).
+    ///
+    /// Fork addition, for telling attached clients apart in the session manager. The hostname
+    /// would be the wrong key - a zellij client is always local to its server, so an ssh or mosh
+    /// attach reports the server's host - and the tty is the part that actually names the terminal
+    /// a human is sitting at. `None` for a client with no controlling terminal, which is what a
+    /// web client and a CLI action are.
+    pub tty: Option<String>,
 }
 
 impl CliAssets {

@@ -1,0 +1,258 @@
+//! What this build can do, in a form a consumer can read.
+//!
+//! A consumer that wants to know whether a fork feature is present has only had the version string
+//! to go on, and that string is not orderable across an upstream bump: the `-nkmk.<n>` counter
+//! RESETS when the upstream version moves, so `0.45.0-nkmk.4` is newer than `0.44.3-nkmk.7` while
+//! `4 < 7`. Anything gating on the counter alone silently switches features off on an upgrade.
+//!
+//! So the build says what it has. `zellij setup --check --json` prints the version split into the
+//! pair that IS comparable - the upstream base and the fork counter - and a flat list of stable
+//! capability names. **Gate on the names.** A name is added when a surface appears and is never
+//! reused for anything else; the version pair is for reporting, not for deciding.
+
+use serde::{Deserialize, Serialize};
+
+use crate::consts::VERSION;
+
+/// The name of this fork, as it appears in the version suffix.
+pub const FORK_NAME: &str = "nkmk";
+
+/// Every consumer-visible surface this fork adds, by stable name.
+///
+/// One line per feature, added when the feature lands. Names are lower-case and hyphenated, they
+/// name the surface rather than the patch, and they never change meaning - a renamed feature gets
+/// a new name and keeps the old one until nothing reads it.
+pub const CAPABILITIES: &[&str] = &[
+    // this list itself, so a consumer can tell "no capabilities" from "too old to answer"
+    "capabilities-json",
+    // session lifecycle and its init-system integration
+    "session-lifecycle",      // zellij session up|down|restart
+    "session-service",        // zellij session enable|disable|status, setup --generate-service
+    "session-kill-wait",      // kill-session/delete-session wait, --wait-timeout, --no-wait
+    "attach-no-resurrect",    // zellij attach --no-resurrect
+    "ls-exited-marker",       // zellij ls -s marks dead sessions (EXITED)
+    "ls-json",                // zellij ls --json
+    "setup-socket-dir",       // setup --check prints [SOCKET DIR]; ls warns about other socket dirs
+    "build-mismatch-warning", // a client warns when the running server is another build
+    // the snapshot archive
+    "session-snapshots", // zellij snapshot list|show|restore|rm|prune, attach --restore
+    // pane and client identity, all of it in `list-panes --json` / `list-clients`
+    "pane-uuid",                // PaneInfo.uuid
+    "pane-restored-from",       // PaneInfo.restored_from
+    "pane-pid",                 // list-panes --json carries pane_pid
+    "pane-process-info",        // PaneInfo.pane_pid, pane_cwd, pane_command
+    "pane-last-output",         // PaneInfo.last_output_at
+    "pane-pending-bell",        // PaneInfo.has_pending_bell, tracked while detached
+    "pane-program-title",       // PaneInfo.program_title
+    "pane-stack-fields",        // PaneInfo.stack_id, index_in_stack, is_expanded_in_stack
+    "client-tty",               // ClientInfo.tty
+    "list-clients-json",        // zellij action list-clients --json
+    "client-rootshell-pane",    // list-clients --json rootshell_pane, from LC_ROOTSHELL_PANE
+    "move-tab-to-index",        // zellij action move-tab --to-index
+    "go-to-tab-name-no-focus",  // zellij action go-to-tab-name --create --no-focus
+    "new-pane-stacked-error",   // --stacked refuses instead of creating nothing
+    "dump-screen-plugin-panes", // dump-screen works on plugin panes
+    "cli-error-reporting", // a missed target or a timed-out action exits non-zero and says why on stderr
+    // plugin development loop
+    "plugin-watch",               // plugin_watch, hot-reload of file: plugins
+    "plugin-permissions",         // plugin_permissions in config.kdl
+    "builtin-slim-bars",          // zellij:slim-tab-bar, zellij:slim-keybinds
+    "background-plugin-dispatch", // a background plugin gets updates with no client attached
+    "web-request-timeout", // web_request times out, and reports the kind in x-zellij-error-kind
+    // configuration this fork adds
+    "config-path-expansion",    // ~ and $VAR in config paths
+    "terminal-title-template",  // terminal_title_template, session_aliases
+    "pane-frame-top-only",      // pane_frame_style "top_only"
+    "bell-clear-delay",         // bell_clear_delay_ms
+    "default-floating-size",    // default_floating_size
+    "resurrect-command-hints",  // resurrect_command_hints
+    "resurrect-commands",       // resurrect_commands "all" | "agents" | "prefill"
+    "agent-session-osc",        // OSC 1337 SetUserVar=agent_session, setup --agent-hooks
+    "agent-hooks-write",        // setup --agent-hooks --write; doctor keeps the script current
+    "harness-map",              // setup --harness-map [--json]: facts and pure screen detector data
+    "program-status-osc", // OSC 7501 answered and kept per pane; state, state_* on list-panes/list-agents --json
+    "list-agents-all-sessions", // list-agents --all-sessions, a session key on each row
+    "wait-agent-change",  // action wait --for agent-change: blocking agent transitions
+    "wait-agent-state", // action wait --for agent-idle|agent-waiting, input_since_state on list-panes --json
+    "last-reply",       // action last-reply: an agent's last reply, from its transcript
+    "session-drop-env", // session_restart_drop_env
+    "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
+    "session-service-config", // session_service, pin_exe
+    "session-warnings", // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
+    "agent-names",      // live Claude messaging names and caller markers in CLI agent lists
+    "pane-frame-agent-name", // pane_frame_agent_name, default false
+    "agent-whoami",     // action whoami and Claude SessionStart pane context
+    "mcp-agent-surfaces", // agents prompt and zellij://agents resource
+    "mcp-agent-input-hint", // named agent guidance after zellij_write_input
+    "mcp-remote-hosts", // zellij mcp: remote_hosts in config.kdl, host/session, scope=fleet
+    "action-watch",     // action watch --json: the server-pushed event stream
+    // state_working on list-panes/list-agents --json: working records, background subagents included
+    "program-status-working-count",
+    // session down|restart refuse with exit 4 while an agent is working; --force overrides
+    "session-agent-guard",
+    // action send-message / message-status, zellij_send: guarded, queued agent messages
+    "agent-send-message",
+];
+
+/// The version, split into the parts that can actually be compared.
+///
+/// `base` moves with upstream and orders normally. `fork_counter` orders only WITHIN one `base`,
+/// because it restarts at 1 whenever `base` moves. An upstream build reports `fork: None` and
+/// `fork_counter: None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionInfo {
+    /// The whole string, exactly as `zellij --version` prints it.
+    pub version: String,
+    /// The upstream version this build is based on, e.g. `0.45.0`.
+    pub base: String,
+    /// The fork name, e.g. `nkmk`. Absent in an upstream build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork: Option<String>,
+    /// The fork counter, e.g. `4`. Absent in an upstream build. Comparable only within one `base`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_counter: Option<u64>,
+}
+
+impl VersionInfo {
+    /// Split a version string of the form `<base>-<fork>.<counter>`.
+    ///
+    /// `base` is always the part before the first `-`, so an upstream pre-release still reports the
+    /// version it is a pre-release of. A suffix that is not `<name>.<number>` leaves `fork` and
+    /// `fork_counter` unset - an upstream build has no fork counter to compare.
+    ///
+    /// A release candidate is built with `-rc.<n>` appended to the whole thing, and reports the
+    /// fork counter it is a candidate FOR: `version` keeps the candidate number, `fork_counter`
+    /// does not. The alternative reads `nkmk.17-rc` as the fork name.
+    pub fn from_version_string(version: &str) -> Self {
+        let (base, suffix) = match version.split_once('-') {
+            Some((base, suffix)) => (base, Some(suffix)),
+            None => (version, None),
+        };
+        let suffix = suffix.map(|suffix| match suffix.rsplit_once("-rc.") {
+            Some((fork, candidate))
+                if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                fork
+            },
+            _ => suffix,
+        });
+        let fork_parts =
+            suffix
+                .and_then(|suffix| suffix.rsplit_once('.'))
+                .and_then(|(fork, counter)| {
+                    counter
+                        .parse::<u64>()
+                        .ok()
+                        .map(|counter| (fork.to_owned(), counter))
+                });
+        VersionInfo {
+            version: version.to_owned(),
+            base: base.to_owned(),
+            fork: fork_parts.as_ref().map(|(fork, _)| fork.clone()),
+            fork_counter: fork_parts.map(|(_, counter)| counter),
+        }
+    }
+}
+
+/// The version and capabilities of this build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildCapabilities {
+    #[serde(flatten)]
+    pub version: VersionInfo,
+    /// Stable capability names. Gate on these, never on the version.
+    pub capabilities: Vec<String>,
+}
+
+impl Default for BuildCapabilities {
+    fn default() -> Self {
+        BuildCapabilities {
+            version: VersionInfo::from_version_string(VERSION),
+            capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+}
+
+impl BuildCapabilities {
+    /// True when this build reports the named capability.
+    pub fn has(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_string_splits_into_base_and_counter() {
+        let parsed = VersionInfo::from_version_string("0.45.0-nkmk.4");
+        assert_eq!(parsed.base, "0.45.0");
+        assert_eq!(parsed.fork.as_deref(), Some("nkmk"));
+        assert_eq!(parsed.fork_counter, Some(4));
+    }
+
+    #[test]
+    fn an_upstream_version_has_no_fork_parts() {
+        let parsed = VersionInfo::from_version_string("0.45.0");
+        assert_eq!(parsed.base, "0.45.0");
+        assert_eq!(parsed.fork, None);
+        assert_eq!(parsed.fork_counter, None);
+    }
+
+    #[test]
+    fn a_release_candidate_reports_the_counter_it_is_a_candidate_for() {
+        let parsed = VersionInfo::from_version_string("0.45.0-nkmk.17-rc.1");
+        assert_eq!(parsed.base, "0.45.0");
+        assert_eq!(parsed.fork.as_deref(), Some("nkmk"));
+        assert_eq!(parsed.fork_counter, Some(17));
+        assert_eq!(
+            parsed.version, "0.45.0-nkmk.17-rc.1",
+            "the whole string still says which candidate this is"
+        );
+    }
+
+    /// `-rc.` marks a candidate only when a number follows it, so the rule cannot eat the end of a
+    /// suffix that merely looks like one.
+    #[test]
+    fn an_rc_marker_without_a_number_is_left_where_it_is() {
+        let parsed = VersionInfo::from_version_string("0.45.0-nkmk.17-rc.beta");
+        assert_eq!(parsed.base, "0.45.0");
+        assert_eq!(parsed.fork, None);
+        assert_eq!(parsed.fork_counter, None);
+    }
+
+    #[test]
+    fn a_suffix_that_is_not_a_fork_counter_is_left_alone() {
+        let parsed = VersionInfo::from_version_string("0.45.0-alpha1");
+        assert_eq!(parsed.base, "0.45.0");
+        assert_eq!(parsed.fork, None);
+        assert_eq!(parsed.fork_counter, None);
+    }
+
+    #[test]
+    fn this_build_reports_its_own_version_and_a_known_capability() {
+        let capabilities = BuildCapabilities::default();
+        assert_eq!(capabilities.version.version, VERSION);
+        assert!(capabilities.has("capabilities-json"));
+        assert!(capabilities.has("pane-uuid"));
+    }
+
+    #[test]
+    fn capability_names_are_unique_and_well_formed() {
+        let mut seen = std::collections::HashSet::new();
+        for capability in CAPABILITIES {
+            assert!(
+                seen.insert(*capability),
+                "capability '{}' is listed twice",
+                capability
+            );
+            assert!(
+                capability
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "capability '{}' is not lower-case and hyphenated",
+                capability
+            );
+        }
+    }
+}

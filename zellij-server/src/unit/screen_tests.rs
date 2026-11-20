@@ -184,11 +184,47 @@ fn route_arbitrary_action_to_server(
     .unwrap();
 }
 
+// same as the above, but hands back the completion result so a test can assert on the
+// error message and exit status an action reports
+fn route_arbitrary_action_and_get_result(
+    session_metadata: &SessionMetaData,
+    action: Action,
+    client_id: ClientId,
+) -> crate::route::ActionCompletionResult {
+    let senders = session_metadata.senders.clone();
+    let default_mode = session_metadata
+        .session_configuration
+        .get_client_configuration(&client_id)
+        .options
+        .default_mode
+        .unwrap_or(InputMode::Normal);
+    let (_should_break, result) = route_action(
+        action,
+        client_id,
+        None,
+        None,
+        senders,
+        None,
+        None,
+        default_mode,
+        None,
+        false,
+    )
+    .unwrap();
+    result.expect("action did not report a completion result")
+}
+
 #[derive(Clone, Default)]
 struct FakeInputOutput {
     fake_filesystem: Arc<Mutex<HashMap<String, String>>>,
     server_to_client_messages: Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
     tty_stdin_bytes: Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    // a client listed here fails every try_send_to_client with the given reason, so a test can
+    // stage a slow client or a departed one
+    client_send_state: Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+    // a (client, pane) listed here fails only that pane's render update, so a test can stage a
+    // channel that fills partway through a batch
+    pane_send_state: Arc<Mutex<HashMap<(ClientId, zellij_utils::data::PaneId), SendToClientError>>>,
 }
 
 impl ServerOsApi for FakeInputOutput {
@@ -241,6 +277,27 @@ impl ServerOsApi for FakeInputOutput {
             .or_insert_with(Vec::new)
             .push(msg);
         Ok(())
+    }
+    fn try_send_to_client(
+        &self,
+        client_id: ClientId,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        if let Some(failure) = self.client_send_state.lock().unwrap().get(&client_id) {
+            return Err(*failure);
+        }
+        if let ServerToClientMsg::PaneRenderUpdate { pane_id, .. } = &msg {
+            if let Some(failure) = self
+                .pane_send_state
+                .lock()
+                .unwrap()
+                .get(&(client_id, *pane_id))
+            {
+                return Err(*failure);
+            }
+        }
+        self.send_to_client(client_id, msg)
+            .map_err(|_| SendToClientError::ClientGone)
     }
     fn register_client(
         &mut self,
@@ -2725,11 +2782,149 @@ pub fn send_cli_write_action_to_screen() {
     let cli_action = CliAction::Write {
         bytes: vec![102, 111, 111],
         pane_id: None,
+#[test]
+pub fn write_to_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
     };
-    send_cli_action_to_server(&session_metadata, cli_action, client_id);
-    std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
-    mock_screen.teardown(vec![pty_writer_thread, screen_thread]);
-    assert_snapshot!(format!("{:?}", *received_pty_instructions.lock().unwrap()));
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::WriteCharsToPaneId {
+            chars: "input from the cli".into(),
+            pane_id: zellij_utils::data::PaneId::Terminal(999),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn paste_to_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::Paste {
+            chars: "pasted from the cli".into(),
+            pane_id: Some(zellij_utils::data::PaneId::Terminal(999)),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn write_to_existing_pane_reports_no_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::WriteCharsToPaneId {
+            chars: "input from the cli".into(),
+            pane_id: zellij_utils::data::PaneId::Terminal(0),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+    assert_eq!(result.exit_status, None);
+}
+
+#[test]
+pub fn close_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTerminalPane { pane_id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn edit_scrollback_for_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::EditScrollbackForPaneWithId(
+            PaneId::Terminal(999),
+            Some(crate::route::NotificationEnd::new(completion_tx)),
+        ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![screen_thread]);
+    let result = completion_rx
+        .try_recv()
+        .expect("no completion result was sent");
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
 }
 
 #[test]
@@ -6023,9 +6218,23 @@ fn create_new_screen_with_message_capture(
     Screen,
     Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
 ) {
-    let mut bus: Bus<ScreenInstruction> = Bus::empty();
-    let fake_os_input = FakeInputOutput::default();
-    let messages = fake_os_input.server_to_client_messages.clone();
+    let (screen, messages, _client_send_state) = create_new_screen_with_client_send_state(size);
+    (screen, messages)
+}
+
+// as above, but also hands back the map controlling how sends to each client fail
+fn create_new_screen_with_client_send_state(
+    size: Size,
+) -> (
+    Screen,
+    Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
+    Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+) {
+    let (screen, messages, client_send_state, _pane_send_state) =
+        create_new_screen_with_pane_send_state(size);
+    (screen, messages, client_send_state)
+}
+
     bus.os_input = Some(Box::new(fake_os_input));
     let client_attributes = ClientAttributes {
         size,
@@ -6081,6 +6290,9 @@ fn create_new_screen_with_message_capture(
         false,
         StackListOrientation::default(),
         None,
+        None,
+        InputWhileScrolled::default(),
+        CommandPaneOnCleanExit::default(),
         false,
         web_sharing,
         true,
@@ -6091,6 +6303,7 @@ fn create_new_screen_with_message_capture(
         true,
         true,
         visual_bell,
+        0,     // bell_clear_delay_ms
         false, // focus_follows_mouse
         false, // mouse_click_through
         web_server_ip,
@@ -6098,7 +6311,12 @@ fn create_new_screen_with_message_capture(
         NestedSessionHandling::default(),
         "test-session-id".to_string(),
     );
-    (seed_first_client_size(screen, size), messages)
+    (
+        seed_first_client_size(screen, size),
+        messages,
+        client_send_state,
+        pane_send_state,
+    )
 }
 
 #[test]
@@ -6235,6 +6453,116 @@ fn subscriber_receives_update_on_changed_viewport() {
         },
         other => panic!("Expected PaneRenderUpdate, got {:?}", other),
     }
+}
+
+#[test]
+fn slow_subscriber_keeps_its_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, messages, client_send_state) = create_new_screen_with_client_send_state(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+
+    // the client is behind, not gone
+    client_send_state
+        .lock()
+        .unwrap()
+        .insert(100, SendToClientError::ClientBusy);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        zellij_utils::data::PaneId::Terminal(1),
+        PaneContents {
+            viewport: vec!["changed line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    assert!(
+        screen.pane_render_subscribers.contains_key(&100),
+        "A subscriber that is merely behind must keep its subscription"
+    );
+
+    // once it catches up, the update it missed is sent - it was never marked as delivered
+    client_send_state.lock().unwrap().remove(&100);
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    let msgs = messages.lock().unwrap();
+    let client_msgs = msgs.get(&100).unwrap();
+    assert_eq!(client_msgs.len(), 2);
+    match &client_msgs[1] {
+        ServerToClientMsg::PaneRenderUpdate { viewport, .. } => {
+            assert_eq!(viewport, &vec!["changed line".to_string()]);
+        },
+        other => panic!("Expected PaneRenderUpdate, got {:?}", other),
+    }
+}
+
+#[test]
+fn departed_subscriber_loses_its_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _messages, client_send_state) = create_new_screen_with_client_send_state(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+
+    client_send_state
+        .lock()
+        .unwrap()
+        .insert(100, SendToClientError::ClientGone);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        zellij_utils::data::PaneId::Terminal(1),
+        PaneContents {
+            viewport: vec!["changed line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    assert!(
+        !screen.pane_render_subscribers.contains_key(&100),
+        "A subscriber whose client is gone must be dropped"
+    );
+}
+
+#[test]
+fn resubscribing_to_only_dead_panes_ends_the_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _messages) = create_new_screen_with_message_capture(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+    assert!(screen.pane_render_subscribers.contains_key(&100));
+
+    // the client asks for panes that do not exist: the old subscription must not survive it
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(999)],
+        None,
+        false,
+    );
+    assert!(
+        !screen.pane_render_subscribers.contains_key(&100),
+        "A subscribe naming no live pane must replace the previous subscription"
+    );
 }
 
 #[test]
@@ -8343,6 +8671,642 @@ pub fn background_plugin_receives_broadcasts_regardless_of_active_tab() {
         !plugin_ids_that_received_mode_update.contains(&3),
         "Inactive tab plugin 3 should NOT receive ModeUpdate, got: {:?}",
         plugin_ids_that_received_mode_update
+    );
+}
+
+#[derive(Default, Debug)]
+struct BackgroundPluginDelivery {
+    pane_updates: usize,
+    tab_updates: usize,
+    max_pane_updates_per_batch: usize,
+    max_tab_updates_per_batch: usize,
+    last_tab_update_len: Option<usize>,
+}
+
+/// Count the PaneUpdate/TabUpdate events delivered to one background plugin. A batch is one
+/// PluginInstruction::Update, i.e. one state change, so the per-batch maxima catch a background
+/// plugin being served once per connected client instead of once per change.
+fn background_plugin_delivery(
+    instructions: &[PluginInstruction],
+    plugin_id: u32,
+) -> BackgroundPluginDelivery {
+    let mut delivery = BackgroundPluginDelivery::default();
+    for instruction in instructions {
+        if let PluginInstruction::Update(updates) = instruction {
+            let mut pane_updates_in_batch = 0;
+            let mut tab_updates_in_batch = 0;
+            for (pid, _cid, event) in updates {
+                if pid != &Some(plugin_id) {
+                    continue;
+                }
+                match event {
+                    Event::PaneUpdate(..) => pane_updates_in_batch += 1,
+                    Event::TabUpdate(tab_infos) => {
+                        tab_updates_in_batch += 1;
+                        delivery.last_tab_update_len = Some(tab_infos.len());
+                    },
+                    _ => {},
+                }
+            }
+            delivery.pane_updates += pane_updates_in_batch;
+            delivery.tab_updates += tab_updates_in_batch;
+            delivery.max_pane_updates_per_batch = delivery
+                .max_pane_updates_per_batch
+                .max(pane_updates_in_batch);
+            delivery.max_tab_updates_per_batch =
+                delivery.max_tab_updates_per_batch.max(tab_updates_in_batch);
+        }
+    }
+    delivery
+}
+
+fn subscribe_background_plugin(mock_screen: &MockScreen, plugin_id: u32, client_id: ClientId) {
+    let mut subscriptions = HashSet::new();
+    subscriptions.insert(EventType::PaneUpdate);
+    subscriptions.insert(EventType::TabUpdate);
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdateBackgroundPluginSubscriptions(
+            plugin_id,
+            client_id,
+            subscriptions,
+        ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+/// A two-pane tab, so that closing one pane is a state change that does not close the tab.
+fn two_pane_layout() -> TiledPaneLayout {
+    let mut layout = TiledPaneLayout::default();
+    layout.children_split_direction = SplitDirection::Vertical;
+    layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    layout
+}
+
+#[test]
+pub fn background_plugin_receives_updates_with_no_clients_attached() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // detach the only client, then change state
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0,
+        "background plugin should receive PaneUpdate with no clients attached, got: {:?}",
+        delivery
+    );
+    assert!(
+        delivery.tab_updates > 0,
+        "background plugin should receive TabUpdate with no clients attached, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "background plugin should receive one TabUpdate per change, got: {:?}",
+        delivery
+    );
+}
+
+#[test]
+pub fn background_plugin_receives_one_update_per_change_with_one_client() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0 && delivery.tab_updates > 0,
+        "background plugin should receive both updates with one client, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "background plugin should receive one TabUpdate per change, got: {:?}",
+        delivery
+    );
+}
+
+#[test]
+pub fn background_plugin_receives_one_update_per_change_with_two_clients() {
+    // Tab 0: plugin pane 2, Tab 1: two terminal panes. Client 1 stays on tab 1, client 2 goes
+    // to tab 0, so the two clients sit on different tabs.
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0 && delivery.tab_updates > 0,
+        "background plugin should receive both updates with two clients, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "two clients must not mean two PaneUpdates for one change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "two clients must not mean two TabUpdates for one change, got: {:?}",
+        delivery
+    );
+    // the background payload lists every tab, not only the client's own
+    assert_eq!(
+        delivery.last_tab_update_len,
+        Some(2),
+        "background TabUpdate should list every tab, got: {:?}",
+        delivery
+    );
+}
+
+/// Every TabUpdate is addressed to a client. That client is never one of the tab's "other"
+/// focused clients: a shared plugin instance draws its tab bar from whatever its slots hear,
+/// background slot included, and would draw a multiplayer cursor for the only client there is.
+#[test]
+pub fn tab_update_never_lists_its_own_client_as_another_focused_client() {
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // one client alone, then a second client on the same tab
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_second_client = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    subscribe_background_plugin(&mock_screen, 99, second_client_id);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let mut background_updates_seen = 0;
+    let mut client_one_saw_client_two = false;
+    for (index, instruction) in instructions.iter().enumerate() {
+        let PluginInstruction::Update(updates) = instruction else {
+            continue;
+        };
+        for (pid, cid, event) in updates {
+            let Event::TabUpdate(tab_infos) = event else {
+                continue;
+            };
+            let Some(cid) = cid else {
+                continue;
+            };
+            if pid == &Some(99) {
+                background_updates_seen += 1;
+            }
+            for tab_info in tab_infos {
+                assert!(
+                    !tab_info.other_focused_clients.contains(cid),
+                    "TabUpdate to plugin {:?} for client {} lists that client as another \
+                     focused client: {:?}",
+                    pid,
+                    cid,
+                    tab_info
+                );
+                assert_eq!(
+                    tab_info.other_focused_clients.len(),
+                    tab_info.other_focused_client_slots.len(),
+                    "every other focused client has a display slot: {:?}",
+                    tab_info
+                );
+                if index >= instructions_before_second_client
+                    && pid == &Some(99)
+                    && *cid == main_client_id
+                    && tab_info.other_focused_clients.contains(&second_client_id)
+                {
+                    client_one_saw_client_two = true;
+                }
+            }
+        }
+    }
+    assert!(
+        background_updates_seen > 0,
+        "background plugin should receive TabUpdate"
+    );
+    assert!(
+        client_one_saw_client_two,
+        "the background TabUpdate for client 1 should still list client 2 on the shared tab"
+    );
+}
+
+/// A background subscription whose client is attached hears exactly that client's TabUpdate, the
+/// one the client's own tab plugins hear: a shared plugin instance draws that client's tab bar from
+/// it. Once the client detaches, the subscription hears the screen-wide state instead.
+#[test]
+pub fn background_tab_update_for_an_attached_client_is_that_clients_own_view() {
+    use zellij_utils::data::TabInfo;
+    // Tab 0: plugin pane 2, Tab 1: two terminal panes. Client 1 stays on tab 1, client 2 goes
+    // to tab 0, so the two clients sit on different tabs.
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+    subscribe_background_plugin(&mock_screen, 99, second_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_detach = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(second_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let tab_updates_in = |instructions: &[PluginInstruction]| {
+        let mut batches = vec![];
+        for instruction in instructions {
+            let PluginInstruction::Update(updates) = instruction else {
+                continue;
+            };
+            let batch: Vec<(Option<u32>, Option<ClientId>, Vec<TabInfo>)> = updates
+                .iter()
+                .filter_map(|(pid, cid, event)| match event {
+                    Event::TabUpdate(tab_infos) => Some((*pid, *cid, tab_infos.clone())),
+                    _ => None,
+                })
+                .collect();
+            if !batch.is_empty() {
+                batches.push(batch);
+            }
+        }
+        batches
+    };
+    let active_tab_ids = |tab_infos: &[TabInfo]| -> Vec<usize> {
+        tab_infos
+            .iter()
+            .filter(|tab_info| tab_info.active)
+            .map(|tab_info| tab_info.tab_id)
+            .collect()
+    };
+
+    // both clients attached, on different tabs
+    let attached_batches =
+        tab_updates_in(&instructions[instructions_before_change..instructions_before_detach]);
+    assert!(
+        !attached_batches.is_empty(),
+        "the change should report tab state"
+    );
+    for batch in &attached_batches {
+        for client_id in [main_client_id, second_client_id] {
+            let background: Vec<&Vec<TabInfo>> = batch
+                .iter()
+                .filter(|(pid, cid, _)| *pid == Some(99) && *cid == Some(client_id))
+                .map(|(_, _, tab_infos)| tab_infos)
+                .collect();
+            assert_eq!(
+                background.len(),
+                1,
+                "one TabUpdate per background subscription per change, client {}: {:?}",
+                client_id,
+                batch
+            );
+            assert_eq!(
+                active_tab_ids(background[0]).len(),
+                1,
+                "client {} should see exactly one active tab: {:?}",
+                client_id,
+                background[0]
+            );
+        }
+        let background_for_main = batch
+            .iter()
+            .find(|(pid, cid, _)| *pid == Some(99) && *cid == Some(main_client_id))
+            .map(|(_, _, tab_infos)| active_tab_ids(tab_infos))
+            .unwrap();
+        let background_for_second = batch
+            .iter()
+            .find(|(pid, cid, _)| *pid == Some(99) && *cid == Some(second_client_id))
+            .map(|(_, _, tab_infos)| active_tab_ids(tab_infos))
+            .unwrap();
+        assert_ne!(
+            background_for_main, background_for_second,
+            "clients on different tabs should see different active tabs"
+        );
+        // the background slot hears what the client's own tab plugin hears
+        let (_, _, tab_plugin_view) = batch
+            .iter()
+            .find(|(pid, cid, _)| *pid == Some(2) && *cid == Some(second_client_id))
+            .expect("client 2's tab plugin hears the change");
+        let background_view = batch
+            .iter()
+            .find(|(pid, cid, _)| *pid == Some(99) && *cid == Some(second_client_id))
+            .map(|(_, _, tab_infos)| tab_infos)
+            .unwrap();
+        assert_eq!(
+            background_view, tab_plugin_view,
+            "background and tab plugin views of client 2 should match"
+        );
+    }
+
+    // client 2 detached: its subscription still hears tab state, the screen-wide one
+    let detached_batches = tab_updates_in(&instructions[instructions_before_detach..]);
+    let detached_views: Vec<&Vec<TabInfo>> = detached_batches
+        .iter()
+        .flatten()
+        .filter(|(pid, cid, _)| *pid == Some(99) && *cid == Some(second_client_id))
+        .map(|(_, _, tab_infos)| tab_infos)
+        .collect();
+    assert!(
+        !detached_views.is_empty(),
+        "a background subscription whose client detached should still hear tab state"
+    );
+    for tab_infos in detached_views {
+        assert_eq!(tab_infos.len(), 2, "the screen-wide view lists every tab");
+        assert_eq!(
+            active_tab_ids(tab_infos).len(),
+            1,
+            "only client 1's tab is active once client 2 has gone: {:?}",
+            tab_infos
+        );
+        // client 1's own view would list no other client on its tab; the screen-wide one, addressed
+        // to client 2, lists client 1 there
+        assert!(
+            tab_infos.iter().any(|tab_info| tab_info.active
+                && tab_info.other_focused_clients == vec![main_client_id]),
+            "the detached subscription hears the screen-wide view, not client 1's: {:?}",
+            tab_infos
+        );
+    }
+}
+
+#[test]
+pub fn background_plugin_gets_one_update_when_the_tab_list_changes() {
+    // A change to the tab list goes to EVERY tab's plugins, not just the active tab's. A
+    // background plugin lives in no tab, so that arm must not reach it a second time.
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    // moving client 1's tab reorders the tab list
+    let _ = mock_screen.to_screen.send(ScreenInstruction::MoveTabLeft(
+        mock_screen.main_client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let instructions_after_change = &instructions[instructions_before_change..];
+    // plugin 2 sits in a tab neither client has active after the move, so its TabUpdate proves
+    // the tab-list-changed arm ran
+    let tab_plugin_delivery = background_plugin_delivery(instructions_after_change, 2);
+    assert!(
+        tab_plugin_delivery.tab_updates > 0,
+        "the tab list change should reach every tab's plugins, got: {:?}",
+        tab_plugin_delivery
+    );
+
+    let delivery = background_plugin_delivery(instructions_after_change, 99);
+    assert!(
+        delivery.tab_updates > 0,
+        "background plugin should hear that the tab list changed, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "a tab list change must not deliver twice to a background plugin, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+}
+
+#[test]
+pub fn background_plugin_receives_updates_after_its_own_client_detaches() {
+    // The failure this guards: a background plugin is addressed by the ClientId it was loaded
+    // with, and that id is recycled. Delivery must not depend on that client still being here.
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // the client the plugin was loaded with leaves, another stays
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0,
+        "background plugin should receive PaneUpdate after its own client detached, got: {:?}",
+        delivery
+    );
+    assert!(
+        delivery.tab_updates > 0,
+        "background plugin should receive TabUpdate after its own client detached, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "background plugin should receive one TabUpdate per change, got: {:?}",
+        delivery
     );
 }
 
@@ -20409,3 +21373,671 @@ fn a_client_following_row_shifts_ends_up_with_the_same_screen_as_a_full_repaint(
     );
     assert_eq!(client.screen(), expected.screen());
 }
+#[test]
+fn a_moved_tab_is_serialized_where_it_was_moved_to() {
+    // the layout a session is restored from lists tabs in serialization order, so this order is
+    // the one a restarted session comes back in
+    let mut screen = create_fixed_size_screen();
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    let before_move = screen.get_layout_metadata(None, None).tab_names();
+
+    screen.move_active_tab_to_left(1).expect("TEST");
+
+    let after_move = screen.get_layout_metadata(None, None).tab_names();
+    assert_eq!(
+        after_move,
+        before_move.into_iter().rev().collect::<Vec<_>>(),
+        "the serialized order follows the move, not the order the tabs were created in"
+    );
+}
+
+#[test]
+fn switching_tabs_is_not_a_change_to_the_tab_list() {
+    // the tab list reaching plugins in tabs the user is not looking at is gated on this: a switch
+    // must not count, or the frequent case pays for the rare one (upstream #4918)
+    let mut screen = create_fixed_size_screen();
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    let before = screen.tab_structure();
+
+    screen.switch_tab_prev(None, true, 1).expect("TEST");
+    assert_eq!(
+        screen.tab_structure(),
+        before,
+        "switching tabs leaves the tab list alone"
+    );
+
+    screen.move_active_tab_to_left(1).expect("TEST");
+    assert_ne!(
+        screen.tab_structure(),
+        before,
+        "moving a tab changes it, so every tab's plugins hear about it"
+    );
+}
+
+#[test]
+fn a_pane_in_the_manifest_names_the_tab_it_is_in() {
+    // the manifest is keyed by tab POSITION and the pane carries the tab's stable ID. The two
+    // agree until a tab moves, which is the whole reason the id is on the pane: a consumer that
+    // reads the key as an identity is wrong from the first reorder onwards
+    let mut screen = create_fixed_size_screen();
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+
+    let panes_at_position = |manifest: &zellij_utils::data::PaneManifest, position: usize| {
+        let mut panes: Vec<(u32, usize)> = manifest
+            .panes
+            .get(&position)
+            .map(|panes| {
+                panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin)
+                    .map(|pane| (pane.id, pane.tab_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        panes.sort();
+        panes
+    };
+
+    let before = screen.generate_and_report_pane_state().expect("TEST");
+    assert_eq!(panes_at_position(&before, 0), vec![(1, 0)]);
+    assert_eq!(panes_at_position(&before, 1), vec![(2, 1)]);
+
+    screen.move_active_tab_to_left(1).expect("TEST");
+
+    let after = screen.generate_and_report_pane_state().expect("TEST");
+    assert_eq!(
+        panes_at_position(&after, 0),
+        vec![(2, 1)],
+        "the manifest key follows the move; the tab id the pane carries does not"
+    );
+    assert_eq!(panes_at_position(&after, 1), vec![(1, 0)]);
+}
+
+/// Moving focus inside a tab only renders, so the render path has to rebuild the manifest or
+/// `is_focused` keeps describing the focus from before the move.
+#[test]
+pub fn a_focus_move_inside_a_tab_refreshes_is_focused() {
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    // a second client attaches to the same tab, so both are looking at the same pane
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // one of them moves away, the other does not
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::FocusNextPane(second_client_id, None));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let focus: Vec<(u32, bool)> = panes
+        .iter()
+        .filter(|pane| !pane.is_plugin)
+        .map(|pane| (pane.id, pane.is_focused))
+        .collect();
+    assert_eq!(
+        focus,
+        vec![(0, true), (1, true)],
+        "the pane the second client moved to is focused too, without anything else reporting"
+    );
+}
+
+/// The last `PaneUpdate` manifest delivered to `plugin_id`, flattened into one list of panes.
+fn last_pane_update_for_plugin(
+    instructions: &[PluginInstruction],
+    plugin_id: u32,
+) -> Option<Vec<zellij_utils::data::PaneInfo>> {
+    let mut last = None;
+    for instruction in instructions {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _cid, event) in updates {
+                if pid != &Some(plugin_id) {
+                    continue;
+                }
+                if let Event::PaneUpdate(manifest) = event {
+                    last = Some(manifest.panes.values().flatten().cloned().collect());
+                }
+            }
+        }
+    }
+    last
+}
+
+#[test]
+pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let mut process_info = HashMap::new();
+    process_info.insert(
+        1,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: Some(std::path::PathBuf::from("/home/user/develop/thing")),
+            command: Some(vec!["claude".to_owned(), "--resume".to_owned()]),
+            agent_env: Default::default(),
+            agent_name: None,
+            agent_session_source: None,
+            osc_agent_session: None,
+        },
+    );
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents: true,
+            pane_frame_agent_name: false,
+        });
+    // any state change makes screen rebuild the manifest and report it
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(0),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let reported = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(reported.pane_pid, Some(90210));
+    assert_eq!(
+        reported.pane_cwd.as_deref(),
+        Some("/home/user/develop/thing")
+    );
+    assert_eq!(reported.pane_command.as_deref(), Some("claude --resume"));
+}
+
+/// How many `PaneUpdate`s delivered to `plugin_id` carried `program_title` on pane 1.
+fn pane_updates_carrying_program_title(
+    instructions: &[PluginInstruction],
+    plugin_id: u32,
+    program_title: &str,
+) -> usize {
+    let mut count = 0;
+    for instruction in instructions {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _cid, event) in updates {
+                if pid != &Some(plugin_id) {
+                    continue;
+                }
+                if let Event::PaneUpdate(manifest) = event {
+                    if manifest.panes.values().flatten().any(|pane| {
+                        pane.id == 1
+                            && !pane.is_plugin
+                            && pane.program_title.as_deref() == Some(program_title)
+                    }) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
+pub fn an_osc_title_change_reports_a_pane_update() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // the program in pane 1 renames itself twice, and writes the first name a second time in
+    // between - a shell that sets its title on every prompt does exactly that
+    for title in ["osc-first", "osc-first", "osc-second"] {
+        let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+            1,
+            format!("\u{1b}]2;{}\u{7}", title).into_bytes(),
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let reported = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(
+        reported.program_title.as_deref(),
+        Some("osc-second"),
+        "the manifest should carry the title the program set last"
+    );
+    assert_eq!(
+        pane_updates_carrying_program_title(&instructions, 99, "osc-first"),
+        1,
+        "writing the same title twice is one change, so it is reported once"
+    );
+    assert_eq!(
+        pane_updates_carrying_program_title(&instructions, 99, "osc-second"),
+        1,
+        "the second title is a change of its own and is reported"
+    );
+}
+
+#[test]
+pub fn a_pane_the_pty_said_nothing_about_reports_no_process_fields() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(0),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let reported = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(reported.pane_pid, None);
+    assert_eq!(reported.pane_cwd, None);
+    assert_eq!(reported.pane_command, None);
+}
+
+#[test]
+pub fn pane_info_reports_when_a_pane_last_emitted_output() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let before_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(1, "hi".as_bytes().to_vec()));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(0),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let after_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let noisy = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    let last_output_at = noisy
+        .last_output_at
+        .expect("a pane that emitted output should report when");
+    assert!(
+        last_output_at >= before_ms && last_output_at <= after_ms,
+        "last_output_at {} should sit between {} and {}",
+        last_output_at,
+        before_ms,
+        after_ms
+    );
+}
+
+#[test]
+pub fn a_silent_pane_reports_no_last_output_time() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(0),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let silent = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(silent.last_output_at, None);
+}
+
+#[test]
+fn an_idle_panes_last_output_time_is_the_same_on_every_read() {
+    // consumers compare two reads of the pane list and take a changed `last_output_at` to mean
+    // the pane wrote something. The stamp was rebuilt on every read from the wall clock minus a
+    // monotonic delta, each truncated to the millisecond on its own, so an idle pane wobbled by
+    // a millisecond between reads and looked busy forever
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    screen.record_pane_output(PaneId::Terminal(1));
+
+    let read_stamp = |screen: &Screen| {
+        let tab = screen.tabs.get(&0).expect("the session's own first tab");
+        screen
+            .pane_infos_for_tab(tab)
+            .into_iter()
+            .find(|pane| !pane.is_plugin && pane.id == 1)
+            .expect("terminal pane 1 is in the tab")
+            .last_output_at
+            .expect("a pane that wrote output reports when")
+    };
+    let first = read_stamp(&screen);
+    for read in 1..=40 {
+        // sub-millisecond gaps, so the two clocks' fractional parts drift apart between reads
+        std::thread::sleep(std::time::Duration::from_micros(370));
+        assert_eq!(
+            read_stamp(&screen),
+            first,
+            "read {} of an idle pane moved its last output time",
+            read
+        );
+    }
+}
+
+#[test]
+pub fn a_bell_is_recorded_on_the_pane_that_rang() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // pane 1 is not the focused one, so its bell latches
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(1, "\u{7}".as_bytes().to_vec()));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RenderToClients);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let rang = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert!(
+        rang.has_pending_bell,
+        "the pane that rang should report a pending bell"
+    );
+    let quiet = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 0)
+        .expect("terminal pane 0 should be in the manifest");
+    assert!(
+        !quiet.has_pending_bell,
+        "a pane that did not ring should report no pending bell"
+    );
+}
+
+#[test]
+pub fn a_bell_is_recorded_with_no_clients_attached() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // detach the only client, then ring the bell in a pane nobody is watching
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_bell = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(1, "\u{7}".as_bytes().to_vec()));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RenderToClients);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions[instructions_before_bell..], 99).expect(
+        "a bell with nobody attached should still report session state to a background plugin",
+    );
+    let rang = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert!(
+        rang.has_pending_bell,
+        "a detached session must still record that a pane rang"
+    );
+}
+
+/// A held command pane's exit status is state, read with nobody attached.
+#[test]
+pub fn a_held_command_pane_reports_its_exit_status_with_no_clients_attached() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let run_command = RunCommand {
+        command: PathBuf::from("false"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let _ = mock_screen.to_screen.send(ScreenInstruction::HoldPane(
+        PaneId::Terminal(1),
+        Some(1),
+        run_command,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("a detached session should still report state to a background plugin");
+    let failed = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert!(failed.exited, "a held pane whose command exited says so");
+    assert_eq!(failed.exit_status, Some(1));
+}
+
+#[test]
+fn a_detached_clients_focus_is_not_reported_as_focus() {
+    // `list-panes -a` read the focus map straight, and a client that detaches keeps its entry
+    // there - so a pane nobody was looking at kept `FOCUSED=true` for the life of the session
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    assert!(
+        screen
+            .collect_pane_list(false)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.pane_info.is_focused),
+        "a client is attached, so it focuses a pane"
+    );
+
+    screen.remove_client(1).expect("TEST"); // the only client detaches
+
+    // the CLI's rows; `PaneInfo` keeps upstream's remembered focus for plugins
+    let focused: Vec<u32> = screen
+        .collect_pane_list(false)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.pane_info.is_focused)
+        .map(|entry| entry.pane_info.id)
+        .collect();
+    assert!(
+        focused.is_empty(),
+        "nothing is attached, so no pane is focused: {:?}",
+        focused
+    );
+}
+
+#[test]
+fn one_client_detaching_does_not_unfocus_the_pane_another_is_on() {
+    // the other direction: the answer is about who is still here, not about how many have left
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    screen.set_client_size(2, size);
+    screen.add_client(2, false).expect("TEST");
+
+    screen.remove_client(2).expect("TEST");
+
+    assert!(
+        screen
+            .collect_pane_list(false)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.pane_info.is_focused),
+        "the client that stayed is still looking at its pane"
+    );
+}
+

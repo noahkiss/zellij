@@ -8548,6 +8548,16 @@ impl TabInfo {
         let selectable_floating_panes_count =
             optional_int_node!("selectable_floating_panes_count", usize).unwrap_or(0);
         let tab_id = optional_int_node!("tab_id", usize).unwrap_or(0);
+        macro_rules! optional_bool_node {
+            ($name:expr) => {{
+                kdl_document
+                    .get($name)
+                    .and_then(|n| n.entries().iter().next())
+                    .and_then(|e| e.value().as_bool())
+            }};
+        }
+        let has_bell_notification = optional_bool_node!("has_bell_notification").unwrap_or(false);
+        let is_flashing_bell = optional_bool_node!("is_flashing_bell").unwrap_or(false);
         Ok(TabInfo {
             position,
             name,
@@ -8567,8 +8577,8 @@ impl TabInfo {
             selectable_tiled_panes_count,
             selectable_floating_panes_count,
             tab_id,
-            has_bell_notification: false,
-            is_flashing_bell: false,
+            has_bell_notification,
+            is_flashing_bell,
             attention: Default::default(),
         })
     }
@@ -8650,6 +8660,18 @@ impl TabInfo {
         let mut tab_id = KdlNode::new("tab_id");
         tab_id.push(self.tab_id as i64);
         kdl_doucment.nodes_mut().push(tab_id);
+
+        // written only when ringing, so a quiet tab's metadata is unchanged
+        if self.has_bell_notification {
+            let mut has_bell_notification = KdlNode::new("has_bell_notification");
+            has_bell_notification.push(self.has_bell_notification);
+            kdl_doucment.nodes_mut().push(has_bell_notification);
+        }
+        if self.is_flashing_bell {
+            let mut is_flashing_bell = KdlNode::new("is_flashing_bell");
+            is_flashing_bell.push(self.is_flashing_bell);
+            kdl_doucment.nodes_mut().push(is_flashing_bell);
+        }
 
         kdl_doucment
     }
@@ -8743,6 +8765,8 @@ impl PaneInfo {
         }
         let tab_position = int_node!("tab_position", usize);
         let id = int_node!("id", u32);
+        // optional: metadata written before the field existed carries no tab id
+        let tab_id = optional_int_node!("tab_id", usize).unwrap_or_default();
 
         let is_plugin = bool_node!("is_plugin");
         let is_focused = bool_node!("is_focused");
@@ -8775,11 +8799,47 @@ impl PaneInfo {
                     _ => None,
                 }
             });
+        macro_rules! optional_bool_node {
+            ($name:expr) => {{
+                kdl_document
+                    .get($name)
+                    .and_then(|n| n.entries().iter().next())
+                    .and_then(|e| e.value().as_bool())
+            }};
+        }
         let terminal_command = optional_string_node!("terminal_command");
         let plugin_url = optional_string_node!("plugin_url");
         let is_selectable = bool_node!("is_selectable");
+        // the identity and stack fields are optional: a pane described by a saved layout has
+        // none of them, and neither does metadata written by an older version
+        let uuid = optional_string_node!("uuid").unwrap_or_default();
+        let restored_from = optional_string_node!("restored_from").unwrap_or_default();
+        let handle = optional_string_node!("handle").unwrap_or_default();
+        let program_title = optional_string_node!("program_title");
+        let default_fg = optional_string_node!("default_fg");
+        let default_bg = optional_string_node!("default_bg");
+        let stack_id = optional_int_node!("stack_id", usize);
+        let index_in_stack = optional_int_node!("index_in_stack", usize);
+        let is_expanded_in_stack = optional_bool_node!("is_expanded_in_stack").unwrap_or(false);
+        let pane_cwd = optional_string_node!("pane_cwd");
+        let pane_pid = optional_int_node!("pane_pid", u32);
+        let pane_command = optional_string_node!("pane_command");
+        let last_output_at = optional_int_node!("last_output_at", u64);
+        let has_pending_bell = optional_bool_node!("has_pending_bell").unwrap_or(false);
 
         let pane_info = PaneInfo {
+            restored_from,
+            handle,
+            tab_id,
+            // a note describes live state, and a saved layout describes what a pane IS, so a
+            // restored pane comes back without one
+            note: String::new(),
+            note_color: Default::default(),
+            pane_cwd,
+            pane_pid,
+            pane_command,
+            last_output_at,
+            has_pending_bell,
             id,
             is_plugin,
             is_focused,
@@ -8804,12 +8864,17 @@ impl PaneInfo {
             plugin_url,
             is_selectable,
             index_in_pane_group: Default::default(), // we don't serialize this
-            default_fg: None,
-            default_bg: None,
+            default_fg,
+            default_bg,
             nested_session_name: None,
             attention: Default::default(),
             command_state: Default::default(),
             program_status: vec![],
+            program_title,
+            stack_id,
+            index_in_stack,
+            is_expanded_in_stack,
+            uuid,
         };
         Ok((tab_position, pane_info))
     }
@@ -8838,6 +8903,7 @@ impl PaneInfo {
         }
 
         int_node!("id", self.id);
+        int_node!("tab_id", self.tab_id);
         bool_node!("is_plugin", self.is_plugin);
         bool_node!("is_focused", self.is_focused);
         bool_node!("is_fullscreen", self.is_fullscreen);
@@ -8870,6 +8936,52 @@ impl PaneInfo {
             string_node!("plugin_url", plugin_url.to_string());
         }
         bool_node!("is_selectable", self.is_selectable);
+        // the identity and stack fields, written only when they say something: this codec also
+        // describes panes in saved layouts, which have none of them
+        if !self.uuid.is_empty() {
+            string_node!("uuid", self.uuid.to_string());
+        }
+        if !self.restored_from.is_empty() {
+            string_node!("restored_from", self.restored_from.to_string());
+        }
+        if !self.handle.is_empty() {
+            string_node!("handle", self.handle.to_string());
+        }
+        if let Some(program_title) = &self.program_title {
+            string_node!("program_title", program_title.to_string());
+        }
+        if let Some(default_fg) = &self.default_fg {
+            string_node!("default_fg", default_fg.to_string());
+        }
+        if let Some(default_bg) = &self.default_bg {
+            string_node!("default_bg", default_bg.to_string());
+        }
+        if let Some(stack_id) = self.stack_id {
+            int_node!("stack_id", stack_id);
+        }
+        if let Some(index_in_stack) = self.index_in_stack {
+            int_node!("index_in_stack", index_in_stack);
+        }
+        if self.is_expanded_in_stack {
+            bool_node!("is_expanded_in_stack", self.is_expanded_in_stack);
+        }
+        // what the pane is running, and when it last said anything - the same rule again, written
+        // only when there is something to write, so a saved layout's panes are unchanged
+        if let Some(pane_cwd) = &self.pane_cwd {
+            string_node!("pane_cwd", pane_cwd.to_string());
+        }
+        if let Some(pane_pid) = self.pane_pid {
+            int_node!("pane_pid", pane_pid);
+        }
+        if let Some(pane_command) = &self.pane_command {
+            string_node!("pane_command", pane_command.to_string());
+        }
+        if let Some(last_output_at) = self.last_output_at {
+            int_node!("last_output_at", last_output_at);
+        }
+        if self.has_pending_bell {
+            bool_node!("has_pending_bell", self.has_pending_bell);
+        }
         kdl_doucment
     }
 }
@@ -8935,6 +9047,16 @@ fn serialize_and_deserialize_session_info() {
 fn serialize_and_deserialize_session_info_with_data() {
     let panes_list = vec![
         PaneInfo {
+            restored_from: String::new(),
+            handle: String::new(),
+            tab_id: 3,
+            note: String::new(),
+            note_color: Default::default(),
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
+            last_output_at: None,
+            has_pending_bell: false,
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -8965,8 +9087,23 @@ fn serialize_and_deserialize_session_info_with_data() {
             attention: Default::default(),
             command_state: Default::default(),
             program_status: Default::default(),
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
+            uuid: String::new(),
         },
         PaneInfo {
+            restored_from: String::new(),
+            handle: String::new(),
+            tab_id: 3,
+            note: String::new(),
+            note_color: Default::default(),
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
+            last_output_at: None,
+            has_pending_bell: false,
             id: 1,
             is_plugin: true,
             is_focused: true,
@@ -9071,6 +9208,83 @@ fn serialize_and_deserialize_session_info_with_data() {
     let deserealized = SessionInfo::from_string(&serialized, "not this session").unwrap();
     assert_eq!(session_info, deserealized);
     insta::assert_snapshot!(serialized);
+}
+
+#[test]
+fn session_info_round_trip_keeps_pane_identity_and_stack_fields() {
+    // session-metadata.kdl is how every peer session is read, so anything this codec drops is
+    // missing from SessionUpdate for all but the current session
+    let pane = PaneInfo {
+        id: 3,
+        title: "a pane".to_owned(),
+        uuid: "27e1a5a8-0000-4000-8000-0000000000ff".to_owned(),
+        restored_from: "8e0d1c33-0000-4000-8000-0000000000aa".to_owned(),
+        handle: "sunny-otter".to_owned(),
+        program_title: Some("vim".to_owned()),
+        default_fg: Some("#00e000".to_owned()),
+        default_bg: Some("#001a3a".to_owned()),
+        stack_id: Some(2),
+        index_in_stack: Some(1),
+        is_expanded_in_stack: true,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane.clone()]);
+    let session_info = SessionInfo {
+        name: "identity session".to_owned(),
+        tabs: vec![TabInfo {
+            name: "tab 1".to_owned(),
+            has_bell_notification: true,
+            is_flashing_bell: true,
+            ..Default::default()
+        }],
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert_eq!(round_tripped_pane.uuid, pane.uuid);
+    assert_eq!(round_tripped_pane.restored_from, pane.restored_from);
+    assert_eq!(round_tripped_pane.handle, pane.handle);
+    assert_eq!(round_tripped_pane.program_title, pane.program_title);
+    assert_eq!(round_tripped_pane.stack_id, pane.stack_id);
+    assert_eq!(round_tripped_pane.index_in_stack, pane.index_in_stack);
+    assert!(round_tripped_pane.is_expanded_in_stack);
+    assert!(deserialized.tabs[0].has_bell_notification);
+}
+
+#[test]
+fn session_info_round_trip_keeps_the_process_and_activity_fields() {
+    let pane = PaneInfo {
+        id: 3,
+        title: "a pane".to_owned(),
+        pane_cwd: Some("/home/user/develop/thing".to_owned()),
+        pane_pid: Some(90210),
+        pane_command: Some("claude --resume".to_owned()),
+        last_output_at: Some(1_760_000_000_000),
+        has_pending_bell: true,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane.clone()]);
+    let session_info = SessionInfo {
+        name: "process session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert_eq!(round_tripped_pane.pane_cwd, pane.pane_cwd);
+    assert_eq!(round_tripped_pane.pane_pid, pane.pane_pid);
+    assert_eq!(round_tripped_pane.pane_command, pane.pane_command);
+    assert_eq!(round_tripped_pane.last_output_at, pane.last_output_at);
+    assert!(round_tripped_pane.has_pending_bell);
 }
 
 #[test]

@@ -107,6 +107,7 @@ pub fn create_first_message(
             host_terminal_env: Default::default(),
             initial_panes: None,
             switch_context,
+            tty: None,
         };
 
         ClientToServerMsg::FirstClientConnected {
@@ -129,6 +130,7 @@ pub fn create_first_message(
             host_terminal_env: Default::default(),
             initial_panes: None,
             switch_context,
+            tty: None,
         };
         let is_web_client = true;
 

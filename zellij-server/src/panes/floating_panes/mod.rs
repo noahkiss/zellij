@@ -1887,6 +1887,15 @@ impl FloatingPanes {
             Err(anyhow!("Pane not found"))
         }
     }
+    /// fork: whether a client that is still connected focuses this pane. `pane_info` reports the
+    /// remembered focus, as upstream does; the CLI's pane rows ask this instead.
+    pub fn pane_id_is_focused_by_connected_client(&self, pane_id: &PaneId) -> bool {
+        let connected_clients = self.connected_clients.borrow();
+        self.panes.contains_key(pane_id)
+            && self
+                .active_panes
+                .pane_id_is_focused_by_connected_client(pane_id, &connected_clients)
+    }
     pub fn pane_info(&self, current_pane_group: &HashMap<ClientId, Vec<PaneId>>) -> Vec<PaneInfo> {
         let mut pane_infos = vec![];
         for (pane_id, pane) in self.panes.iter() {
@@ -1896,6 +1905,9 @@ impl FloatingPanes {
             pane_info_for_pane.is_suppressed = false;
             pane_info_for_pane.is_focused = is_focused;
             pane_info_for_pane.is_fullscreen = self.fullscreen_pane_id == Some(*pane_id);
+            // stacks are a tiled-layer concept, a floating pane is never a member of one
+            pane_info_for_pane.stack_id = None;
+            pane_info_for_pane.is_expanded_in_stack = false;
             pane_infos.push(pane_info_for_pane);
         }
         pane_infos

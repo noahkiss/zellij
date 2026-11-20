@@ -40,15 +40,28 @@ mod popup_keys;
 pub(crate) use popup_keys::PopupKeyAction;
 pub use popup_keys::PopupScroll;
 
-const ACTION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
-
-#[derive(Debug, Clone)]
-pub struct ActionCompletionResult {
-    pub exit_status: Option<i32>,
-    pub affected_pane_id: Option<PaneId>,
-    pub affected_tab_id: Option<usize>,
-    pub error_message: Option<String>,
-    pub stdout_message: Option<String>,
+impl ActionCompletionResult {
+    /// The action did not report success. The CLI turns `error_message` into a line on stderr
+    /// and a non-zero exit.
+    pub fn failed(error_message: String) -> Self {
+        ActionCompletionResult {
+            exit_status: Some(1),
+            affected_pane_id: None,
+            affected_tab_id: None,
+            error_message: Some(error_message),
+            stdout_lines: Vec::new(),
+        }
+    }
+    /// The wait for the action's result ran out. The exit stays non-zero, because the caller was
+    /// not told the action succeeded - but it is not told the action failed either, since nothing
+    /// cancelled it and it may well complete a moment later.
+    pub fn timed_out(action_name: &str) -> Self {
+        ActionCompletionResult::failed(format!(
+            "Timed out after {:?} waiting for action {} to report a result. \
+             The action was not cancelled and may still complete.",
+            ACTION_COMPLETION_TIMEOUT, action_name
+        ))
+    }
 }
 
 pub fn wait_for_action_completion(
@@ -63,13 +76,10 @@ pub fn wait_for_action_completion(
                 Ok(result) => result,
                 Err(e) => {
                     log::error!("Failed to wait for action {}: {}", action_name, e);
-                    ActionCompletionResult {
-                        exit_status: None,
-                        affected_pane_id: None,
-                        affected_tab_id: None,
-                        error_message: None,
-                        stdout_message: None,
-                    }
+                    ActionCompletionResult::failed(format!(
+                        "Action {} ended without reporting a result",
+                        action_name
+                    ))
                 },
             }
         })
@@ -78,57 +88,25 @@ pub fn wait_for_action_completion(
             .block_on(async { tokio::time::timeout(ACTION_COMPLETION_TIMEOUT, receiver).await })
         {
             Ok(Ok(result)) => result,
-            Err(_) | Ok(Err(_)) => {
-                log::error!(
-                    "Action {} did not complete within {:?} timeout",
+            Ok(Err(_)) => {
+                log::error!("Action {} ended without reporting a result", action_name);
+                ActionCompletionResult::failed(format!(
+                    "Action {} ended without reporting a result",
+                    action_name
+                ))
+            },
+            Err(_) => {
+                log::warn!(
+                    "Action {} did not report a result within {:?}",
                     action_name,
                     ACTION_COMPLETION_TIMEOUT
                 );
-                ActionCompletionResult {
-                    exit_status: None,
-                    affected_pane_id: None,
-                    affected_tab_id: None,
-                    error_message: None,
-                    stdout_message: None,
-                }
+                // the exit stays non-zero: the action may still be in flight, so the caller must
+                // not read "exited 0" as "this happened". It must not read it as "this failed"
+                // either - nothing was cancelled - so the message says which of the two it is
+                ActionCompletionResult::timed_out(action_name)
             },
         }
-    }
-}
-
-fn wait_for_cli_action_completion(
-    receiver: oneshot::Receiver<ActionCompletionResult>,
-    action_name: &str,
-) -> ActionCompletionResult {
-    let runtime = get_tokio_runtime();
-    match runtime
-        .block_on(async { tokio::time::timeout(ACTION_COMPLETION_TIMEOUT, receiver).await })
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => ActionCompletionResult {
-            exit_status: None,
-            affected_pane_id: None,
-            affected_tab_id: None,
-            error_message: None,
-            stdout_message: None,
-        },
-        Err(_) => {
-            log::error!(
-                "Action {} did not complete within {:?} timeout",
-                action_name,
-                ACTION_COMPLETION_TIMEOUT
-            );
-            ActionCompletionResult {
-                exit_status: None,
-                affected_pane_id: None,
-                affected_tab_id: None,
-                error_message: Some(format!(
-                    "Action {} did not complete within {:?}, its outcome is unknown",
-                    action_name, ACTION_COMPLETION_TIMEOUT
-                )),
-                stdout_message: None,
-            }
-        },
     }
 }
 
@@ -4134,12 +4112,13 @@ fn build_table_row(
     let mut row = Vec::new();
 
     if show_tab {
-        row.push(entry.tab_id.to_string());
+        row.push(entry.pane_info.tab_id.to_string());
         row.push(entry.tab_position.to_string());
         row.push(entry.tab_name.clone());
     }
 
     row.push(format_pane_id(&entry.pane_info));
+    row.push(entry.pane_info.handle.clone());
     row.push(format_pane_type(&entry.pane_info));
     row.push(entry.pane_info.title.clone());
 
@@ -4193,6 +4172,26 @@ fn extract_command(entry: &PaneListEntry) -> String {
 
 fn extract_cwd(entry: &PaneListEntry) -> String {
     entry
+        .pane_cwd
+        .as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("-")
+        .to_string()
+}
+
+        .pane_info
+        .pane_command
+        .as_ref()
+        .or(entry.pane_info.terminal_command.as_ref())
+        .or(entry.pane_info.plugin_url.as_ref())
+        .map(|s| s.as_str())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn extract_cwd(entry: &PaneListEntry) -> String {
+    entry
+        .pane_info
         .pane_cwd
         .as_ref()
         .map(|s| s.as_str())
@@ -4525,6 +4524,33 @@ mod tests {
         };
 
         assert_eq!(result.affected_tab_id, Some(123));
+    #[test]
+    fn test_action_completion_timeout_reports_a_timeout_not_a_failure() {
+        let (tx, rx) = oneshot::channel();
+        // the sender is held for longer than the timeout, so the wait must give up
+        let result = wait_for_action_completion(rx, "TestAction", false);
+        drop(tx);
+
+        assert_eq!(
+            result.exit_status,
+            Some(1),
+            "the caller was not told the action succeeded, so the exit stays non-zero"
+        );
+        let error_message = result
+            .error_message
+            .expect("a timed out action must report an error");
+        assert!(
+            error_message.contains("Timed out"),
+            "Expected the message to name the timeout, got: {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("may still complete"),
+            "the action is not cancelled, and the message must not claim it failed, got: {}",
+            error_message
+        );
+    }
+
     }
 
     #[test]

@@ -1338,6 +1338,15 @@ impl Pane for TerminalPane {
     fn take_initial_attention_flags(&mut self) -> Option<(bool, bool)> {
         self.initial_attention_flags.take()
     }
+    fn program_title(&self) -> Option<String> {
+        self.grid.title.clone()
+    }
+    fn take_program_title_changed(&mut self) -> bool {
+        self.grid.take_title_changed()
+    }
+    fn bracketed_paste_enabled(&self) -> bool {
+        self.grid.bracketed_paste_mode
+    }
     fn custom_title(&self) -> Option<String> {
         if self.pane_name.is_empty() {
             None

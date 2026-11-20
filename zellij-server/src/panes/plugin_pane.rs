@@ -20,11 +20,12 @@ use crate::vt_parser;
 use crate::ClientId;
 use std::cell::RefCell;
 use std::rc::Rc;
-use zellij_utils::data::PaneContents;
+use uuid::Uuid;
 use zellij_utils::data::{
     BareKey, BorderStyleOverride, KeyModifier, KeyWithModifier, PermissionStatus, PermissionType,
     PluginPermission,
 };
+use zellij_utils::data::{NoteColor, PaneContents};
 use zellij_utils::pane_size::{Offset, SizeInPixels};
 use zellij_utils::position::Position;
 use zellij_utils::{

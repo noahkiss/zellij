@@ -571,6 +571,26 @@ fn prepare_sock_dir(teardown: Option<TerminalTeardown>) {
     }
 }
 
+/// The terminal device this client is attached to, for the session's client list.
+///
+/// `None` is a real answer, not a failure: a web client and a CLI action have no controlling
+/// terminal, and neither does a client whose stdin has been redirected.
+#[cfg(unix)]
+pub fn own_tty() -> Option<String> {
+    use std::os::fd::BorrowedFd;
+    // stdin, because that is the descriptor the client reads its keys from - the one that names
+    // the terminal a human is actually sitting at
+    let stdin = unsafe { BorrowedFd::borrow_raw(0) };
+    nix::unistd::ttyname(stdin)
+        .ok()
+        .map(|path| path.display().to_string())
+}
+
+#[cfg(not(unix))]
+pub fn own_tty() -> Option<String> {
+    None
+}
+
 fn prepare_parent_dir(teardown: Option<TerminalTeardown>, path: &Path) {
     let sock_dir = &*ZELLIJ_SOCK_DIR;
     if let Some(parent) = path.parent().filter(|parent| *parent != sock_dir.as_path()) {
@@ -1870,6 +1890,7 @@ pub fn start_server_detached(
                 host_terminal_env: host_terminal_env(),
                 initial_panes: None,
                 switch_context: None,
+                tty: own_tty(),
             };
 
             let ipc_pipe = create_ipc_pipe(&name, None);
@@ -1930,6 +1951,7 @@ pub fn start_server_detached(
                 host_terminal_env: host_terminal_env(),
                 initial_panes,
                 switch_context: None,
+                tty: own_tty(),
             };
 
             let ipc_pipe = create_ipc_pipe(&name, None);

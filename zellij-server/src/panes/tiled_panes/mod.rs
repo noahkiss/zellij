@@ -41,7 +41,7 @@ use zellij_utils::{
         layout::{Run, RunPluginOrAlias, SplitDirection},
         options::PaneFrameStyle,
     },
-    pane_size::{Offset, PaneGeom, Size, SizeInPixels, Viewport},
+    pane_size::{Dimension, Offset, PaneGeom, Size, SizeInPixels, Viewport},
 };
 
 use std::{
@@ -376,7 +376,11 @@ impl TiledPanes {
                 Ok(new_pane_geom) => {
                     pane.set_geom(new_pane_geom);
                     self.panes.insert(pane_id, pane);
-                    self.expand_pane_in_stack(pane_id);
+                    // fork change: expanding the newcomer here moved every client focused in the
+                    // stack onto it, so a pane made without focus took it anyway. A focusing
+                    // caller focuses the pane itself afterwards.
+                    self.keep_focused_pane_expanded_in_stack_of(pane_id);
+                    self.set_force_render();
                     None
                 },
                 Err(e) => {
@@ -3370,6 +3374,7 @@ impl TiledPanes {
             .map(|(id, _)| *id)
     }
     pub fn pane_info(&self, current_pane_group: &HashMap<ClientId, Vec<PaneId>>) -> Vec<PaneInfo> {
+        let index_in_stack = self.index_in_stack_per_pane();
         let mut pane_infos = vec![];
         for (pane_id, pane) in self.panes.iter() {
             let mut pane_info_for_pane = pane_info_for_pane(pane_id, pane, &current_pane_group);
@@ -3379,9 +3384,48 @@ impl TiledPanes {
             pane_info_for_pane.is_collapsed = self.panes_to_hide.is_covered(pane_id);
             pane_info_for_pane.is_focused = is_focused;
             pane_info_for_pane.is_fullscreen = is_focused && self.fullscreen_is_active();
+            pane_info_for_pane.index_in_stack = index_in_stack.get(pane_id).copied();
             pane_infos.push(pane_info_for_pane);
         }
         pane_infos
+    }
+
+    /// fork: whether a client that is still connected focuses this pane. A detached client keeps
+    /// its entry in `active_panes` so it lands back where it was; `pane_info` reports that
+    /// remembered focus, as upstream does, and the CLI's pane rows ask this instead.
+    pub fn pane_id_is_focused_by_connected_client(&self, pane_id: &PaneId) -> bool {
+        let connected_clients = self.connected_clients.borrow();
+        self.active_panes
+            .pane_id_is_focused_by_connected_client(pane_id, &connected_clients)
+    }
+
+    pub fn index_in_stack(&self, pane_id: &PaneId) -> Option<usize> {
+        self.index_in_stack_per_pane().get(pane_id).copied()
+    }
+
+    /// The position of each stacked pane inside its own stack, counted from the top.
+    ///
+    /// A stack is the set of panes sharing a `stacked` id as well as the same horizontal placement
+    /// (mirroring how `StackedPanes::positions_in_stack` finds the members of a stack).
+    fn index_in_stack_per_pane(&self) -> HashMap<PaneId, usize> {
+        let mut stacks: HashMap<(usize, usize, Dimension), Vec<(PaneId, usize)>> = HashMap::new();
+        for (pane_id, pane) in self.panes.iter() {
+            let geom = pane.position_and_size();
+            if let Some(stack_id) = geom.stacked {
+                stacks
+                    .entry((stack_id, geom.x, geom.cols))
+                    .or_default()
+                    .push((*pane_id, geom.y));
+            }
+        }
+        let mut index_in_stack = HashMap::new();
+        for mut stack in stacks.into_values() {
+            stack.sort_by_key(|(_pane_id, y)| *y);
+            for (index, (pane_id, _y)) in stack.into_iter().enumerate() {
+                index_in_stack.insert(pane_id, index);
+            }
+        }
+        index_in_stack
     }
 
     pub fn pane_id_is_focused(&self, pane_id: &PaneId) -> bool {

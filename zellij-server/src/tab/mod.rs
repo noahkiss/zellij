@@ -5200,6 +5200,35 @@ impl Tab {
         }
         self.process_pty_bytes(pid, bytes).with_context(err_context)
     }
+    /// Whether the program in terminal pane `pid` renamed itself (OSC 0/2) since this was last
+    /// asked, clearing the flag. The caller reports the change to plugins.
+    /// See `Pane::bracketed_paste_enabled`. `false` for a pane this tab does not have.
+    pub fn bracketed_paste_enabled(&mut self, pid: u32) -> bool {
+        self.tiled_panes
+            .get_pane_mut(PaneId::Terminal(pid))
+            .or_else(|| self.floating_panes.get_pane_mut(PaneId::Terminal(pid)))
+            .or_else(|| {
+                self.suppressed_panes
+                    .values_mut()
+                    .find(|s_p| s_p.1.pid() == PaneId::Terminal(pid))
+                    .map(|s_p| &mut s_p.1)
+            })
+            .map(|pane| pane.bracketed_paste_enabled())
+            .unwrap_or(false)
+    }
+    pub fn take_program_title_changed(&mut self, pid: u32) -> bool {
+        self.tiled_panes
+            .get_pane_mut(PaneId::Terminal(pid))
+            .or_else(|| self.floating_panes.get_pane_mut(PaneId::Terminal(pid)))
+            .or_else(|| {
+                self.suppressed_panes
+                    .values_mut()
+                    .find(|s_p| s_p.1.pid() == PaneId::Terminal(pid))
+                    .map(|s_p| &mut s_p.1)
+            })
+            .map(|pane| pane.take_program_title_changed())
+            .unwrap_or(false)
+    }
     pub fn handle_plugin_bytes(
         &mut self,
         pid: u32,
@@ -8797,7 +8826,22 @@ impl Tab {
             pane_info_for_suppressed_pane.is_suppressed = true;
             pane_info_for_suppressed_pane.is_focused = false;
             pane_info_for_suppressed_pane.is_fullscreen = false;
+            pane_info_for_suppressed_pane.stack_id = None;
+            pane_info_for_suppressed_pane.is_expanded_in_stack = false;
             pane_info.push(pane_info_for_suppressed_pane);
+        }
+        let stack_list_membership = self.stack_list_membership();
+        for info in pane_info.iter_mut() {
+            // the manifest is keyed by tab POSITION, which moves when tabs are reordered - the
+            // pane carries the tab's stable id so a consumer needs no second lookup
+            info.tab_id = self.id;
+            Self::apply_stack_list_membership(&stack_list_membership, info);
+            let pane_id = if info.is_plugin {
+                PaneId::Plugin(info.id)
+            } else {
+                PaneId::Terminal(info.id)
+            };
+            info.has_pending_bell = self.panes_with_pending_bell.contains(&pane_id);
         }
         pane_info
     }

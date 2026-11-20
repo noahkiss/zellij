@@ -14,6 +14,9 @@ pub struct FailingRenderPane {
 }
 
 impl Pane for FailingRenderPane {
+    fn pane_uuid(&self) -> uuid::Uuid {
+        self.inner.pane_uuid()
+    }
     fn x(&self) -> usize {
         self.inner.x()
     }
@@ -220,6 +223,9 @@ pub struct FocusReportingPane {
 }
 
 impl Pane for FocusReportingPane {
+    fn pane_uuid(&self) -> uuid::Uuid {
+        self.inner.pane_uuid()
+    }
     fn x(&self) -> usize {
         self.inner.x()
     }

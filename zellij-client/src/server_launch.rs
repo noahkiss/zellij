@@ -67,14 +67,31 @@ impl ServerLaunch {
     }
 }
 
-pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
-    let mut launch = ServerLaunch::new(current_exe()?.into_os_string(), socket_path);
-    launch.debug = debug;
-    spawn_server_with(&launch)
+/// The binary the server is spawned from, when it is not this one.
+///
+/// Set once, before any client work, from the config's `pin_exe` (see
+/// `server_exe_for_interactive_launch`). It lives here rather than travelling through
+/// `spawn_server` because that call is behind the `ClientOsApi` trait, and threading a value
+/// through a trait, its fake, and five call sites to say one thing is a poor trade.
+static PINNED_SERVER_EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Tell the client which binary to start servers from. Only the first call counts.
+pub fn record_pinned_server_exe(server_exe: Option<PathBuf>) {
+    let _ = PINNED_SERVER_EXE.set(server_exe);
 }
 
-pub fn spawn_server_with(launch: &ServerLaunch) -> io::Result<()> {
-    let mut cmd = launch.command();
+/// The binary a new server is started from: the pinned copy if one was recorded, else this one.
+///
+/// "This one" is asked of `own_exe_for_spawn`, not `current_exe()`: after an upgrade on Linux the
+/// latter names a " (deleted)" path that cannot be spawned.
+fn server_exe() -> io::Result<PathBuf> {
+    match PINNED_SERVER_EXE.get().cloned().flatten() {
+        Some(pinned) => Ok(pinned),
+        None if cfg!(windows) => current_exe(),
+        None => zellij_utils::session_lifecycle::own_exe_for_spawn(),
+    }
+}
+
     match launch_style(cfg!(windows)) {
         LaunchStyle::WaitForDaemon => {
             let status = cmd.status()?;

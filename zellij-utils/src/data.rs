@@ -1287,6 +1287,10 @@ pub enum Event {
     ),
     RunCommandResult(Option<i32>, Vec<u8>, Vec<u8>, BTreeMap<String, String>), // exit_code, STDOUT, STDERR,
     // context
+    /// The result of a `web_request`. A status of 0 means no HTTP response was received at all -
+    /// the transport failed - and the `x-zellij-error-kind` header names the failure
+    /// (`connection_failed`, `timeout`, `name_resolution`, ...) with the message in the body.
+    /// Any other status is one a server actually sent.
     WebRequestResult(
         u16,
         BTreeMap<String, String>,
@@ -3616,6 +3620,154 @@ pub struct ClientInfo {
     pub pane_id: PaneId,
     pub running_command: String,
     pub is_current_client: bool,
+    ///
+    /// NOTE: this is the multi-select grouping feature (eg. `TogglePaneInGroup`), it is per-client
+    /// and empty unless the user explicitly marked panes for a bulk action. It has nothing to do
+    /// with stacked panes - for those, see `stack_id` and `index_in_stack`.
+    pub index_in_pane_group: BTreeMap<ClientId, usize>,
+    /// The default foreground color of this pane, if set (e.g. "#00e000")
+    pub default_fg: Option<String>,
+    /// The default background color of this pane, if set (e.g. "#001a3a")
+    pub default_bg: Option<String>,
+    pub nested_session_name: Option<String>,
+    // fork: `serde(default)` on upstream's new fields, so rows from an older build still read
+    #[serde(default)]
+    pub attention: crate::attention::PaneAttention,
+    /// Upstream's command tracker state. The fork renames its JSON key: a CLI row flattens this
+    /// struct, and `command_state` there is the fork's string (`PaneListEntry::command_state`)
+    #[serde(default, rename = "command_state_detail")]
+    pub command_state: crate::attention::CommandState,
+    #[serde(default)]
+    pub program_status: Vec<crate::attention::ProgramStatusRecord>,
+    /// The title the program running inside this pane set for itself with OSC 0/2, if any
+    ///
+    /// Unlike `title`, this is not replaced by a user-assigned pane name, so it can be used to
+    /// identify the program even after the pane has been renamed
+    pub program_title: Option<String>,
+    /// The id of the stack this pane belongs to, if it is part of a stack of tiled panes
+    pub stack_id: Option<usize>,
+    /// The position of this pane inside its stack, counted from the top, if it is part of a stack
+    pub index_in_stack: Option<usize>,
+    /// Whether this pane is the expanded (non-collapsed) member of its stack
+    pub is_expanded_in_stack: bool,
+    /// A uuid given to this pane when it was created and never given to another pane
+    ///
+    /// It identifies this pane for as long as the server runs, whether the pane is tiled, floating
+    /// or suppressed, and survives renaming, moving and stacking. Within one running server the
+    /// terminal id counter is monotonic, so a closed pane's `id` is not reissued either - what the
+    /// uuid adds there is that it also survives everything that changes a pane's id.
+    ///
+    /// It does NOT survive a server restart, a resurrection or a snapshot restore: what comes back
+    /// is a new pane with new state, and it says so with a new uuid. Ids DO repeat across those,
+    /// so neither is identity there - see `restored_from`, and pair it with the session's creation
+    /// time if you need a key that spans a restart.
+    pub uuid: String,
+    /// The uuid of the pane this one continues, if it was rebuilt from a serialized session
+    ///
+    /// Empty for a pane that was never restored. One hop only: a pane restored twice names the
+    /// incarnation directly before it, not the whole chain. Use it to carry state across a restart
+    /// deliberately - the new uuid is what stops that happening by accident.
+    pub restored_from: String,
+    /// The working directory of the process running in this pane, if known
+    ///
+    /// Terminal panes only. It comes from the cache the pty thread refreshes once a second for
+    /// panes that produced output, so it lags a `cd` by up to a second and is `None` until the
+    /// first refresh. `Event::CwdChanged` is the push complement; this is the snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_cwd: Option<String>,
+    /// The pid of the process zellij started in this pane, if known
+    ///
+    /// Terminal panes only, and it is the pane's own child - the shell, not whatever the shell is
+    /// running. Walk down from it (`/proc/<pid>/task/<pid>/children` or the process table) to find
+    /// a tool running inside the pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_pid: Option<u32>,
+    /// The command running in this pane, if known, as a snapshot
+    ///
+    /// The foreground command when there is one, otherwise the pane's shell. Refreshed on the same
+    /// once-a-second cache as `pane_cwd`. `Event::CommandChanged` is the push complement, and is
+    /// the one to subscribe to for changes - this field exists so a consumer that has just started
+    /// does not have to wait for a command to change before it knows what is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_command: Option<String>,
+    /// When this pane last emitted output, in milliseconds since the Unix epoch
+    ///
+    /// Terminal panes only, and it means bytes arriving from the pty - not a human typing, not the
+    /// pane being focused. `None` for a pane that has produced nothing since the server started.
+    ///
+    /// It is the cheapest liveness signal there is: "is this pane still working" answered without
+    /// reading a single cell of its content. Nothing pushes on output alone, so a consumer sees it
+    /// move on the once-a-second session tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
+    /// Whether this pane has a bell nobody has looked at yet
+    ///
+    /// A pane that rings the terminal bell while it is not focused latches this until a client
+    /// focuses it. It is recorded whether or not anyone is attached, so it is readable from a
+    /// detached session - which is where "this pane wants attention" is worth knowing.
+    ///
+    /// The `title` field carries a ` [!]` suffix for the same condition; read this instead, and
+    /// leave `title` to display. Always `false` when `visual_bell` is off in the configuration:
+    /// with no visual notification there is no per-pane bell state to report.
+    #[serde(default)]
+    pub has_pending_bell: bool,
+    /// The two-word name a human addresses this pane by, eg. `sunny-otter`
+    ///
+    /// The pane's ADDRESS, where the uuid is its LINEAGE. Unique among the session's live panes,
+    /// and it CARRIES across a snapshot restore while the uuid rotates - an address that changed
+    /// when the session came back would not be one. A closed pane's handle returns to circulation,
+    /// so a handle names at most one pane right now, not one pane forever.
+    ///
+    /// Two lowercase words joined by a dash, drawn from a fixed append-only word list, which is
+    /// what keeps it unambiguous against every other way of naming a pane: `terminal_1`, a bare
+    /// id, a uuid.
+    #[serde(default)]
+    pub handle: String,
+    /// A short note the server left on this pane, drawn on its frame. Empty when there is none.
+    ///
+    /// It describes the pane's live state - "exit 7" on a command pane whose command failed and
+    /// is being held open, "plugin failed" on a plugin pane that failed. It is not part of what
+    /// the pane *is*, so it is not serialized into a snapshot: a restored pane comes back without
+    /// one.
+    #[serde(default)]
+    pub note: String,
+    /// The colour `note` is drawn in. Meaningless, and `info`, when there is no note.
+    #[serde(default)]
+    pub note_color: NoteColor,
+    /// The `TabInfo::tab_id` of the tab this pane is in
+    ///
+    /// `PaneManifest` is keyed by tab POSITION, which moves when tabs are reordered and is not the
+    /// same number as the tab's id. This is the join a consumer holding a manifest needs to say
+    /// which tab a pane is in without correlating a `PaneUpdate` against a `TabUpdate` that may
+    /// have been delivered at a different moment.
+    #[serde(default)]
+    pub tab_id: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ClientInfo {
+    pub client_id: ClientId,
+    pub pane_id: PaneId,
+    pub running_command: String,
+    pub is_current_client: bool,
+    /// The size of this client's terminal, when the server knows it.
+    ///
+    /// A session is sized to its smallest attached client, so this is what tells a human which
+    /// client is shrinking the grid for everyone else. `None` when the server has not yet
+    /// recorded a size for the client - a client that has attached but not yet been sized.
+    /// `list-clients` reports it; the plugin API does not carry it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<Size>,
+    /// The terminal device this client is attached to (`/dev/ttys004`), when it has one.
+    ///
+    /// The hostname would be the wrong thing to carry: a zellij client is always local to its
+    /// server, so an ssh or mosh attach would report the server's own host for every client. The
+    /// tty is what actually names the terminal a human is sitting at. `None` for a client with no
+    /// controlling terminal - a web client, a CLI action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
+}
+
 }
 
 impl ClientInfo {
@@ -3630,7 +3782,19 @@ impl ClientInfo {
             pane_id,
             running_command,
             is_current_client,
+            terminal_size: None,
+            tty: None,
         }
+    }
+    /// Record the size of this client's terminal.
+    pub fn with_terminal_size(mut self, terminal_size: Option<Size>) -> Self {
+        self.terminal_size = terminal_size;
+        self
+    }
+    /// Record the terminal device this client is attached to.
+    pub fn with_tty(mut self, tty: Option<String>) -> Self {
+        self.tty = tty;
+        self
     }
 }
 
