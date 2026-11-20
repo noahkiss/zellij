@@ -8992,6 +8992,9 @@ session until the Mac ran out of process slots: a probe given up as lost was nev
 `default-plugins/slim-keybinds/src/vitals.rs` (`guarded`, `Lease`, `bar_key`, `ProbeGate`),
 `default-plugins/slim-keybinds/src/main.rs` (`pipe`). Tests in `vitals.rs`, one of which runs the
 watchdog against a hung body. The checked-in `slim-keybinds.wasm` is rebuilt. No contract change.
+A native test build leaves out `register_plugin!`. The macro exports a `#[no_mangle] fn pipe`,
+which shadows libc's `pipe(2)` there, and macOS `std::process::Command` calls `pipe(2)`. With the
+macro in, the watchdog test ran the plugin's `pipe` and panicked reading stdin.
 
 ### `list-agents --json` rows say how to message the agent
 

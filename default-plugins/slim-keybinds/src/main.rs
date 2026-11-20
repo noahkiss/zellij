@@ -543,4 +543,11 @@ impl ZellijPlugin for SlimKeybinds {
     }
 }
 
+// Not in a native test build: the macro exports `#[no_mangle] fn pipe`, which there shadows
+// libc's `pipe(2)`. On macOS, `std::process::Command` creates its pipes with `pipe(2)`, so the
+// watchdog test would call the plugin's `pipe` instead and panic reading stdin.
+#[cfg(not(test))]
 register_plugin!(SlimKeybinds);
+// The macro is what uses the plugin; a test build keeps it used without the macro.
+#[cfg(test)]
+const _: fn() -> SlimKeybinds = SlimKeybinds::default;
