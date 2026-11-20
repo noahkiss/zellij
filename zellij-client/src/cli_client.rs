@@ -353,15 +353,60 @@ fn handle_pipe_server_message(
     }
 }
 
-fn wait_for_pipe_release(os_input: &mut Box<dyn ClientOsApi>, pipe_id: &str) -> PipeWaitOutcome {
+/// The session's messages for a pipe that waits under `--timeout`, read on a thread because
+/// `recv_from_server` blocks, and a session with nothing to say is exactly the case where it
+/// blocks longest. `None` is the pipe that waits forever, on the blocking read.
+fn pipe_inbox(
+    os_input: &Box<dyn ClientOsApi>,
+    wait: &PipeWait,
+) -> Option<mpsc::Receiver<ServerToClientMsg>> {
+    wait.idle_timeout.map(|_| {
+        let (sender, incoming) = mpsc::channel();
+        let reader = os_input.box_clone();
+        std::thread::spawn(move || {
+            while let Some((message, _)) = reader.recv_from_server() {
+                if sender.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        incoming
+    })
+}
+
+fn wait_for_pipe_release(
+    os_input: &mut Box<dyn ClientOsApi>,
+    request: &PipeRequest,
+    inbox: Option<&mpsc::Receiver<ServerToClientMsg>>,
+    wait: &PipeWait,
+) -> PipeWaitOutcome {
+    // a message just went out, so the wait for an answer starts now
+    let mut last_heard = Instant::now();
     loop {
-        match os_input.recv_from_server() {
-            Some((message, _)) => {
-                if let Some(outcome) = handle_pipe_server_message(os_input, pipe_id, message) {
-                    return outcome;
+        let message = match (inbox, wait.idle_timeout) {
+            (Some(incoming), Some(window)) => {
+                match incoming
+                    .recv_timeout((last_heard + window).saturating_duration_since(Instant::now()))
+                {
+                    Ok(message) => {
+                        last_heard = Instant::now();
+                        message
+                    },
+                    Err(RecvTimeoutError::Timeout) => {
+                        return PipeWaitOutcome::Exit(wait.timed_out(request, window))
+                    },
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return PipeWaitOutcome::Exit(wait.session_gone())
+                    },
                 }
             },
-            None => return PipeWaitOutcome::Exit(2),
+            _ => match os_input.recv_from_server() {
+                Some((message, _)) => message,
+                None => return PipeWaitOutcome::Exit(wait.session_gone()),
+            },
+        };
+        if let Some(outcome) = handle_pipe_server_message(os_input, &request.pipe_id, message) {
+            return outcome;
         }
     }
 }
@@ -400,6 +445,7 @@ fn drive_streaming_pipe(
     first_payload: Option<String>,
     separator: u8,
     batch: bool,
+    wait: &PipeWait,
 ) -> i32 {
     let (sender, receiver) = std::sync::mpsc::channel();
     {
@@ -442,8 +488,23 @@ fn drive_streaming_pipe(
     let mut queued: VecDeque<Option<String>> = VecDeque::new();
     let mut waiting_for_release = false;
     let mut input_ended = false;
+    // when the session was last heard from, or last asked: what the idle window is measured from
+    let mut last_heard = Instant::now();
     loop {
-        match receiver.recv() {
+        // the idle window runs only while an answer is owed: the wait for stdin is outside it
+        let event = match (waiting_for_release, wait.idle_timeout) {
+            (true, Some(window)) => {
+                match receiver
+                    .recv_timeout((last_heard + window).saturating_duration_since(Instant::now()))
+                {
+                    Ok(event) => Ok(event),
+                    Err(RecvTimeoutError::Timeout) => return wait.timed_out(request, window),
+                    Err(RecvTimeoutError::Disconnected) => Err(()),
+                }
+            },
+            _ => receiver.recv().map_err(|_| ()),
+        };
+        match event {
             Ok(PipeEvent::Payload(payload)) => {
                 if payload.is_none() {
                     input_ended = true;
@@ -451,6 +512,7 @@ fn drive_streaming_pipe(
                 queued.push_back(payload);
             },
             Ok(PipeEvent::Server(message)) => {
+                last_heard = Instant::now();
                 match handle_pipe_server_message(os_input, &request.pipe_id, message) {
                     Some(PipeWaitOutcome::Released(Some(exit_code))) => return exit_code,
                     Some(PipeWaitOutcome::Released(None)) => {
@@ -463,12 +525,13 @@ fn drive_streaming_pipe(
                     None => {},
                 }
             },
-            Ok(PipeEvent::ServerGone) | Err(_) => return 2,
+            Ok(PipeEvent::ServerGone) | Err(()) => return wait.session_gone(),
         }
         if !waiting_for_release {
             if let Some(payload) = next_payload(&mut queued, batch) {
                 os_input.send_to_server(request.message(payload));
                 waiting_for_release = true;
+                last_heard = Instant::now();
             }
         }
     }
@@ -478,11 +541,13 @@ fn drive_pipe(
     os_input: &mut Box<dyn ClientOsApi>,
     request: &PipeRequest,
     mut payloads: impl Iterator<Item = Option<String>>,
+    wait: &PipeWait,
 ) -> i32 {
+    let inbox = pipe_inbox(os_input, wait);
     let mut next_payload = payloads.next();
     while let Some(payload) = next_payload {
         os_input.send_to_server(request.message(payload));
-        match wait_for_pipe_release(os_input, &request.pipe_id) {
+        match wait_for_pipe_release(os_input, request, inbox.as_ref(), wait) {
             PipeWaitOutcome::Released(Some(exit_code)) => return exit_code,
             PipeWaitOutcome::Released(None) => {},
             PipeWaitOutcome::Exit(exit_code) => return exit_code,
@@ -518,13 +583,23 @@ fn pipe_client(
     os_input: &mut Box<dyn ClientOsApi>,
     request: PipeRequest,
     payload: Option<String>,
+    wait: PipeWait,
 ) -> i32 {
     let request = request.prepare();
     let is_piped = !os_input.stdin_is_terminal();
-    if !is_piped {
-        return drive_pipe(os_input, &request, std::iter::once(payload));
+    // whether the pipe's own words came from the invocation
+    let payload_from_command_line = payload.is_some();
+    if !pipe_reads_stdin(is_piped, payload_from_command_line) {
+        let exit_status = drive_pipe(os_input, &request, std::iter::once(payload), &wait);
+        if exit_status == 0 && is_piped {
+            // the pipe said everything it had to say, so this end-of-pipe message is the last one
+            // there is: the same place `zellij pipe -- 'payload' < /dev/null` has always ended,
+            // instead of falling through to a stdin the pipe never owned
+            os_input.send_to_server(request.message(None));
+        }
+        return exit_status;
     }
-    drive_streaming_pipe(os_input, &request, payload, b'\n', false)
+    drive_streaming_pipe(os_input, &request, payload, b'\n', false, &wait)
 }
 
 pub fn start_prompt_client(
@@ -598,15 +673,19 @@ pub fn start_prompt_client(
     }
     .prepare();
     let exit_status = match plan.input {
-        PromptInput::Single(payload) => {
-            drive_pipe(&mut os_input, &request, std::iter::once(payload))
-        },
+        PromptInput::Single(payload) => drive_pipe(
+            &mut os_input,
+            &request,
+            std::iter::once(payload),
+            &PipeWait::prompt(),
+        ),
         PromptInput::StreamStdin { null } => drive_streaming_pipe(
             &mut os_input,
             &request,
             None,
             if null { 0 } else { b'\n' },
             true,
+            &PipeWait::prompt(),
         ),
     };
     os_input.send_to_server(ClientToServerMsg::ClientExited);
@@ -890,6 +969,42 @@ pub fn plan_prompt(
         args,
         input,
     })
+}
+
+/// Whether this pipe reads stdin at all, once the message it was invoked with has gone out.
+///
+/// Two things answer no, and only one of them used to be asked. Stdin that is a **terminal** is a
+/// person at a keyboard rather than data waiting to be sent. And a payload given on the **command
+/// line** is the whole pipe: `zellij pipe --name claim -- 'payload'` said its piece in the
+/// invocation, so the stdin it inherited belongs to whoever spawned it and is nothing to do with
+/// the pipe.
+///
+/// That second answer is what makes `--timeout` mean anything. The read it prevents sits outside
+/// the idle window, so a stdin that is neither a terminal nor ever at EOF held the pipe open with
+/// nothing able to end it - and that is the ordinary shape of an inherited stdin: a command run
+/// over ssh, or a child of a long-lived server. `zellij pipe --timeout 5 --name claim -- 'payload'`
+/// got its answer and then blocked forever anyway. Redirecting from `/dev/null` was the only cure,
+/// and a caller should not have to know that.
+///
+/// The cost is that `echo data | zellij pipe --name n -- 'payload'` now sends only the payload. An
+/// invocation that says its message twice was always ambiguous; the one that means the stream is
+/// the one that leaves the payload off.
+fn pipe_reads_stdin(stdin_is_piped: bool, payload_from_command_line: bool) -> bool {
+    stdin_is_piped && !payload_from_command_line
+}
+
+/// The sentence a pipe that ran out of time prints on stderr.
+///
+/// Exit 2 is one bucket with several doors into it, so the sentence is what tells a script which
+/// one this was. It names the pipe and the window, and it says why a pipe can go unanswered at
+/// all - which is the thing a caller who has just met this for the first time does not know.
+fn pipe_timed_out(pipe_id: &str, timeout: Duration) -> String {
+    format!(
+        "The pipe '{}' went unanswered for {}s and gave up. A pipe is unblocked by a plugin that \
+         received it, and none did. `--timeout 0` waits for one however long it takes.",
+        pipe_id,
+        timeout.as_secs()
+    )
 }
 
 /// A record report as one JSON object, or `None` for lines that are not a record.

@@ -66,6 +66,7 @@ fn send_to_the_fixture(zellij: &TestSession, name: &str, args: &[(&str, &str)]) 
         Some(joined.parse().unwrap())
     };
     let pipe = CliAction::Pipe {
+        timeout: 0,
         name: Some(name.to_owned()),
         payload: None,
         args,

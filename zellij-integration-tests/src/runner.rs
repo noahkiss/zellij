@@ -928,10 +928,17 @@ impl TestSession {
     }
 
     fn spawn_cli_client(&self, cli_action: CliAction) -> JoinHandle<i32> {
+        // `pipe --timeout` is held by the client rather than travelling with the action, so it is
+        // taken off the request here the same way the real CLI takes it
+        let mut cli_action = cli_action;
+        let pipe_timeout = cli_action.take_pipe_timeout();
+        // The id forms only: resolving a handle or a uuid needs a real cli connection to ask the
+        // server on, and this harness builds its actions before it has one.
         let actions = Action::actions_from_cli(
             cli_action,
             Box::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
             Some(self.config.clone()),
+            &pane_ids_only,
         )
         .expect("failed to build cli actions");
         let (fake_client_os_api, _fake_client_handle) = FakeClientOsApi::new(self.size, None);
@@ -995,10 +1002,14 @@ impl TestSession {
     }
 
     pub fn run_cli_pipe(&self, cli_action: CliAction, caller: CliCaller) -> CliOutputHandle {
+        // `pipe --timeout` is held by the client, taken off the request as the real CLI does
+        let mut cli_action = cli_action;
+        let pipe_timeout = cli_action.take_pipe_timeout();
         let actions = Action::actions_from_cli(
             cli_action,
             Box::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
             Some(self.config.clone()),
+            &pane_ids_only,
         )
         .expect("failed to build cli actions");
         let (fake_client_os_api, fake_client_handle) = self.cli_os_api(caller);

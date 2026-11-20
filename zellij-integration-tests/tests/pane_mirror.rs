@@ -160,6 +160,8 @@ fn pipe_to_the_fixture(
         .join(",");
     let args = Some(joined.parse().unwrap());
     let pipe = CliAction::Pipe {
+        // upstream's pipe: no idle window
+        timeout: 0,
         name: Some(name.to_owned()),
         payload: None,
         args,
@@ -1864,6 +1866,8 @@ fn a_live_view_inside_a_popup_plugin_pane_shows_the_source_and_takes_keys() {
     args.push(("rows", "3".to_owned()));
     let opened = zellij.run_cli_pipe(
         CliAction::Pipe {
+            // upstream's pipe: no idle window
+            timeout: 0,
             name: Some("live_view_set".to_owned()),
             payload: None,
             args: Some(
@@ -2450,6 +2454,8 @@ fn a_popup_starts_capture_through_the_api_shows_the_cursor_over_a_pinned_pane_an
         .join(",");
     let opened = zellij.run_cli_pipe(
         CliAction::Pipe {
+            // upstream's pipe: no idle window
+            timeout: 0,
             name: Some("live_view_set".to_owned()),
             payload: None,
             args: Some(joined.parse().unwrap()),

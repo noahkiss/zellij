@@ -390,6 +390,8 @@ fn pipe_action(
     popup: Option<PipePopupPlacement>,
 ) -> CliAction {
     CliAction::Pipe {
+        // upstream's pipe: no idle window
+        timeout: 0,
         name: Some(name.to_owned()),
         payload: payload.map(|p| p.to_owned()),
         args: args.map(|a| a.parse().unwrap()),
@@ -468,6 +470,8 @@ fn a_click_outside_a_pipe_popup_closes_it_with_popup_outside_click_close() {
         Some(PipePopupPlacement::Center),
     );
     if let CliAction::Pipe {
+        // upstream's pipe: no idle window
+        timeout: 0,
         popup_outside_click,
         ..
     } = &mut action

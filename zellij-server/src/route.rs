@@ -2422,6 +2422,12 @@ fn route_action_with_origin(
             } else {
                 log::error!("Message must have a name");
             }
+            // the pipe answers for itself, on the plugin's own messages. Falling through to the
+            // wait below would read the completion channel dropped above as "the action reported
+            // nothing" and send the caller `Action CliPipe ended without reporting a result` - an
+            // error every `zellij pipe` got, ahead of the plugin's real answer, whether or not
+            // anything was wrong.
+            return Ok((should_break, None));
         },
         Action::KeybindPipe {
             mut name,

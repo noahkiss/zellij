@@ -2342,6 +2342,9 @@ impl Action {
                 popup_no_focus,
                 popup_capture_all_keys,
                 popup_outside_click,
+                // the client holds the pipe's deadline; it never becomes part of the action, so
+                // `--timeout` costs the client/server contract nothing
+                timeout: _,
             } => {
                 let current_dir = get_current_dir();
                 let cwd = plugin_cwd

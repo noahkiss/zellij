@@ -157,7 +157,15 @@ fn output(text: &str) -> ServerToClientMsg {
 }
 
 fn run(os_api: &ScriptedOsApi, action: Action) -> i32 {
-    start_cli_client(Box::new(os_api.clone()), "session", vec![action])
+    start_cli_client(
+        Box::new(os_api.clone()),
+        "session",
+        vec![action],
+        None,
+        None,
+        false,
+        None,
+    )
 }
 
 #[test]

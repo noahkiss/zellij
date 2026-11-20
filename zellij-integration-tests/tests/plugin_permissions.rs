@@ -60,6 +60,7 @@ fn write_into(zellij: &TestSession, session: &str, terminal: &FakePtyHandle) -> 
         terminal.terminal_id()
     );
     let pipe = CliAction::Pipe {
+        timeout: 0,
         name: Some("session_pane_command".to_owned()),
         payload: None,
         args: Some(args.parse().unwrap()),

@@ -12,6 +12,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use url::Url;
 
 const fn ansi(color: AnsiColor) -> Style {
@@ -1292,7 +1293,8 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// The name of the pipe
         #[clap(short, long, value_parser, display_order(1))]
         name: Option<String>,
-        /// The data to send down this pipe (if blank, will listen to STDIN)
+        /// The data to send down this pipe. Given here it is the WHOLE pipe and STDIN is never read;
+        /// leave it blank to send what arrives on STDIN instead
         payload: Option<String>,
 
         #[clap(short, long, value_parser, display_order(2))]
@@ -1307,6 +1309,15 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// considered a different plugin for the purposes of determining the pipe destination)
         #[clap(short('c'), long, value_parser, display_order(4))]
         plugin_configuration: Option<PluginUserConfiguration>,
+        /// Seconds the session may say NOTHING before this gives up and exits 2. The window is
+        /// idle time, not a budget for the call: every answer restarts it, and time spent
+        /// waiting on STDIN is outside it, so a `tail -f | zellij pipe` is unaffected. `0` waits
+        /// forever, which only a plugin that received the message can end
+        #[clap(long, value_parser, default_value = "30", display_order(5))]
+        timeout: u64,
+    },
+}
+
 /// The condition a `zellij action wait` blocks on.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -2627,7 +2638,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// The name of the pipe
         #[clap(short, long, value_parser, display_order(1))]
         name: Option<String>,
-        /// The data to send down this pipe (if blank, will listen to STDIN)
+        /// The data to send down this pipe. Given here it is the WHOLE pipe and STDIN is never read;
+        /// leave it blank to send what arrives on STDIN instead
         payload: Option<String>,
 
         #[clap(short, long, value_parser, display_order(2))]
@@ -4466,6 +4478,31 @@ mod tests {
         let action = parse_action(&["rename-pane", "notes"]);
         assert!(missing_target(&action, true).is_none());
         assert!(missing_target(&action, false).is_some());
+    }
+
+    #[test]
+    fn a_pipe_deadline_is_taken_out_of_the_request() {
+        let mut action = parse_action(&["pipe", "--timeout", "5", "--name", "logs"]);
+        assert_eq!(
+            action.take_pipe_timeout(),
+            Some(Duration::from_secs(5)),
+            "the client holds the idle window; the action never carries it"
+        );
+        // taken once: the client waits on it, and it must not also travel with the action
+        assert_eq!(action.take_pipe_timeout(), None);
+    }
+
+    #[test]
+    fn a_pipe_gives_up_by_default_and_hangs_only_when_told_to() {
+        // a pipe nothing answers has no other end, so the window is on by default and a caller
+        // who wants the old unbounded wait asks for it by name
+        let mut default = parse_action(&["pipe", "--name", "logs"]);
+        assert_eq!(default.take_pipe_timeout(), Some(Duration::from_secs(30)));
+        let mut asked_for = parse_action(&["pipe", "--timeout", "0", "--name", "logs"]);
+        assert_eq!(asked_for.take_pipe_timeout(), None);
+        // the negative control: no other verb has a pipe deadline to give up
+        let mut other = parse_action(&["new-pane"]);
+        assert_eq!(other.take_pipe_timeout(), None);
     }
 
     fn wait_bounds(args: &[&str]) -> (WaitFor, u64, u64) {
