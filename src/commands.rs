@@ -1898,6 +1898,14 @@ pub fn get_config_options_from_cli_args(opts: &CliArgs) -> Result<Options, Strin
         .map_err(|e| e.to_string())
 }
 
+/// The config file this process was pointed at, for the commands that read a key from it by name.
+static CONFIG_PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the config file path. Only the first call counts.
+pub(crate) fn record_config_path(path: Option<PathBuf>) {
+    let _ = CONFIG_PATH.set(path);
+}
+
 /// fork addition: `zellij action send-message`, run by the client.
 fn send_message(
     cli_action: &zellij_utils::cli::CliAction,
@@ -1938,6 +1946,47 @@ fn send_message(
             from_name: from_name.clone(),
             from_tab: from_tab.clone(),
             json: *json || output_json,
+            default_harness: CONFIG_PATH
+                .get()
+                .cloned()
+                .flatten()
+                .and_then(default_harness),
         },
     )
+}
+
+/// The config's `default_harness "<name>"`: the coding agent `send-message` starts in a target tab
+/// or pane that runs none. Read from the file by name, as the MCP server reads `remote_hosts`, so
+/// the client needs no option of its own for it. Absent, unreadable or not one string: `None`, and
+/// `send-message` refuses an agentless target as before.
+fn default_harness(config_path: PathBuf) -> Option<String> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    default_harness_in(&text)
+}
+
+pub(crate) fn default_harness_in(config: &str) -> Option<String> {
+    let document: kdl::KdlDocument = config.parse().ok()?;
+    let value = document.get("default_harness")?.entries().first()?.value();
+    value
+        .as_string()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod default_harness_tests {
+    use super::default_harness_in;
+
+    #[test]
+    fn the_key_is_one_string_and_anything_else_is_none() {
+        assert_eq!(
+            default_harness_in("default_harness \"claude\"\n"),
+            Some("claude".to_owned())
+        );
+        assert_eq!(default_harness_in("default_shell \"zsh\"\n"), None);
+        assert_eq!(default_harness_in("default_harness \"\"\n"), None);
+        assert_eq!(default_harness_in("default_harness 3\n"), None);
+        assert_eq!(default_harness_in("default_harness {\n"), None);
+    }
 }

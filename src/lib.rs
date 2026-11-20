@@ -94,6 +94,8 @@ fn main() {
 
     {
         let config = Config::try_from(&opts).ok();
+        // `send-message` reads `default_harness` from the config file by name
+        commands::record_config_path(Config::config_file_path(&opts));
         if let Some(Command::Sessions(Sessions::ListAgents {
             json,
             report_withheld: _,

@@ -9100,7 +9100,8 @@ when that cannot mix with a person's typing, and otherwise holds it.
   machine. A handle or id wins outright. Otherwise the sender's own agent never answers, and
   exactly one other agent must: none or several
   is a miss, exit 2, with the candidates on stderr. A pane with no agent is refused: type into it
-  with `zellij_write_input`.
+  with `zellij_write_input`. With `default_harness` in the config, a tab or pane with no agent
+  gets one started instead; see [below](#a-target-with-no-agent-starts-the-default-harness).
 - **The guard** runs on the server, and the message goes in only when all three hold:
 
   | check | default | why |
@@ -9205,6 +9206,56 @@ the mailbox's save, restore, expiry and pruning, the pty writer's held write, ta
 and old-build detection, and on the screen: delivery to an idle agent, a key after it, a draft
 held and left alone then delivered after its turn, a cleared draft, the quiet window, and the
 working, blocked, shell and no-wait cases.
+
+### A target with no agent starts the default harness
+
+```kdl
+default_harness "claude"
+```
+
+Without the key, `send-message` refuses a target that names no agent, as above. With it, a target
+that names **one tab, or one pane, with no agent in its tab** gets the named harness started there,
+and the message becomes its first prompt:
+
+1. **Where.** A named pane that is an idle shell takes it. Otherwise the tab's one idle shell takes
+   it. With no idle shell, or with several, a new pane opens in that tab without taking anyone's
+   focus, and its shell types the command once it is ready. A new tab is never made: a tab name
+   that matches no tab is refused as before.
+2. **An idle shell** is one whose own `OSC 133` markers say it is at a prompt, with nothing typed
+   since (`input_since_prompt` false) and no restored command waiting (`prefilled_command`). A shell
+   without markers never qualifies: it cannot say whether a person typed at it. Two idle shells are
+   not a pick, so they get a new pane.
+3. **Typing.** The command is the bare name and Enter, as a person would type it. The pane is read
+   again just before the write, and a shell that is no longer idle gets a new pane instead.
+4. **Then the message.** The harness has 30 seconds to show up as an agent in that pane. The
+   message then goes to it through the guard above, which holds it as `starting` until the harness
+   reports `idle` and types it in. stderr names what was started and where.
+
+Refused, with nothing started (exit 2):
+
+- a tab that already runs an agent, the caller's own included;
+- a name that matches several tabs, or none;
+- a harness this build does not recognise, and one that reports no `OSC 7501` state (opencode,
+  codex): the guard would refuse the message, so starting it would only leave an agent behind.
+
+The key is read by name from the config file, the way the MCP server reads `remote_hosts`. It is a
+top-level key, so an older build ignores it (a stock build) or warns and skips it (a fork build
+since the tolerant-config release); see `docs/config-compatibility.md`. The value is the harness
+name only; the fork never adds flags to it. `zellij_send` runs `send-message` on the receiving
+machine, so that machine's `default_harness` is the one used.
+
+Limits:
+
+- The re-read and the write are two requests to the server, not one step. A key that lands in
+  that shell between them mixes with the command.
+- A shell that redraws its prompt resets `input_since_prompt`. bash redraws on a resize, so a line
+  typed but not entered, followed by a resize (a new pane in the tab is one), reads as idle.
+- The first message waits out the draft the typed command leaves (about 10 seconds), then goes in.
+
+`send-message` also stopped listing an agent twice when a plugin pane and its terminal pane share
+a number: the agent row is matched to terminal panes only.
+
+Capability: `send-default-harness`.
 
 ### Fork protocol tags live in a reserved block
 

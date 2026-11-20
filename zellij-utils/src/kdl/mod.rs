@@ -3489,7 +3489,8 @@ fn plist_value_to_kdl(name: &str, value: &PlistValue) -> KdlNode {
 
 /// Every top-level node a config may hold: the blocks [`Config::from_kdl`] reads, every option
 /// [`Options::from_kdl`] reads, `layout` (a layout file goes through the same parse for the
-/// options it carries) and `remote_hosts` (read by the MCP server from the same file). Anything
+/// options it carries), `remote_hosts` (read by the MCP server from the same file) and
+/// `default_harness` (read by `send-message` from the same file). Anything
 /// else is a key from a newer build, or a typo, and is warned about.
 ///
 /// A key read anywhere from the top level of `config.kdl` belongs here: the test
@@ -3507,6 +3508,7 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "new_pane_default",
     "layout",
     "remote_hosts",
+    "default_harness",
     "mousebinds",
     "context_menu",
     "terminal",

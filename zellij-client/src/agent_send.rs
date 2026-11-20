@@ -87,6 +87,112 @@ pub fn resolve(target: &str, candidates: &[Candidate]) -> Resolved {
     }
 }
 
+/// Where a default harness is started for a target that names no agent.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HarnessPlace {
+    /// Type the harness command into this idle shell.
+    TypeInto { session: String, terminal_id: u32 },
+    /// Open a pane in this tab, without focus, and start the harness there.
+    NewPaneIn {
+        session: String,
+        tab_id: usize,
+        tab_name: String,
+    },
+}
+
+/// A shell waiting at a fresh prompt with nothing typed, by its own OSC 133 markers.
+///
+/// Only the markers count. A shell without them cannot say it is at a prompt, nor whether a person
+/// has typed at it, so it never qualifies, and the harness goes into a new pane beside it instead.
+pub fn is_idle_shell(candidate: &Candidate) -> bool {
+    let pane = candidate.pane;
+    candidate.agent.is_none()
+        && pane.agent.is_none()
+        && !pane.pane_info.is_plugin
+        && !pane.pane_info.exited
+        && !pane.pane_info.is_held
+        && pane.command_state_from_markers() == Some(zellij_utils::data::PaneCommandState::Prompt)
+        && !pane.input_since_prompt
+        && pane.prefilled_command.is_none()
+}
+
+/// Where to start a default harness for `target`, when [`resolve`] found no agent for it.
+///
+/// The target must name one pane (a handle or a pane id) or one tab by name, and the tab must run
+/// no agent, the caller's own included. A named pane that is an idle shell takes the harness.
+/// Otherwise the tab takes it in its one idle shell, and in a new pane when it has none or several:
+/// a pick between two shells would be a guess. `None` when the target names no tab, several, or a
+/// tab that already runs an agent.
+pub fn harness_place(target: &str, candidates: &[Candidate]) -> Option<HarnessPlace> {
+    let (session_filter, word) = match target.split_once('/') {
+        Some((session, word)) if !session.is_empty() && !word.is_empty() => (Some(session), word),
+        _ => (None, target),
+    };
+    let in_scope: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|c| session_filter.map_or(true, |session| c.session == session))
+        .collect();
+    let pane_id = pane_id_of(word);
+    let named: Vec<&&Candidate> = in_scope
+        .iter()
+        .filter(|c| {
+            !c.pane.pane_info.is_plugin
+                && (c.pane.pane_info.handle == word || pane_id == Some(c.pane.pane_info.id))
+        })
+        .collect();
+    let tab_key = |c: &Candidate| (c.session.to_owned(), c.pane.pane_info.tab_id);
+    let (session, tab_id) = match named.as_slice() {
+        [one] => tab_key(one),
+        [] => {
+            let mut tabs: Vec<(String, usize)> = in_scope
+                .iter()
+                .filter(|c| {
+                    !c.pane.tab_name.is_empty() && c.pane.tab_name.eq_ignore_ascii_case(word)
+                })
+                .map(|c| tab_key(c))
+                .collect();
+            tabs.sort();
+            tabs.dedup();
+            match tabs.as_slice() {
+                [one] => one.clone(),
+                _ => return None,
+            }
+        },
+        _ => return None,
+    };
+    let tab: Vec<&&Candidate> = in_scope
+        .iter()
+        .filter(|c| c.session == session && c.pane.pane_info.tab_id == tab_id)
+        .collect();
+    if tab
+        .iter()
+        .any(|c| c.agent.is_some() || c.pane.agent.is_some())
+    {
+        return None;
+    }
+    let tab_name = tab.first()?.pane.tab_name.clone();
+    if let [one] = named.as_slice() {
+        if is_idle_shell(one) {
+            return Some(HarnessPlace::TypeInto {
+                session,
+                terminal_id: one.pane.pane_info.id,
+            });
+        }
+    }
+    let idle: Vec<&&&Candidate> = tab.iter().filter(|c| is_idle_shell(c)).collect();
+    match (named.is_empty(), idle.as_slice()) {
+        (true, [one]) => Some(HarnessPlace::TypeInto {
+            session,
+            terminal_id: one.pane.pane_info.id,
+        }),
+        _ => Some(HarnessPlace::NewPaneIn {
+            session,
+            tab_id,
+            tab_name,
+        }),
+    }
+}
+
 fn answers_to(candidate: &Candidate, word: &str) -> bool {
     let same = |value: &str| !value.is_empty() && value.eq_ignore_ascii_case(word);
     let Some(agent) = candidate.agent.filter(|agent| !agent.is_self) else {
@@ -308,6 +414,103 @@ mod tests {
         assert!(matches!(resolve_in("scribe", &fleet), Resolved::Nothing(_)));
         // its own handle still names it
         assert_eq!(resolve_in("calm-lynx", &fleet), one("play", 4));
+    }
+
+    fn place_in(target: &str, fixtures: &[Fixture]) -> Option<HarnessPlace> {
+        let candidates: Vec<Candidate> = fixtures
+            .iter()
+            .map(|f| Candidate {
+                session: f.session,
+                pane: &f.pane,
+                agent: f.agent.as_ref(),
+            })
+            .collect();
+        harness_place(target, &candidates)
+    }
+
+    /// A shell pane in `tab` (tab id `tab_id`), at a fresh marked prompt when `idle`.
+    fn shell(id: u32, handle: &str, tab: &str, tab_id: usize, idle: bool) -> Fixture {
+        let mut fixture = pane("work", id, handle, tab, None);
+        fixture.pane.pane_info.tab_id = tab_id;
+        if idle {
+            fixture.pane.command_state = Some(zellij_utils::data::PaneCommandState::Prompt);
+        }
+        fixture
+    }
+
+    fn type_into(terminal_id: u32) -> Option<HarnessPlace> {
+        Some(HarnessPlace::TypeInto {
+            session: "work".into(),
+            terminal_id,
+        })
+    }
+
+    fn new_pane_in(tab_id: usize, tab_name: &str) -> Option<HarnessPlace> {
+        Some(HarnessPlace::NewPaneIn {
+            session: "work".into(),
+            tab_id,
+            tab_name: tab_name.into(),
+        })
+    }
+
+    #[test]
+    fn a_tab_with_one_idle_shell_takes_the_harness_there() {
+        let panes = vec![shell(7, "idle-shell", "notes", 3, true)];
+        assert_eq!(place_in("notes", &panes), type_into(7));
+        assert_eq!(place_in("NOTES", &panes), type_into(7));
+        assert_eq!(place_in("idle-shell", &panes), type_into(7));
+        assert_eq!(place_in("work/notes", &panes), type_into(7));
+    }
+
+    #[test]
+    fn a_shell_with_typed_text_or_a_prefill_or_no_markers_is_not_idle() {
+        let mut typed = shell(7, "typed-shell", "notes", 3, true);
+        typed.pane.input_since_prompt = true;
+        assert_eq!(place_in("notes", &[typed]), new_pane_in(3, "notes"));
+        let mut prefilled = shell(7, "prefill-shell", "notes", 3, true);
+        prefilled.pane.prefilled_command = Some("make".into());
+        assert_eq!(place_in("notes", &[prefilled]), new_pane_in(3, "notes"));
+        let unmarked = shell(7, "plain-shell", "notes", 3, false);
+        assert_eq!(place_in("notes", &[unmarked]), new_pane_in(3, "notes"));
+        // a prompt the foreground-process tracker inferred, without markers, is not enough
+        let mut tracked = shell(7, "tracked-shell", "notes", 3, false);
+        tracked.pane.pane_info.command_state.phase =
+            zellij_utils::attention::CommandPhase::AtPrompt;
+        tracked.pane.command_state = Some(zellij_utils::data::PaneCommandState::Prompt);
+        assert_eq!(place_in("notes", &[tracked]), new_pane_in(3, "notes"));
+    }
+
+    #[test]
+    fn two_idle_shells_are_not_a_pick_unless_one_is_named() {
+        let panes = vec![
+            shell(7, "first-shell", "notes", 3, true),
+            shell(8, "second-shell", "notes", 3, true),
+        ];
+        assert_eq!(place_in("notes", &panes), new_pane_in(3, "notes"));
+        assert_eq!(place_in("second-shell", &panes), type_into(8));
+        // a named pane that is busy puts the harness in a new pane in its tab, not in a neighbour
+        let mut busy = shell(9, "busy-shell", "notes", 3, false);
+        busy.pane.command_state = Some(zellij_utils::data::PaneCommandState::Running);
+        let panes = vec![busy, shell(7, "idle-shell", "notes", 3, true)];
+        assert_eq!(place_in("busy-shell", &panes), new_pane_in(3, "notes"));
+    }
+
+    #[test]
+    fn a_tab_with_an_agent_or_no_such_tab_starts_nothing() {
+        // `develop` holds sunny-otter's claude; `review` holds a codex
+        assert_eq!(place_in("develop", &fleet()), None);
+        assert_eq!(place_in("quiet-shell", &fleet()), None);
+        assert_eq!(place_in("nowhere", &fleet()), None);
+        // the caller's own agent counts: a harness is never started beside the sender
+        let mut fleet = fleet();
+        fleet[3].agent.as_mut().unwrap().is_self = true;
+        assert_eq!(place_in("calm-lynx", &fleet), None);
+        // one tab name in two tabs is two places
+        let panes = vec![
+            shell(7, "one-shell", "notes", 3, true),
+            shell(8, "two-shell", "notes", 4, true),
+        ];
+        assert_eq!(place_in("notes", &panes), None);
     }
 
     #[test]

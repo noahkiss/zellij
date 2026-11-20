@@ -3382,6 +3382,8 @@ pub struct SendMessageRequest {
     pub from_name: Option<String>,
     pub from_tab: Option<String>,
     pub json: bool,
+    /// The config's `default_harness`: started in a target tab or pane that runs no agent.
+    pub default_harness: Option<String>,
 }
 
 /// fork addition: `zellij action send-message`.
@@ -3398,7 +3400,7 @@ pub fn start_send_message_client(
     sessions: &[String],
     request: SendMessageRequest,
 ) -> i32 {
-    use zellij_utils::agent_mail::{Address, Status};
+    use zellij_utils::agent_mail::Address;
     let text = if request.text == "-" {
         let mut text = String::new();
         if let Err(e) = io::Read::read_to_string(&mut io::stdin(), &mut text) {
@@ -3487,11 +3489,44 @@ pub fn start_send_message_client(
                 .map(move |pane| crate::agent_send::Candidate {
                     session: session.as_str(),
                     pane,
-                    agent: agents.iter().find(|a| a.pane_id == pane.pane_info.id),
+                    // a plugin pane and a terminal pane can share a number; agents are terminals
+                    agent: agents
+                        .iter()
+                        .find(|a| a.pane_id == pane.pane_info.id)
+                        .filter(|_| !pane.pane_info.is_plugin),
                 })
         })
         .collect();
-    let (session, terminal_id) = match crate::agent_send::resolve(&target, &candidates) {
+    let resolved = crate::agent_send::resolve(&target, &candidates);
+    let no_agent = matches!(
+        resolved,
+        crate::agent_send::Resolved::NotAgent { .. } | crate::agent_send::Resolved::Nothing(_)
+    );
+    let place = match (&request.default_harness, no_agent) {
+        (Some(_), true) => crate::agent_send::harness_place(&target, &candidates),
+        _ => None,
+    };
+    if let (Some(harness), Some(place)) = (&request.default_harness, place) {
+        match start_default_harness(make_os_input, harness, place) {
+            Ok(started) => {
+                eprintln!("{}", started.line);
+                // the server holds the message as `starting` until the harness reports, then types
+                // it in once it is idle: its first prompt
+                return deliver_message(
+                    make_os_input,
+                    &request,
+                    text,
+                    started.session,
+                    started.terminal_id,
+                );
+            },
+            Err(message) => {
+                eprintln!("{}", message);
+                return 2;
+            },
+        }
+    }
+    let (session, terminal_id) = match resolved {
         crate::agent_send::Resolved::One {
             session,
             terminal_id,
@@ -3531,6 +3566,175 @@ pub fn start_send_message_client(
         },
     };
 
+    deliver_message(make_os_input, &request, text, session, terminal_id)
+}
+
+/// A default harness that was started for a message, and where.
+struct StartedHarness {
+    session: String,
+    terminal_id: u32,
+    /// What was done, for stderr: `started claude in work/sunny-otter (tab notes)`.
+    line: String,
+}
+
+/// How long a started harness has to show up as an agent in its pane.
+const HARNESS_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a new pane's shell has to be ready for the harness command.
+const HARNESS_SHELL_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Start `harness` at `place`: type it into the idle shell, or open a pane in the tab without
+/// focus and type it there once its shell is ready. Then wait for the pane to run it as an agent.
+///
+/// The idle shell is read again just before the command is typed, so a person who started typing
+/// since the target was resolved gets a new pane instead. The two steps are still two requests to
+/// the server: a key that lands between the re-read and the write mixes with the command.
+fn start_default_harness(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    harness: &str,
+    place: crate::agent_send::HarnessPlace,
+) -> Result<StartedHarness, String> {
+    use crate::agent_send::HarnessPlace;
+    let Some(kind) = agent_detect::harness_for_command(harness).map(|h| h.kind) else {
+        return Err(format!(
+            "default_harness {:?} is not a coding agent this build recognises, so nothing was started.",
+            harness
+        ));
+    };
+    if !zellij_utils::agent_mail::reports_state(kind) {
+        return Err(format!(
+            "default_harness {:?} reports no state (OSC 7501), so nothing could say when it is \
+             idle to take the message. Nothing was started.",
+            harness
+        ));
+    }
+    let pane_row = |session: &str, terminal_id: u32| -> Result<Option<PaneListEntry>, String> {
+        Ok(panes_of_session(make_os_input(), session)?
+            .into_iter()
+            .find(|pane| !pane.pane_info.is_plugin && pane.pane_info.id == terminal_id))
+    };
+    let (session, terminal_id, how) = match place {
+        HarnessPlace::TypeInto {
+            session,
+            terminal_id,
+        } => {
+            let still_idle = pane_row(&session, terminal_id)?.is_some_and(|pane| {
+                crate::agent_send::is_idle_shell(&crate::agent_send::Candidate {
+                    session: &session,
+                    pane: &pane,
+                    agent: None,
+                })
+            });
+            if still_idle {
+                (session, terminal_id, "in its idle shell")
+            } else {
+                let pane = pane_row(&session, terminal_id)?.ok_or_else(|| {
+                    format!(
+                        "terminal_{} closed before the harness started.",
+                        terminal_id
+                    )
+                })?;
+                let terminal_id = open_shell_pane(make_os_input, &session, pane.pane_info.tab_id)?;
+                (session, terminal_id, "in a new pane")
+            }
+        },
+        HarnessPlace::NewPaneIn {
+            session, tab_id, ..
+        } => {
+            let terminal_id = open_shell_pane(make_os_input, &session, tab_id)?;
+            (session, terminal_id, "in a new pane")
+        },
+    };
+    ask(
+        make_os_input(),
+        &session,
+        Action::WriteCharsToPaneId {
+            chars: format!("{}\r", harness),
+            pane_id: PaneId::Terminal(terminal_id),
+        },
+        "the harness command",
+    )?;
+    let deadline = Instant::now() + HARNESS_START_TIMEOUT;
+    loop {
+        let row = pane_row(&session, terminal_id)?.ok_or_else(|| {
+            format!(
+                "terminal_{} closed while {} was starting.",
+                terminal_id, harness
+            )
+        })?;
+        if row.agent.as_ref().is_some_and(|agent| agent.kind == kind) {
+            return Ok(StartedHarness {
+                line: format!(
+                    "started {} {} {}/{} (tab {}); the message goes in once it is idle",
+                    harness, how, session, row.pane_info.handle, row.tab_name
+                ),
+                session,
+                terminal_id,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "typed {:?} into {}/{}, and no {} showed up there in {}s. Nothing was sent.",
+                harness,
+                session,
+                row.pane_info.handle,
+                kind,
+                HARNESS_START_TIMEOUT.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Open a shell pane in `tab_id` without taking anyone's focus, and wait for its shell.
+fn open_shell_pane(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session: &str,
+    tab_id: usize,
+) -> Result<u32, String> {
+    let lines = ask(
+        make_os_input(),
+        session,
+        Action::NewTiledPane {
+            direction: None,
+            command: None,
+            pane_name: None,
+            near_current_pane: false,
+            no_focus: true,
+            borderless: None,
+            border_style: None,
+            tab_id: Some(tab_id),
+        },
+        "a new pane",
+    )?;
+    let terminal_id = lines
+        .iter()
+        .find_map(|line| {
+            let (_, id) = line.split_once("terminal_")?;
+            id.trim().parse::<u32>().ok()
+        })
+        .ok_or_else(|| format!("The session did not say which pane it made: {:?}", lines))?;
+    wait_for_ready(
+        make_os_input,
+        session,
+        PaneId::Terminal(terminal_id),
+        Duration::from_millis(500),
+        Some(Instant::now() + HARNESS_SHELL_READY_TIMEOUT),
+    )
+    .map_err(|miss| match miss {
+        WaitMiss::Failed(message) | WaitMiss::Missed(message) => message,
+    })?;
+    Ok(terminal_id)
+}
+
+/// Hand the message for `terminal_id` to `session`, and report what became of it.
+fn deliver_message(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    request: &SendMessageRequest,
+    text: String,
+    session: String,
+    terminal_id: u32,
+) -> i32 {
+    use zellij_utils::agent_mail::Status;
     let (from, own_name, own_tab) = match &request.from {
         Some(from) => (from.clone(), None, None),
         None => sender_address(make_os_input),

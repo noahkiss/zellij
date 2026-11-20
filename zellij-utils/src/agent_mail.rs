@@ -298,7 +298,7 @@ pub fn guard(facts: &GuardFacts) -> Decision {
 
 /// Whether a harness reports its state over `OSC 7501` on its own, as it starts. codex reports
 /// only through the hooks a person installs, and opencode not at all.
-fn reports_state(kind: &str) -> bool {
+pub fn reports_state(kind: &str) -> bool {
     matches!(kind, "claude" | "pi")
 }
 
