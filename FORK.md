@@ -8745,28 +8745,47 @@ before.
 `socket_dir_redirects`), `src/session_commands.rs` (`refuse_a_scratch_pin`). Tests in
 `session_lifecycle.rs`. No contract change.
 
-### The vitals probe never overlaps itself
+### The vitals probe never overlaps itself, outlives its window, or runs once per tab
 
 `slim-keybinds` draws its vitals cluster from a `/bin/sh` probe every ten seconds. On macOS the
 probe runs `top -l 2 -n 0 -s 1`, which takes a second when the machine is idle and far longer when it
 is not. The timer fired whether or not the last probe had answered, so under load the probes piled
 up, each `top` slowed the others, and one Mac reached a load average near 300. Every tab has its own
-bar, and every bar ran its own probe.
+bar, and every bar ran its own probe. A later report found `top` probes piling up in a detached
+session until the Mac ran out of process slots: a probe given up as lost was never killed.
 
+- **A probe kills itself when its window closes.** The probe runs as a background job, and a
+  watchdog job kills its whole process tree after eight seconds, under the ten-second interval:
+  each process is stopped, then its children are killed the same way (`pgrep -P`), then the
+  process. It is plain `/bin/sh`, because macOS has no `timeout(1)`, and it kills the children
+  too, because killing the shell alone would leave `top` running as an orphan. The watchdog writes
+  nothing, so it never holds the output open, and it is killed once the probe ends in time. A
+  killed probe exits non-zero and the bar keeps its last numbers. Linux runs the same wrapper.
 - **One probe in flight per bar.** A tick that finds a probe still out is skipped. A probe
   unanswered for three ticks counts as lost, and the next tick starts a new one, so a result that
   never comes cannot stop the cluster.
-- **Only a bar someone can see probes.** The bar subscribes to `Visible`, which zellij sends when
-  a tab gains its first client or loses its last. A hidden bar keeps its last numbers and skips its
-  probes; a tab switched to probes at once, unless a probe is already out. A bar never told, such as one in a tab an agent made in
-  the background, probes as before. A fully detached session gets no `Visible` events, so each of its
-  bars still probes, one at a time.
+- **One bar per session probes; the others draw its numbers.** The bar that probes sends its
+  output on a pipe (`slim-keybinds-vitals`) to every plugin of the session, and every other bar
+  parses and draws it. The bars pick the prober among themselves: the lowest plugin id, then the
+  lowest client id, since a plugin runs one instance per attached client under one id. A bar that
+  hears from a lower one defers for two ticks; one that stops hearing, because that bar's tab
+  closed or it went hidden, takes the probe up within twenty seconds. This was chosen over
+  "probe only from a bar whose tab has a client" because it needs no knowledge of tabs or clients,
+  and `Visible` alone did not hold the bars back: a three-tab scratch session on v0.46.0 with one
+  client attached ran three probes every tick. With the pipe, the same session probes once per
+  tick (measured), plus about one probe per bar in the second a client attaches, before any bar
+  has heard from another.
+- **Only a bar someone can see probes.** The bar still subscribes to `Visible`. A hidden bar skips
+  its probes; a bar switched to probes at once, unless a probe is already out or a lower bar
+  probes. A fully detached scratch session on v0.46.0 ran no probes at all (measured), and a
+  client that attaches gets fresh numbers at once.
 - The macOS probe still uses `top -l 2 -s 1`. A cheaper source of CPU ticks would need a
-  sample kept between probes; with one probe at a time and only visible bars probing, the cost is
+  sample kept between probes; with one probe per session, killed at eight seconds, the cost is
   bounded.
 
-`default-plugins/slim-keybinds/src/vitals.rs` (`ProbeGate`), `default-plugins/slim-keybinds/src/main.rs`.
-Tests in `vitals.rs`. The checked-in `slim-keybinds.wasm` is rebuilt. No contract change.
+`default-plugins/slim-keybinds/src/vitals.rs` (`guarded`, `Lease`, `bar_key`, `ProbeGate`),
+`default-plugins/slim-keybinds/src/main.rs` (`pipe`). Tests in `vitals.rs`, one of which runs the
+watchdog against a hung body. The checked-in `slim-keybinds.wasm` is rebuilt. No contract change.
 
 ### `list-agents --json` rows say how to message the agent
 

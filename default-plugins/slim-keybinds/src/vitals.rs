@@ -1,4 +1,5 @@
-//! System vitals: at most one host probe in flight per bar, parsed into a right-corner cluster.
+//! System vitals: one probing bar per session, one probe in flight at most, parsed into a
+//! right-corner cluster.
 //!
 //!     cpu 12% │ ram 7.0/23G │ disk 412/931G │ bat 87% │ fda ok
 //!
@@ -115,6 +116,40 @@ fn duration(secs: u64) -> String {
 /// listed is kept. The per-user `TCC.db` the probe opened before is gone on macOS 27. Only the
 /// Darwin branch asks it — nowhere else has the permission to be missing.
 pub fn probe_command() -> String {
+    guarded(&probe_body(), PROBE_WINDOW_S)
+}
+
+/// How long a probe may run before it kills itself, in seconds. Under the ten-second interval, so
+/// a probe never outlives the tick that would otherwise start the next one. A healthy probe takes
+/// about a second on either platform.
+pub const PROBE_WINDOW_S: u32 = 8;
+
+/// `body`, run so that it cannot outlive `window_s` seconds, in portable `/bin/sh`.
+///
+/// macOS has no `timeout(1)`, and killing the shell alone would leave its children - the `top` a
+/// slow machine is stuck in - running on as orphans. So the body runs as a background job, and a
+/// watchdog job kills the body's whole process tree when the window closes: each process is
+/// stopped first so it cannot start another, then its children are killed the same way
+/// (`pgrep -P`, on both platforms), then the process itself. The watchdog writes nothing, so it
+/// never holds the probe's output open, and it is killed the same way once the body ends in time.
+/// A killed body exits non-zero, and the bar keeps its last numbers.
+pub fn guarded(body: &str, window_s: u32) -> String {
+    format!(
+        "_k() {{ kill -STOP \"$1\" 2>/dev/null; \
+           for _c in $(pgrep -P \"$1\"); do _k \"$_c\"; done; \
+           kill -KILL \"$1\" 2>/dev/null; }}; \
+         ( {body} ) & _b=$!; \
+         ( sleep {window_s}; _k \"$_b\" ) >/dev/null 2>&1 & _w=$!; \
+         wait \"$_b\"; _r=$?; \
+         _k \"$_w\"; \
+         exit $_r",
+        body = body,
+        window_s = window_s
+    )
+}
+
+/// The probe itself, without its watchdog.
+fn probe_body() -> String {
     "case \"$(uname)\" in \
        Darwin) \
          echo \"CPUMAC $(top -l 2 -n 0 -s 1 | grep 'CPU usage' | tail -1)\"; \
@@ -142,6 +177,61 @@ pub fn probe_command() -> String {
 /// slow probe under load gets time to finish, and a result that never comes cannot stop the cluster
 /// for good.
 pub const LOST_AFTER_TICKS: u32 = 3;
+
+/// The pipe a probing bar sends its probe's output on, to every other bar of the session.
+pub const PIPE_NAME: &str = "slim-keybinds-vitals";
+
+/// How many ticks a bar keeps deferring to a lower-numbered bar it last heard from. Two intervals,
+/// so one late probe does not hand the job over, and a bar that went away (its tab closed, or
+/// hidden) is replaced within twenty seconds.
+pub const LEASE_TICKS: u32 = 2;
+
+/// The argument of a [`PIPE_NAME`] message that names the sending bar: its [`bar_key`].
+pub const FROM_ARG: &str = "from";
+
+/// What orders the bars: the plugin id, then the client the instance serves. A plugin runs one
+/// instance per attached client, all under one plugin id, so the id alone cannot tell them apart.
+pub fn bar_key(plugin_id: u32, client_id: u32) -> u64 {
+    ((plugin_id as u64) << 32) | client_id as u64
+}
+
+/// One bar per session probes; every other bar draws the numbers it sends.
+///
+/// Every tab has its own bar, and each ran its own probe. The bars pick one without a word about
+/// tabs or clients: the bar with the lowest [`bar_key`] probes, and sends its output on
+/// [`PIPE_NAME`] to every plugin of the session. A bar that hears from a lower key defers to it for
+/// [`LEASE_TICKS`] ticks; one that stops hearing takes the probe up again. Output from any other
+/// bar is drawn, whichever bar sent it.
+#[derive(Default, Debug, PartialEq)]
+pub struct Lease {
+    /// The lower key this bar last heard from, and the ticks left before it stops deferring.
+    deferring_to: Option<(u64, u32)>,
+}
+
+impl Lease {
+    /// Another bar sent its output. `own` is this bar's [`bar_key`].
+    pub fn heard(&mut self, from: u64, own: u64) {
+        if from < own {
+            let lowest = self
+                .deferring_to
+                .map_or(from, |(current, _)| current.min(from));
+            self.deferring_to = Some((lowest, LEASE_TICKS));
+        }
+    }
+
+    /// One timer tick passed.
+    pub fn tick(&mut self) {
+        self.deferring_to = match self.deferring_to {
+            Some((id, left)) if left > 1 => Some((id, left - 1)),
+            _ => None,
+        };
+    }
+
+    /// Whether this bar should run the probe itself.
+    pub fn probes(&self) -> bool {
+        self.deferring_to.is_none()
+    }
+}
 
 /// At most one probe in flight per bar.
 ///
@@ -431,6 +521,86 @@ mod tests {
         }
         assert!(gate.start(), "taken for lost");
         assert!(!gate.start(), "the new probe is in flight");
+    }
+
+    #[test]
+    fn the_lowest_bar_probes_and_the_others_defer_while_they_hear_from_it() {
+        let mut lease = Lease::default();
+        assert!(lease.probes(), "a bar that has heard nothing probes");
+        // a higher id is not deferred to
+        lease.heard(9, 5);
+        assert!(lease.probes());
+        // its own key is not a lower one
+        lease.heard(5, 5);
+        assert!(lease.probes());
+        lease.heard(3, 5);
+        assert!(!lease.probes());
+        // heard again every tick: still deferring
+        for _ in 0..5 {
+            lease.tick();
+            lease.heard(3, 5);
+            assert!(!lease.probes());
+        }
+        // the lower bar went quiet: this one takes over after the lease
+        for _ in 0..LEASE_TICKS {
+            assert!(!lease.probes());
+            lease.tick();
+        }
+        assert!(lease.probes());
+        // two instances of one plugin, one per client, are told apart by the client
+        assert!(bar_key(2, 1) < bar_key(2, 3));
+        assert!(bar_key(2, u32::MAX) < bar_key(3, 0));
+    }
+
+    /// The watchdog, run for real: a body that hangs is killed with its children when the window
+    /// closes, and a body that finishes in time is not held up by it.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_outlives_its_window_kills_itself_and_its_children() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        let marker = format!("{}", 7000 + std::process::id() % 1000);
+        let hung = guarded(&format!("echo started; sleep {}; echo never", marker), 1);
+        let start = Instant::now();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&hung)
+            .output()
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "started\n");
+        assert!(!out.status.success());
+        let left = Command::new("pgrep")
+            .args(["-f", &format!("sleep {}", marker)])
+            .output()
+            .unwrap();
+        assert!(left.stdout.is_empty(), "left running: {:?}", left);
+
+        let quick = guarded("echo done", 30);
+        let start = Instant::now();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&quick)
+            .output()
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+        assert!(out.status.success());
+        // the probe keeps its own exit status
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(guarded("exit 3", 30))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3));
     }
 
     #[test]

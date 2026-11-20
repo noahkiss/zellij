@@ -32,7 +32,7 @@ mod vitals;
 use derive::{hints_for_mode, Hints};
 use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
-use vitals::{ProbeGate, Vitals};
+use vitals::{Lease, ProbeGate, Vitals};
 use zellij_tile::prelude::*;
 
 /// One column of bar background at each end, so nothing sits flush against the terminal edge.
@@ -95,6 +95,10 @@ struct SlimKeybinds {
     vitals: Vitals,
     /// One probe at a time; see `ProbeGate`.
     probe: ProbeGate,
+    /// One probing bar per session; see `Lease`.
+    lease: Lease,
+    /// This bar's `vitals::bar_key`, which decides which bar probes.
+    own_key: u64,
     /// `true` once zellij says this bar's tab has no client on it. Every tab has its own bar, and
     /// only a bar someone can see needs fresh numbers. A bar never told is taken as seen, so a tab
     /// made in the background still probes, as before.
@@ -154,9 +158,9 @@ fn parse_list(v: Option<&String>) -> Vec<String> {
 }
 
 impl SlimKeybinds {
-    /// Start a probe if this bar is seen and none is in flight.
+    /// Start a probe if this bar is the session's probing bar, is seen, and has none in flight.
     fn probe(&mut self) {
-        if self.show_vitals && !self.hidden && self.probe.start() {
+        if self.show_vitals && !self.hidden && self.lease.probes() && self.probe.start() {
             vitals::request();
         }
     }
@@ -287,6 +291,8 @@ impl ZellijPlugin for SlimKeybinds {
         // RunCommands (the vitals probe, and nothing else). It never CHANGES application state.
         // A bar is not a pane you focus:
         set_selectable(false);
+        let ids = get_plugin_ids();
+        self.own_key = vitals::bar_key(ids.plugin_id, ids.client_id);
         subscribe(&[
             EventType::ModeUpdate,
             EventType::InitialKeybinds,
@@ -380,6 +386,7 @@ impl ZellijPlugin for SlimKeybinds {
                     return false;
                 }
                 set_timeout(VITALS_INTERVAL);
+                self.lease.tick();
                 self.probe();
                 false
             },
@@ -409,13 +416,49 @@ impl ZellijPlugin for SlimKeybinds {
                     return false;
                 }
                 self.probe.landed();
-                // A non-zero exit means a partial or missing probe; keeping the previous
-                // numbers beats blanking the cluster on one bad tick.
-                exit_code == Some(0) && self.vitals.parse(&stdout)
+                // A non-zero exit means a partial or missing probe, or one its watchdog killed;
+                // keeping the previous numbers beats blanking the cluster on one bad tick.
+                if exit_code != Some(0) {
+                    return false;
+                }
+                // every other bar of the session draws these numbers instead of probing
+                pipe_message_to_plugin(
+                    MessageToPlugin::new(vitals::PIPE_NAME)
+                        .with_payload(String::from_utf8_lossy(&stdout).into_owned())
+                        .with_args(BTreeMap::from([(
+                            vitals::FROM_ARG.to_string(),
+                            self.own_key.to_string(),
+                        )])),
+                );
+                self.vitals.parse(&stdout)
             },
 
             _ => false,
         }
+    }
+
+    /// Another bar's probe output. A lower-numbered bar is deferred to; any bar's numbers are drawn.
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        if pipe_message.name != vitals::PIPE_NAME || !self.show_vitals {
+            return false;
+        }
+        if !matches!(pipe_message.source, PipeSource::Plugin(_)) {
+            return false;
+        }
+        let Some(from) = pipe_message
+            .args
+            .get(vitals::FROM_ARG)
+            .and_then(|key| key.parse::<u64>().ok())
+        else {
+            return false;
+        };
+        if from == self.own_key {
+            return false;
+        }
+        self.lease.heard(from, self.own_key);
+        pipe_message
+            .payload
+            .map_or(false, |payload| self.vitals.parse(payload.as_bytes()))
     }
 
     fn render(&mut self, _rows: usize, cols: usize) {

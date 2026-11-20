@@ -19,8 +19,9 @@ and its hint disappears on its own. Rebind it to a different key and the hint fo
 (`ModeInfo.style.colors`), so changing the theme changes the bar with no rebuild and no colours
 duplicated into the layout.
 
-**Permissions: `ReadApplicationState` + `RunCommands`.** The second is only for the vitals probe.
-The plugin never changes application state. A builtin is granted what it uses without asking, so
+**Permissions: `ReadApplicationState`, `RunCommands` and `MessageAndLaunchOtherPlugins`.** The
+second runs the vitals probe; the third sends its numbers to the session's other bars, so one bar
+probes for all of them. The plugin never changes application state. A builtin is granted what it uses without asking, so
 there is no prompt and nothing to seed — which matters here, because the pane calls
 `set_selectable(false)` and a prompt rendered in it could never be answered.
 
@@ -58,7 +59,7 @@ pane size=1 borderless=true {
 | `show_locked_hints` | `true` | Draw hints in Locked mode. Ignored on the Unlock-First preset, where Locked is the base mode and hiding the unlock hint would be a dead end. |
 | `uppercase` | `auto` | `auto` uppercases only the mode-entry hints. `true`/`false` force it. |
 | `max_hints` | — | Cap on the number of hints. |
-| `show_vitals` | `false` | Right-corner `cpu 37% │ ram 7.1/23G │ disk 89.8/293G │ bat 87% │ up 32d`. The battery segment is omitted entirely on machines without one; uptime shows one unit (`32d` / `11h` / `7m`). Refreshed every 10s by one `/bin/sh` probe. |
+| `show_vitals` | `false` | Right-corner `cpu 37% │ ram 7.1/23G │ disk 89.8/293G │ bat 87% │ up 32d`. The battery segment is omitted entirely on machines without one; uptime shows one unit (`32d` / `11h` / `7m`). Refreshed every 10s by one `/bin/sh` probe per session, killed if it runs past 8s; every bar draws its numbers. |
 
 All options are optional and every unrecognised value falls back to the default rather than
 erroring. There is deliberately no colour option — colours come from the theme.
