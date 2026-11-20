@@ -9286,6 +9286,10 @@ the reply to its sender's host. With no session of its own it refuses (`reason: 
 is refused (`reason: remote_too_old`) rather than typed into: the unguarded paste is the failure
 this exists to stop. The server instructions and `how_to_message` name `zellij_send` as the way to
 message an agent; `message_to` stays in the flat `list-agents` rows as the harness's own route.
+The record's own `reason` (`working`, `typing`, `not_agent`, ...) goes at the top of the answer,
+so the tool's output schema lists those values beside the failure kinds and `remote_too_old`. A
+queued message once failed the schema check, and the caller read a delivered-later message as an
+error.
 
 Contract: two `Action` messages, `SendMessageAction` (tag 900) and `MessageStatusAction` (tag 901),
 in the fork block from 900, clear of upstream's numbering. A stock client
