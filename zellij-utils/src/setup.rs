@@ -2,7 +2,10 @@ use crate::input::theme::Themes;
 #[allow(unused_imports)]
 use crate::{
     cli::{CliArgs, Command, SessionCommand, Sessions},
-    consts::{FEATURES, VERSION, ZELLIJ_CACHE_DIR, ZELLIJ_DEFAULT_THEMES},
+    consts::{
+        FEATURES, UPSTREAM_BASE_COMMIT, UPSTREAM_BASE_TAG, VERSION, ZELLIJ_CACHE_DIR,
+        ZELLIJ_DEFAULT_THEMES, ZELLIJ_SOCK_DIR,
+    },
     data::LayoutInfo,
     errors::prelude::*,
     home::*,
@@ -746,6 +749,12 @@ impl Setup {
                 .unwrap();
             }
         }
+        writeln!(
+            &mut message,
+            "[Upstream base]: {:?}",
+            format!("{} @ {}", UPSTREAM_BASE_TAG, UPSTREAM_BASE_COMMIT)
+        )
+        .unwrap();
         if let Some(config_dir) = config_dir.clone() {
             writeln!(&mut message, "[CONFIG DIR]: \"{}\"", config_dir.display()).unwrap();
         } else {

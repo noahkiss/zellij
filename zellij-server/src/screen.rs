@@ -3282,21 +3282,55 @@ impl Screen {
 
     pub fn set_client_size(&mut self, client_id: ClientId, size: Size) {
         self.client_sizes.insert(client_id, size);
-    }
-
-    fn size_for_client(&self, client_id: Option<ClientId>) -> Size {
-        client_id
-            .and_then(|client_id| self.client_sizes.get(&client_id).copied())
-            .or_else(|| {
-                self.get_first_client_id()
-                    .and_then(|client_id| self.client_sizes.get(&client_id).copied())
-            })
-            .or_else(|| self.client_sizes.values().next().copied())
-            .unwrap_or_default()
         // fork addition: remember it for when this client goes. A zero size is not a terminal
         // anyone is looking at, and adopting one would put the session back where it started
         if size.rows > 0 && size.cols > 0 {
             self.size_with_no_client = size;
+        }
+    }
+
+    /// Re-ask the session-wide questions and, when an answer changed, hand every bar the new set.
+    ///
+    /// Both are session-global and the config decides whether each is wanted at all: the FDA one is
+    /// opt-in, because only the user knows whether they mean zellij to have that permission, and
+    /// the stale-build one is on unless it is turned off.
+    ///
+    /// The answers ride `ModeInfo`, which is the only thing every bar already reads and which
+    /// already reaches every tab's plugins. Nothing else about the mode has changed, so the
+    /// broadcast is the same shape as `update_all_clients_nesting_mode_info` and costs the same.
+    ///
+    /// A live warning is re-sent on every tick, not only when it changes. The first tick fires as
+    /// the server starts, before any tab exists and before a bar has loaded, so a warning that is
+    /// already true then would otherwise reach nobody and - never changing - would never be sent
+    /// again. Measured: a session started on a superseded build showed nothing for as long as it
+    /// ran. Only the abnormal state repeats, the bars drop an update that matches what they hold,
+    /// and the interval is 30 seconds.
+    pub fn recheck_session_warnings(&mut self) {
+        let warnings = crate::session_warnings::current_warnings();
+        if warnings == self.session_warnings && warnings.is_empty() {
+            return;
+        }
+        self.session_warnings = warnings.clone();
+        self.default_mode_info.session_warnings = warnings.clone();
+        let mut client_ids: Vec<ClientId> = self.mode_info.keys().copied().collect();
+        for connected_client_id in self.connected_clients.borrow().keys() {
+            if !client_ids.contains(connected_client_id) {
+                client_ids.push(*connected_client_id);
+            }
+        }
+        for client_id in client_ids {
+            let mode_info = self
+                .mode_info
+                .entry(client_id)
+                .or_insert_with(|| self.default_mode_info.clone());
+            mode_info.session_warnings = warnings.clone();
+            let mode_info = mode_info.clone();
+            for tab in self.tabs.values_mut() {
+                tab.change_mode_info(mode_info.clone(), client_id);
+            }
+        }
+        for tab in self.tabs.values_mut() {
+            let _ = tab.update_input_modes();
         }
     }
 
@@ -4197,10 +4231,6 @@ impl Screen {
             break;
         }
         Ok(())
-    }
-
-    fn pane_exists(&self, pane_id: &PaneId) -> bool {
-        self.tabs.values().any(|tab| tab.has_pane_with_pid(pane_id))
     }
 
     fn answer_color_palette_mode_query_locally(&mut self, pane_id: PaneId) {

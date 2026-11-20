@@ -73,6 +73,7 @@ mod not_wasm {
             nested_descend_keys: vec![],
             remote_client: None,
             hidden_bars: Default::default(),
+            session_warnings: vec![],
         }
     }
 

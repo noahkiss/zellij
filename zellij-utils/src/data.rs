@@ -2828,6 +2828,9 @@ pub struct ModeInfo {
     pub remote_client: Option<String>,
     #[serde(default)]
     pub hidden_bars: HiddenBars,
+    /// Facts that are true of the whole session and actionable, for a bar to badge. Empty is the
+    /// normal case, and the ordinary reason a bar draws nothing.
+    pub session_warnings: Vec<SessionWarning>,
 }
 
 pub const ALL_BARS: &str = "all";
@@ -2923,6 +2926,32 @@ impl FromStr for HiddenBars {
             return Ok(HiddenBars::None);
         }
         Ok(HiddenBars::from_names(&names))
+    }
+}
+
+/// A session-wide condition worth one badge in a status bar.
+///
+/// Each is true of the session rather than of a pane, is invisible everywhere else, and names
+/// something the user can act on. The variant order is the order they are shown in, so a bar
+/// listing several never reorders them between frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SessionWarning {
+    /// This server is running a build that the binary it was started from no longer holds. A
+    /// server keeps its binary for the life of the session, so an upgrade reaches nothing until
+    /// the session is restarted.
+    SupersededBuild,
+    /// macOS refused this binary a Full Disk Access-gated open, on a machine whose config says
+    /// zellij is meant to hold that permission.
+    MissingFullDiskAccess,
+}
+
+impl SessionWarning {
+    /// The short code a bar draws. Kept to a few columns: the badge shares a line with the tabs.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SessionWarning::SupersededBuild => "zj",
+            SessionWarning::MissingFullDiskAccess => "TCC",
+        }
     }
 }
 
@@ -3554,6 +3583,7 @@ pub struct PaneInfo {
     /// Whether a pane is suppressed - suppressed panes are not visible to the user, but still run
     /// in the background
     pub is_suppressed: bool,
+    #[serde(default)]
     pub is_collapsed: bool,
     /// The full title of the pane as it appears in the UI (if there is room for it)
     pub title: String,

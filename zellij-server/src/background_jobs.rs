@@ -1255,6 +1255,15 @@ pub(crate) fn background_jobs_main(
     }
 }
 
+                // fork: the version stamp and the web requests in flight go with the session
+                zellij_utils::sessions::remove_own_server_version_stamp(&session_id);
+                drain_web_requests(&web_requests_in_flight, WEB_REQUEST_DRAIN_TIMEOUT);
+                return Ok(());
+            },
+        }
+    }
+}
+
 fn job_already_running(
     job: BackgroundJob,
     running_jobs: &mut HashMap<BackgroundJob, Instant>,

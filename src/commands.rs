@@ -1630,6 +1630,9 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
         Err(failure) => failure.report_and_exit(),
     };
 
+    // a watcher is an attach that cannot type, so it meets a stale server the way an attach does
+    zellij_utils::session_lifecycle::check_server_build(client_info.get_session_name());
+
     let mut opts = opts.clone();
     opts.session = Some(client_info.get_session_name().to_string());
 

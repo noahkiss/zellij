@@ -891,6 +891,14 @@ message ModeUpdatePayload {
   repeated string nested_descend_keys = 22;
   optional string remote_client = 23;
   repeated string hidden_bars = 24;
+  // fork: in the block from 900
+  repeated SessionWarning session_warnings = 900;
+}
+
+// Session-wide conditions worth badging in a status bar. Ordered as they are drawn.
+enum SessionWarning {
+    SupersededBuild = 0;
+    MissingFullDiskAccess = 1;
 }
 
 enum WebSharing {

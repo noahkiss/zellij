@@ -1,16 +1,18 @@
 use crate::{
     consts::{
-        is_ipc_socket, session_info_folder_for_session, session_layout_cache_file_name,
-        ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
+        is_ipc_socket, server_version_stamp_file_name, session_info_folder_for_session,
+        session_layout_cache_file_name, VERSION, ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
     },
     data::SessionInfo,
     envs,
     input::layout::Layout,
     ipc::{ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg},
     session_index::{self, SessionIndex},
+    session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
 };
 use anyhow;
 use humantime::format_duration;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -88,6 +90,13 @@ pub fn resolve_session_socket_path(name: &str) -> Option<PathBuf> {
 /// sessions from before ids.
 pub fn display_name_for_session_id(id: &str) -> String {
     session_index::session_name_for_id(id).unwrap_or_else(|| id.to_owned())
+}
+
+/// fork: the id that names this session's socket and session_info folder. The session index maps
+/// the name to it; a session the index does not know uses its name, as before ids existed. Every
+/// fork path that reaches a session's socket or folder from its NAME goes through here.
+pub fn session_id_for(name: &str) -> String {
+    resolve_session_id(name).unwrap_or_else(|| name.to_owned())
 }
 
 fn session_name(names_by_id: &HashMap<String, String>, id: String) -> String {
@@ -595,6 +604,142 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
                     short,
                     reverse,
                 );
+/// What `ls --json` reports about the binary behind one live session.
+///
+/// **Nothing here crosses a contract.** The answer is read from the OS by pid, on the side that
+/// runs `ls`, exactly as the stale-build warning already does - no `SessionInfo` field, no
+/// protobuf tag, no client/server message. FORK.md declined putting a version on the plugin API
+/// for a warning, and this stays inside that decision by never asking the session anything.
+///
+/// **The version is never asked of the binary.** Running every server's executable to ask its
+/// version turns a read of the socket directory into an execution of whatever those paths point
+/// at. It also hangs while one of them is on a mount that has gone away. So `server_version` comes
+/// from one of two places, and from nowhere else:
+///
+/// 1. The build is `same` as this one. Then the version is this binary's own.
+/// 2. Otherwise, the stamp the server wrote into its session_info folder as it started. The stamp
+///    names the pid that wrote it, and it counts only when that pid is the pid serving the
+///    session now. A stamp left by an earlier server under the same name never counts.
+///
+/// Neither: the field is absent. A wrong version is worse than none. The build id stays the
+/// answer to "which build": two builds of one version have different build ids.
+fn server_identity_fields(name: &str, is_dead: bool) -> ServerIdentityFields {
+    if is_dead {
+        return ServerIdentityFields::default();
+    }
+    let Some(server) = crate::session_lifecycle::the_server_for_session(name) else {
+        return ServerIdentityFields::default();
+    };
+    let stamp = std::fs::read_to_string(server_version_stamp_file_name(&session_id_for(name))).ok();
+    let Some(theirs) = crate::session_lifecycle::executable_of_server(&server) else {
+        return ServerIdentityFields {
+            server_version: server_version(
+                crate::session_lifecycle::BuildMatch::Unknown,
+                stamp.as_deref(),
+                server.pid,
+            ),
+            ..Default::default()
+        };
+    };
+    let ours = crate::session_lifecycle::own_executable();
+    let verdict = crate::session_lifecycle::compare_builds(ours.as_ref(), Some(&theirs));
+    ServerIdentityFields {
+        server_exe: Some(theirs.path.display().to_string()),
+        server_build_id: theirs.build_id.as_ref().map(|id| {
+            id.iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<String>()
+        }),
+        server_build: Some(
+            match verdict {
+                crate::session_lifecycle::BuildMatch::Same => "same",
+                crate::session_lifecycle::BuildMatch::Different => "different",
+                crate::session_lifecycle::BuildMatch::Unknown => "unknown",
+            }
+            .to_owned(),
+        ),
+        server_exe_replaced: theirs.replaced.then_some(true),
+        server_version: server_version(verdict, stamp.as_deref(), server.pid),
+    }
+}
+
+/// The version of the server with `pid`, from what `server_identity_fields` knows about it.
+fn server_version(
+    verdict: crate::session_lifecycle::BuildMatch,
+    stamp: Option<&str>,
+    pid: u32,
+) -> Option<String> {
+    if verdict == crate::session_lifecycle::BuildMatch::Same {
+        return Some(VERSION.to_owned());
+    }
+    version_from_stamp(stamp?, pid)
+}
+
+/// What a server writes into its version stamp: its pid, then its version, a line each.
+pub fn server_version_stamp_contents(pid: u32, version: &str) -> String {
+    format!("{}\n{}\n", pid, version)
+}
+
+/// The version a stamp records, if the stamp was written by `pid`.
+///
+/// Anything else is `None`: another pid, a malformed stamp, or a truncated one. Both lines must
+/// end in a newline, so a stamp read halfway through its write never counts.
+fn version_from_stamp(stamp: &str, pid: u32) -> Option<String> {
+    let mut lines = stamp.split_inclusive('\n');
+    let stamp_pid = lines.next()?.strip_suffix('\n')?;
+    let version = lines.next()?.strip_suffix('\n')?;
+    if lines.next().is_some() || stamp_pid.parse::<u32>().ok()? != pid {
+        return None;
+    }
+    if version.is_empty() || version.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(version.to_owned())
+}
+
+/// Record this server's pid and version in its session's session_info folder.
+///
+/// The server calls this once, as it starts. A failure is logged and nothing more: without the
+/// stamp `ls --json` omits `server_version` for a server of another build, which is safe.
+pub fn write_server_version_stamp(session_name: &str) {
+    // a name or an id: the folder is named by the id either way
+    let session_id = session_id_for(session_name);
+    let folder = session_info_folder_for_session(&session_id);
+    let stamp = server_version_stamp_file_name(&session_id);
+    let pid = process::id();
+    // written beside the stamp and renamed over it, so a reader never sees half a stamp
+    let partial = folder.join(format!(
+        "{}.{}.partial",
+        crate::consts::SERVER_VERSION_STAMP_FILE_NAME,
+        pid
+    ));
+    let written = fs::create_dir_all(&folder)
+        .and_then(|_| fs::write(&partial, server_version_stamp_contents(pid, VERSION)))
+        .and_then(|_| fs::rename(&partial, &stamp));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&partial);
+        log::error!(
+            "Failed to write the server version stamp {:?}: {:?}",
+            stamp,
+            e
+        );
+    }
+}
+
+/// Remove this server's version stamp from its session's session_info folder, as it exits.
+///
+/// Only a stamp this process wrote: a new server under the same name may already have replaced it.
+pub fn remove_own_server_version_stamp(session_name: &str) {
+    let stamp = server_version_stamp_file_name(&session_id_for(session_name));
+    let ours = fs::read_to_string(&stamp)
+        .ok()
+        .and_then(|contents| version_from_stamp(&contents, process::id()))
+        .is_some();
+    if ours {
+        let _ = fs::remove_file(&stamp);
+    }
+}
+
 /// Build the `ls --json` listing from the session names and the metadata each live session wrote.
 pub fn session_list_entries(
     sessions: Vec<(String, Duration, bool)>,

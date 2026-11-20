@@ -4050,6 +4050,13 @@ pub fn start_server_impl(
     // No-op off macOS.
     zellij_utils::session_lifecycle::probe_protected_locations();
 
+    // `ls --json` reads this to name the version of a server that is not its own build. After the
+    // daemonize, so the pid in it is the server's. Not for the in-process test server, whose pid
+    // is the test harness's. The stamp sits in the session-info folder, named by the session id.
+    if install_panic_hook {
+        zellij_utils::sessions::write_server_version_stamp(&session_id);
+    }
+
     let (to_server, server_receiver): ChannelWithContext<ServerInstruction> = channels::bounded(50);
     let to_server = SenderWithContext::new(to_server);
     let session_data: Arc<RwLock<Option<SessionMetaData>>> = Arc::new(RwLock::new(None));

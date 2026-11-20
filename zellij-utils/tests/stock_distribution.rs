@@ -177,8 +177,13 @@ fn the_command_is_named_zellij_and_carries_the_zellij_version() {
         .join()
         .expect("the cli test thread panicked");
     assert_eq!(name, "zellij");
+    // fork: the version leads with the bare version and names the upstream base on a second line
     assert_eq!(
-        version.expect("a version should be set"),
-        zellij_utils::consts::VERSION
+        version
+            .expect("a version should be set")
+            .lines()
+            .next()
+            .map(str::to_owned),
+        Some(zellij_utils::consts::VERSION.to_owned())
     );
 }

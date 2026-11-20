@@ -2811,6 +2811,15 @@ impl TryFrom<ProtobufModeUpdatePayload> for ModeInfo {
             .filter_map(|key| KeyWithModifier::from_str(key).ok())
             .collect();
 
+        // an unknown code is dropped rather than fatal: a bar built against an older contract
+        // should badge what it understands, not refuse the whole mode update
+        let session_warnings = protobuf_mode_update_payload
+            .session_warnings
+            .iter()
+            .filter_map(|warning| ProtobufSessionWarning::try_from(*warning).ok())
+            .map(|warning| warning.into())
+            .collect();
+
         let mode_info = ModeInfo {
             mode: current_mode,
             keybinds,
@@ -2836,6 +2845,7 @@ impl TryFrom<ProtobufModeUpdatePayload> for ModeInfo {
             nested_descend_keys,
             remote_client: protobuf_mode_update_payload.remote_client,
             hidden_bars: HiddenBars::from_names(&protobuf_mode_update_payload.hidden_bars),
+            session_warnings,
         };
         Ok(mode_info)
     }
@@ -2881,6 +2891,14 @@ impl TryFrom<ModeInfo> for ProtobufModeUpdatePayload {
         let remote_client = mode_info.remote_client;
         let hidden_bars = mode_info.hidden_bars.names();
         let protobuf_input_mode_keybinds = keybinds_to_protobuf(mode_info.keybinds);
+        let session_warnings = mode_info
+            .session_warnings
+            .iter()
+            .map(|warning| {
+                let protobuf_warning: ProtobufSessionWarning = (*warning).into();
+                protobuf_warning as i32
+            })
+            .collect();
         Ok(ProtobufModeUpdatePayload {
             current_mode: current_mode as i32,
             style: Some(style),
@@ -2906,7 +2924,26 @@ impl TryFrom<ModeInfo> for ProtobufModeUpdatePayload {
             nested_descend_keys,
             remote_client,
             hidden_bars,
+            session_warnings,
         })
+    }
+}
+
+impl Into<ProtobufSessionWarning> for SessionWarning {
+    fn into(self) -> ProtobufSessionWarning {
+        match self {
+            SessionWarning::SupersededBuild => ProtobufSessionWarning::SupersededBuild,
+            SessionWarning::MissingFullDiskAccess => ProtobufSessionWarning::MissingFullDiskAccess,
+        }
+    }
+}
+
+impl Into<SessionWarning> for ProtobufSessionWarning {
+    fn into(self) -> SessionWarning {
+        match self {
+            ProtobufSessionWarning::SupersededBuild => SessionWarning::SupersededBuild,
+            ProtobufSessionWarning::MissingFullDiskAccess => SessionWarning::MissingFullDiskAccess,
+        }
     }
 }
 
@@ -3318,6 +3355,11 @@ fn serialize_mode_update_event_with_non_default_values() {
         ],
         remote_client: Some("over SSH from 192.168.1.5".to_owned()),
         hidden_bars: HiddenBars::from_names(&["tab-bar"]),
+        // both, so the roundtrip covers the repeated field rather than an empty one
+        session_warnings: vec![
+            SessionWarning::SupersededBuild,
+            SessionWarning::MissingFullDiskAccess,
+        ],
     });
     let protobuf_event: ProtobufEvent = mode_update_event.clone().try_into().unwrap();
     let serialized_protobuf_event = protobuf_event.encode_to_vec();
