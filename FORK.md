@@ -867,6 +867,8 @@ plugin-system snapshots did not need it: none of them render a pane frame or oth
 text. The `quit_and_resurrect_session` and `resize_terminal_window` e2e snapshots almost certainly do
 need it too, since they cross a real frame render, but this box has no `musl-gcc` to build the e2e
 binary that would prove it — confirm and refresh them in CI before relying on that pair.
+CI confirmed it for `resize_terminal_window` (its frames now carry `apt-anteater` and `dry-backyard`), and that
+snapshot is refreshed; `quit_and_resurrect_session` passed unchanged.
 
 ### Making a tab does not need somebody attached
 
