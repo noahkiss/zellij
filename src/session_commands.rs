@@ -1649,9 +1649,28 @@ fn builds_that_may_serve(name: &str, opts: &CliArgs) -> Vec<PathBuf> {
 /// How long one pre-flight command may take before the build counts as failing it.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Run `exe` with `args`, and say why it failed, if it did. A build that hangs fails.
+/// Run `exe` with `args`, and say why it failed, if it did. A build that hangs fails. Its output
+/// is read while it runs, so a build that writes more than a pipe holds never blocks on it.
 fn preflight_run(exe: &Path, args: &[std::ffi::OsString]) -> Result<String, String> {
+    use std::io::Read;
     use std::process::Stdio;
+    use std::sync::mpsc;
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        match pipe {
+            Some(mut pipe) => {
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ = pipe.read_to_end(&mut bytes);
+                    let _ = tx.send(bytes);
+                });
+            },
+            None => {
+                let _ = tx.send(Vec::new());
+            },
+        }
+        rx
+    }
     let mut child = std::process::Command::new(exe)
         .args(args)
         .stdin(Stdio::null())
@@ -1659,27 +1678,35 @@ fn preflight_run(exe: &Path, args: &[std::ffi::OsString]) -> Result<String, Stri
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run it: {}", e))?;
+    let stdout_rx = drain(child.stdout.take());
+    let stderr_rx = drain(child.stderr.take());
     let started = Instant::now();
-    loop {
+    let no_answer = || format!("no answer in {}s", PREFLIGHT_TIMEOUT.as_secs());
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= PREFLIGHT_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("no answer in {}s", PREFLIGHT_TIMEOUT.as_secs()));
+                return Err(no_answer());
             },
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(format!("could not wait for it: {}", e)),
         }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("could not read its output: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if output.status.success() {
+    };
+    // a child it left behind may hold the pipes open; that counts against the same timeout
+    let read = |rx: &mpsc::Receiver<Vec<u8>>| {
+        let left = PREFLIGHT_TIMEOUT
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_secs(1));
+        rx.recv_timeout(left).map_err(|_| no_answer())
+    };
+    let stdout = String::from_utf8_lossy(&read(&stdout_rx)?).into_owned();
+    let stderr = read(&stderr_rx)?;
+    if status.success() {
         return Ok(stdout);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&stderr);
     let detail = stderr
         .lines()
         .chain(stdout.lines())
@@ -1687,7 +1714,7 @@ fn preflight_run(exe: &Path, args: &[std::ffi::OsString]) -> Result<String, Stri
         .find(|line| !line.is_empty())
         .unwrap_or("no output")
         .to_owned();
-    Err(format!("{} ({})", output.status, detail))
+    Err(format!("{} ({})", status, detail))
 }
 
 /// Pre-flight one build: it starts and names itself, and it parses this config.
@@ -3257,6 +3284,27 @@ mod tests {
         );
         let missing = preflight(Path::new("/nonexistent/zellij"), &opts).unwrap_err();
         assert!(missing.contains("could not run it"), "{}", missing);
+    }
+
+    #[test]
+    fn the_preflight_reads_more_output_than_a_pipe_holds_without_stalling() {
+        // well past the 64 KiB a pipe buffers, on both streams
+        let script = "head -c 300000 /dev/zero | tr '\\0' a; head -c 300000 /dev/zero >&2; \
+                      echo; echo zellij-ok";
+        let started = Instant::now();
+        let out = preflight_run(Path::new("/bin/sh"), &["-c".into(), script.into()]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(out.len(), 300_000 + 1 + "zellij-ok\n".len());
+        assert!(out.ends_with("zellij-ok\n"));
+        let fails = preflight_run(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "head -c 300000 /dev/zero; echo why >&2; exit 3".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(fails.contains("(why)"), "{}", fails);
     }
 
     #[test]

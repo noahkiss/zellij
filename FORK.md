@@ -5799,7 +5799,8 @@ change.
 
 **The pre-flight.** Before anything is torn down, `restart` runs each build that may serve the
 restarted session with `--version` and `setup --check` (with this command's `--config` and
-`--config-dir`), 20 seconds each. A build that fails either, or hangs, refuses the restart with exit
+`--config-dir`), 20 seconds each, its output read as it runs so no amount of it can stall the
+build. A build that fails either, or hangs, refuses the restart with exit
 2, the reason on stderr and in `restart.log`, and the old server left running:
 
 ```
