@@ -12,6 +12,9 @@ trap 'rm -rf "$work"' EXIT
 
 home_linux="/ho""me/zed-q/"
 home_mac="/Use""rs/zed-q/"
+bare_linux="/ho""me/zed-q"
+bare_mac="/Use""rs/zed-q"
+upstream_author="/ho""me/aram/"
 lan_10="10.""20.30.40"
 lan_172="172.""20.1.2"
 lan_192="192.""168.50.60"
@@ -88,6 +91,51 @@ index 1111111..2222222 100644
 EOF
 check "removed lines, near misses and placeholders pass" 0 "$work/clean.diff"
 
+# A home directory that ends the path: at the end of a line, before a quote, a space or a colon.
+cat >"$work/bare.diff" <<EOF
+diff --git a/docs/env.md b/docs/env.md
+--- a/docs/env.md
++++ b/docs/env.md
+@@ -1,0 +1,5 @@
++HOME=$bare_linux
++"cwd": "$bare_mac", 'x'
++cd $bare_linux && ls
++PATH=$bare_mac:/usr/bin
++a placeholder /home/user and /Users/runner is fine
+EOF
+check "a bare home directory fails" 1 "$work/bare.diff"
+for want in \
+    "docs/env.md:1: home path: $bare_linux" \
+    "docs/env.md:2: home path: $bare_mac" \
+    "docs/env.md:3: home path: $bare_linux" \
+    "docs/env.md:4: home path: $bare_mac"; do
+    if ! grep -qxF "$want" <<<"$LAST_OUT"; then
+        echo "FAIL missing hit: $want"
+        failures=$((failures + 1))
+    fi
+done
+if [[ $(grep -c . <<<"$LAST_OUT") -ne 4 ]]; then
+    echo "FAIL expected exactly 4 bare hits, got:"
+    echo "$LAST_OUT" | sed 's/^/    /'
+    failures=$((failures + 1))
+fi
+
+# A snapshot is scanned like any file: only upstream's named authors pass in one.
+cat >"$work/snap.diff" <<EOF
+diff --git a/zellij-server/src/unit/snapshots/x.snap b/zellij-server/src/unit/snapshots/x.snap
+--- a/zellij-server/src/unit/snapshots/x.snap
++++ b/zellij-server/src/unit/snapshots/x.snap
+@@ -1,0 +1,2 @@
++cwd ${home_linux}src
++cwd ${upstream_author}src
+EOF
+check "a snapshot with a home path fails" 1 "$work/snap.diff"
+if [[ $LAST_OUT != "zellij-server/src/unit/snapshots/x.snap:1: home path: $home_linux" ]]; then
+    echo "FAIL snapshot: expected only the first line, got:"
+    echo "$LAST_OUT" | sed 's/^/    /'
+    failures=$((failures + 1))
+fi
+
 # The allowlist lets a known fixture through, and only that one.
 cat >"$work/allow.txt" <<EOF
 ^src/tests/fixtures/
@@ -149,6 +197,24 @@ range_check() {
 range_check "a range adding only clean lines passes over old leaks" 0 "$base" "$clean"
 range_check "a range adding a leak fails" 1 "$clean" "$leak"
 range_check "an unknown commit is a usage error" 2 0000000000000000000000000000000000000000 "$leak"
+
+# A commit message is scanned like an added line.
+repo_commit -q --allow-empty -m "clean subject" -m "built in $bare_linux"
+told=$(git -C "$repo" rev-parse HEAD)
+range_check "a leak in a commit message fails" 1 "$leak" "$told"
+range_check "a range before that message passes" 0 "$base" "$clean"
+
+# git failing mid-scan fails the scan; it never reads as nothing added.
+echo "an unreadable blob" >"$repo/broken.txt"
+git -C "$repo" add broken.txt
+repo_commit -q -m broken
+broken=$(git -C "$repo" rev-parse HEAD)
+blob=$(git -C "$repo" rev-parse HEAD:broken.txt)
+[[ ${#blob} -eq 40 ]] || { echo "FAIL no blob id"; exit 1; }
+loose="${repo:?}/.git/objects/${blob:0:2}/${blob:2}"
+[[ -f $loose ]] || { echo "FAIL no loose object at $loose"; exit 1; }
+rm -f -- "$loose"
+range_check "a diff git cannot read is an error, not a pass" 2 "$told" "$broken"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures failure(s)"

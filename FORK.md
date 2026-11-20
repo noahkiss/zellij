@@ -9329,19 +9329,24 @@ fork's `PaneInfo` fields and no `top_only` style; the checked-in plugins are reb
 
 The `Leak scan` workflow (`.github/workflows/leak-scan.yml`) runs on every pull request and every
 push to `main`, with no path filter: a doc is where such a leak most often lands. It runs
-`.github/scripts/leak-scan.sh` over the lines the change ADDS, so content already in the tree
-never fails it:
+`.github/scripts/leak-scan.sh` over the lines the change ADDS and over the message of every
+commit in it, so content already in the tree never fails it:
 
-- a home directory path, `/home/<name>/` or `/Users/<name>/`;
+- a home directory path, `/home/<name>` or `/Users/<name>`, with a slash after it or ending the
+  path (end of line, a quote, a space, a colon);
 - a private IPv4 address (10/8, 172.16/12, 192.168/16) or a Tailscale CGNAT one (100.64/10);
 - a `*.ts.net` name.
 
 The rules are generic; the repo is public. `leak-scan-allowlist.txt` beside the script lets
 placeholder names and upstream's own fixtures through, one regex per line against `<path>:<match>`.
-A pull request scans its merge commit against the base; a push scans from the commit before it,
-so a forced push (a rebase onto upstream) scans the whole rewrite. Upstream content it flags then
-goes into the allowlist. `leak-scan-test.sh` runs first and checks the scanner against crafted
-diffs.
+Snapshots get no blanket pass: upstream's authors' paths pass by name, so a snapshot regenerated
+on another machine fails. A pull request scans its merge commit against the base; a push scans
+from the commit before it, so a forced push (a rebase onto upstream) scans the whole rewrite, and
+a branch's first push scans everything it holds that the default branch does not. Upstream
+content it flags then goes into the allowlist. The scan fails closed: a `git diff` that fails, or
+a push base the workflow cannot fetch, fails the job rather than scanning less.
+`leak-scan-test.sh` runs first and checks the scanner against crafted diffs and a scratch
+repository.
 
 ## Assessed and deliberately not built
 

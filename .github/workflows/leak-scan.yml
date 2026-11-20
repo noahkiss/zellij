@@ -1,8 +1,9 @@
 name: Leak scan
 
 # Fails a change that ADDS a local-context leak: a home directory path, a private or Tailscale
-# CGNAT IPv4 address, or a tailnet name. Only added lines are scanned, so upstream content already
-# in the tree never fails. The rules and the allowlist live in .github/scripts/.
+# CGNAT IPv4 address, or a tailnet name. Only added lines and the range's commit messages are
+# scanned, so upstream content already in the tree never fails. A base that cannot be fetched
+# fails the job rather than scanning less. The rules and the allowlist live in .github/scripts/.
 #
 # No paths-ignore: a doc is where such a leak most often lands.
 on:
@@ -20,11 +21,12 @@ jobs:
     name: Scan added lines
     runs-on: ubuntu-latest
     steps:
+      # Full history: the scan reads every commit message in the range, not only the diff.
       # A pull request checks out its merge commit: parent 1 is the base, so HEAD^1..HEAD is
-      # exactly what the pull request adds. A push needs the commit before it too, fetched below.
+      # exactly what the pull request adds.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Test the scanner
         run: .github/scripts/leak-scan-test.sh
@@ -34,15 +36,25 @@ jobs:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           base=HEAD^1
-          if [[ $EVENT == push && -n $BEFORE && ! $BEFORE =~ ^0+$ ]]; then
-            # The commit before the push. A forced push scans the whole rewrite, a rebase onto
-            # upstream included; add upstream's own fixtures to the allowlist when it flags them.
-            if git fetch --quiet --depth=1 origin "$BEFORE"; then
+          if [[ $EVENT == push ]]; then
+            if [[ -n $BEFORE && ! $BEFORE =~ ^0+$ ]]; then
+              # The commit before the push. A forced push scans the whole rewrite, a rebase onto
+              # upstream included; add upstream's own fixtures to the allowlist when it flags them.
+              if ! git fetch --quiet origin "$BEFORE"; then
+                echo "::error::cannot fetch the push base $BEFORE; refusing to scan less"
+                exit 1
+              fi
               base=$BEFORE
             else
-              echo "::warning::cannot fetch $BEFORE; scanning the last commit only"
+              # A branch's first push: everything it holds that the default branch does not.
+              if ! git fetch --quiet origin "$DEFAULT_BRANCH"; then
+                echo "::error::cannot fetch $DEFAULT_BRANCH to scan a first push against"
+                exit 1
+              fi
+              base=$(git merge-base FETCH_HEAD "$AFTER")
             fi
           fi
           .github/scripts/leak-scan.sh "$base" "$AFTER"

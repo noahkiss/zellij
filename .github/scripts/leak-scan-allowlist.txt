@@ -1,20 +1,24 @@
-# Allowlist for leak-scan.sh: one Perl regex per line, matched against `<path>:<match>`.
+# Allowlist for leak-scan.sh: one Perl regex per line, matched against `<path>:<match>`. A match
+# ends with `/` when the path goes on past the directory, and without it when the path ends there.
 # Keep every entry generic or upstream-owned. Never add a real machine, user or address of ours.
 
 # Placeholder home directories in docs, tests and examples.
-:/(home|Users)/(user|u|me|you|name|someone|alice|bob|example|runner)/$
+:/(home|Users)/(user|u|me|you|name|someone|alice|bob|example|runner)/?$
 
 # Homebrew's Linux prefix is a fixed path, not a person.
-:/home/linuxbrew/$
+:/home/linuxbrew/?$
 
-# Upstream's recorded terminal sessions, their goldens and snapshots carry its authors' paths.
-:/home/(aram|thomas|jinho)/$
+# Upstream's recorded terminal sessions and goldens carry its authors' paths; its snapshots carry
+# them too, allowed by name only, so a snapshot regenerated on another machine still fails.
+:/home/(aram|thomas|jinho)/?$
 ^src/tests/fixtures/
 ^zellij-terminal/fixtures/goldens/
-/snapshots/[^:]*\.snap:
 
 # Sample addresses already in tests, each pinned to its file.
 ^default-plugins/session-manager/src/main\.rs:10\.0\.0\.7$
 ^zellij-utils/src/desktop_integration/platform\.rs:10\.0\.0\.[12]$
 ^zellij-utils/src/input/cli_assets\.rs:192\.168\.1\.[25]$
 ^zellij-utils/src/plugin_api/event\.rs:192\.168\.1\.5$
+
+# Upstream's desktop-entry test quotes a path with a space in it.
+^zellij-utils/src/desktop_integration/desktop_entry\.rs:/(?:home)/a$

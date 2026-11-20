@@ -52,8 +52,8 @@ needs a local run. The v16 release shipped with four stale integration snapshots
 e2e snapshots because local gates covered only the first surface. v19 reached `main` with six
 stale plugin-system snapshots for the same reason, fixed in `5fef6e6b1` before the tag.
 
-**The `Leak scan` workflow fails a change whose added lines hold a home path, a private or tailnet
-address, or a tailnet name.** Locally: `.github/scripts/leak-scan.sh <base> HEAD`, and
+**The `Leak scan` workflow fails a change whose added lines or commit messages hold a home path,
+a private or tailnet address, or a tailnet name.** Locally: `.github/scripts/leak-scan.sh <base> HEAD`, and
 `leak-scan-test.sh` beside it; a known upstream fixture goes in `leak-scan-allowlist.txt` there.
 
 **That e2e job is also the only runner of zellij-server's `--ignored` plugin-system suite.**

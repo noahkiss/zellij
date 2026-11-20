@@ -3,7 +3,8 @@
 # Tailscale CGNAT IPv4 address (the 100.64/10 block), or a `*.ts.net` name.
 #
 # Only added lines are scanned, so content already in the tree (upstream's own fixtures) never
-# fails a change that does not touch it.
+# fails a change that does not touch it. A commit range also scans each commit's message, under
+# the path `commit-message/<sha>`.
 #
 # Usage:
 #   leak-scan.sh <base> <head>     scan what <head> adds over <base> (two commits)
@@ -13,7 +14,7 @@
 # LEAK_SCAN_ALLOWLIST) holds one Perl regex per line, matched against `<path>:<match>`. A hit that
 # matches any of them is let through. Blank lines and lines starting with '#' are ignored.
 #
-# Exit status: 0 clean, 1 a leak was found, 2 usage or git error.
+# Exit status: 0 clean, 1 a leak was found, 2 usage or git error. A git failure never passes.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,13 +25,15 @@ usage() {
     exit 2
 }
 
+work="$(mktemp -d "${TMPDIR:-/tmp}/leak-scan.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
 if [[ $# -eq 2 && $1 == --diff ]]; then
     if [[ $2 == - ]]; then
         diff_input=/dev/stdin
     else
         diff_input=$2
     fi
-    exec 3<"$diff_input"
 elif [[ $# -eq 2 ]]; then
     for rev in "$1" "$2"; do
         if ! git rev-parse --quiet --verify "$rev^{commit}" >/dev/null; then
@@ -38,7 +41,31 @@ elif [[ $# -eq 2 ]]; then
             exit 2
         fi
     done
-    exec 3< <(git diff --no-color --no-ext-diff -U0 --no-renames "$1" "$2" --)
+    # Into files, not a pipe: a git failure must fail the scan, never feed it empty input.
+    diff_input="$work/input.diff"
+    if ! git diff --no-color --no-ext-diff -U0 --no-renames "$1" "$2" -- >"$diff_input"; then
+        echo "leak-scan: git diff $1 $2 failed" >&2
+        exit 2
+    fi
+    # Each commit message in the range, as an added file named commit-message/<sha>.
+    if ! commits="$(git rev-list --reverse "$1..$2")"; then
+        echo "leak-scan: git rev-list $1..$2 failed (is the checkout deep enough?)" >&2
+        exit 2
+    fi
+    for sha in $commits; do
+        if ! git log -1 --format=%B "$sha" >"$work/message"; then
+            echo "leak-scan: cannot read the message of $sha" >&2
+            exit 2
+        fi
+        lines=$(wc -l <"$work/message")
+        {
+            echo "diff --git a/commit-message/$sha b/commit-message/$sha"
+            echo "--- a/commit-message/$sha"
+            echo "+++ b/commit-message/$sha"
+            echo "@@ -0,0 +1,$lines @@"
+            sed 's/^/+/' "$work/message"
+        } >>"$diff_input"
+    done
 else
     usage
 fi
@@ -58,7 +85,9 @@ ALLOWLIST="$allowlist" perl -e '
 
     my $octet = qr/(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/;
     my @rules = (
-        ["home path", qr{/home/[A-Za-z_][A-Za-z0-9_.-]*/|/Users/[A-Za-z0-9_][A-Za-z0-9_.-]*/}],
+        # A home directory with a name: followed by a slash, or ending the path (end of line, a
+        # quote, a space, a colon).
+        ["home path", qr{(?:/home/[A-Za-z_]|/Users/[A-Za-z0-9_])[A-Za-z0-9_.-]*(?:/|(?=["\x27`\s:]|$))}],
         ["private IPv4 address", qr{(?<![\d.])(?:10\.$octet|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.$octet\.$octet(?![\d.])}],
         ["Tailscale CGNAT address", qr{(?<![\d.])100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.$octet\.$octet(?![\d.])}],
         ["tailnet name", qr{(?<![A-Za-z0-9.-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.ts\.net\b}],
@@ -110,4 +139,4 @@ ALLOWLIST="$allowlist" perl -e '
         exit 1;
     }
     exit 0;
-' <&3
+' <"$diff_input"
