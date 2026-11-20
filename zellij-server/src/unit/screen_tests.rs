@@ -25735,6 +25735,36 @@ fn launched_plugins(instructions: &[PtyInstruction]) -> Vec<(String, usize, Clie
         .collect()
 }
 
+/// The close runs inline: when the key's instruction returns, the pressing client's tab is
+/// already gone. A close sent back through the queue would run after a tab switch already waiting
+/// there, and close the tab that switch landed on.
+#[test]
+pub fn close_tab_or_confirm_closes_the_pressing_clients_tab_before_anything_queued_runs() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    let pressed_on = screen.get_active_tab(1).unwrap().id;
+    let other = screen
+        .tabs
+        .values()
+        .map(|tab| tab.id)
+        .find(|id| *id != pressed_on)
+        .unwrap();
+    screen.close_tab_or_confirm(1, None).expect("TEST");
+    let left: Vec<usize> = screen.tabs.values().map(|tab| tab.id).collect();
+    assert_eq!(left, vec![other], "the pressed tab is gone, at once");
+    // a switch queued behind the key now finds only the other tab
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    assert_eq!(screen.tabs.len(), 1, "nothing else closes");
+    // a client with no tab closes nothing
+    screen.close_tab_or_confirm(99, None).expect("TEST");
+    assert_eq!(screen.tabs.len(), 1);
+}
+
 #[test]
 pub fn close_tab_or_confirm_closes_a_one_pane_tab_without_launching_anything() {
     let instructions = close_tab_or_confirm_with_two_clients(|_main, second| second);

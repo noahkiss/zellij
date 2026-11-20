@@ -3443,6 +3443,59 @@ impl Screen {
         }
     }
 
+    /// fork addition: the tab-mode close key. Only the client that pressed it counts: a client
+    /// with no tab of its own has nothing to close, and never falls back to another client's tab.
+    /// A tab that would lose nothing closes here and now, never through the queue, where a tab
+    /// switch already waiting for this client would run first and make it close another tab.
+    fn close_tab_or_confirm(
+        &mut self,
+        client_id: ClientId,
+        mut completion_tx: Option<NotificationEnd>,
+    ) -> Result<()> {
+        let panes = self
+            .get_active_tab(client_id)
+            .ok()
+            .map(close_tab_or_confirm::panes_at_stake);
+        match panes.map(close_tab_or_confirm::decide) {
+            None => {},
+            Some(close_tab_or_confirm::Decision::CloseTabNow) => {
+                // what the `CloseTab` instruction does, for this client's tab only
+                let closed = self.tab_summary_for_client(client_id);
+                let tab_index = *self
+                    .active_tab_ids
+                    .get(&client_id)
+                    .context("a client with an active tab has its id")?;
+                self.close_tab_by_id(tab_index)?;
+                let connected_client_ids: Vec<ClientId> =
+                    self.active_tab_ids.keys().copied().collect();
+                for connected_client_id in connected_client_ids {
+                    self.sync_scroll_mode_on_focus(connected_client_id)?;
+                }
+                self.render(None)?;
+                if let (Some(closed), Some(c)) = (closed, completion_tx.as_mut()) {
+                    c.set_stdout_message(format!("closed: {}", closed));
+                }
+            },
+            Some(close_tab_or_confirm::Decision::Ask) => {
+                self.bus
+                    .senders
+                    .send_to_screen(ScreenInstruction::LaunchOrFocusPlugin(
+                        close_tab_or_confirm::prompt_plugin(),
+                        true,  // floating
+                        true,  // move_to_focused_tab
+                        false, // in place
+                        false, // close_replaced_pane
+                        None,
+                        false, // skip_cache
+                        client_id,
+                        completion_tx,
+                        None,
+                    ))?;
+            },
+        }
+        Ok(())
+    }
+
     pub fn set_client_size(&mut self, client_id: ClientId, size: Size) {
         self.client_sizes.insert(client_id, size);
         // fork addition: remember it for when this client goes. A zero size is not a terminal
@@ -14718,40 +14771,7 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::CloseTabOrConfirm(client_id, completion_tx) => {
-                // Only the client that pressed the key: a client with no tab of its own has
-                // nothing to close, and must never fall back to another client's tab.
-                let panes = screen
-                    .get_active_tab(client_id)
-                    .ok()
-                    .map(close_tab_or_confirm::panes_at_stake);
-                match panes.map(close_tab_or_confirm::decide) {
-                    None => {},
-                    Some(close_tab_or_confirm::Decision::CloseTabNow) => {
-                        screen
-                            .bus
-                            .senders
-                            .send_to_screen(ScreenInstruction::CloseTab(
-                                client_id,
-                                completion_tx,
-                            ))?;
-                    },
-                    Some(close_tab_or_confirm::Decision::Ask) => {
-                        screen.bus.senders.send_to_screen(
-                            ScreenInstruction::LaunchOrFocusPlugin(
-                                close_tab_or_confirm::prompt_plugin(),
-                                true,  // floating
-                                true,  // move_to_focused_tab
-                                false, // in place
-                                false, // close_replaced_pane
-                                None,
-                                false, // skip_cache
-                                client_id,
-                                completion_tx,
-                                None,
-                            ),
-                        )?;
-                    },
-                }
+                screen.close_tab_or_confirm(client_id, completion_tx)?;
             },
             ScreenInstruction::CloseTab(client_id, mut completion_tx) => {
                 let closed = screen.tab_summary_for_client(client_id);

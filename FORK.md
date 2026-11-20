@@ -6386,7 +6386,9 @@ bind "x" { CloseTabOrConfirm; SwitchToMode "Normal"; }
   client that pressed the key, before anything is drawn (`zellij-server/src/close_tab_or_confirm.rs`).
   It counts the selectable panes in that client's tab, both layers, hidden floating panes
   included: the same counts the plugin reads from `TabInfo`, and the same rule as its
-  `TabShape::decide`. One at most closes the tab as `CloseTab` does. More launches the plugin,
+  `TabShape::decide`. One at most closes the tab as `CloseTab` does, at once on the same step
+  rather than through the screen queue, where a tab switch already queued for that client would
+  run first and leave the close to hit the tab it switched to. More launches the plugin,
   floating and moved to that client's tab, as the old binding did. Another client's tab is never
   consulted, and a client with no tab of its own changes nothing.
 - **Why the server and not the plugin.** The binding used to launch the plugin every time, and the
