@@ -52,7 +52,8 @@ keybinds {
         bind "e" { TogglePaneEmbedOrFloating; SwitchToMode "Locked"; }
         bind "c" { SwitchToMode "RenamePane"; PaneNameInput 0;}
         bind "i" { TogglePanePinned; SwitchToMode "Locked"; }
-        bind "u" { MutePane; SwitchToMode "Locked"; }
+        bind "u" { ReopenPane; SwitchToMode "Locked"; }
+        bind "Shift u" { MutePane; SwitchToMode "Locked"; }
         bind "g" { IgnorePaneOutput; SwitchToMode "Locked"; }
         bind "v" { WatchPane; SwitchToMode "Locked"; }
     }

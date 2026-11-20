@@ -27,9 +27,10 @@ use crate::input::layout::{
 };
 use crate::input::mousebinds::{MouseBehaviour, MouseBinding, MouseBindingKind};
 use crate::input::options::{
-    Clipboard, OnForceClose, Options, PaneFrameStyle, StackListOrientation, DEFAULT_WORD_SEPARATORS,
+    Clipboard, DefaultFloatingSize, OnForceClose, Options, PaneFrameStyle, StackListOrientation,
+    DEFAULT_WORD_SEPARATORS,
 };
-use crate::input::permission::{GrantedPermission, PermissionCache};
+use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermissions};
 use crate::input::plugins::PluginAliases;
 use crate::input::session_suggestions::SessionSuggestionsConfig;
 use crate::input::terminal::TerminalConfig;
@@ -37,10 +38,17 @@ use crate::input::theme::{
     FrameConfig, TerminalColors, Theme, Themes, UiConfig, TERMINAL_COLOR_NAMES,
 };
 use crate::input::web_client::WebClientConfig;
+use crate::resurrect_command_hints::{
+    ResurrectCommandHint, ResurrectCommandHints, ResurrectCommands,
+};
+#[cfg(test)]
+use crate::session_service::LaunchdKey;
+use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions};
 use kdl_layout_parser::KdlLayoutParser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use strum::IntoEnumIterator;
+use unknown::note_unknown;
 use uuid::Uuid;
 
 use miette::NamedSource;
@@ -1427,6 +1435,17 @@ impl Action {
                 node.push(name.clone());
                 Some(node)
             },
+            Action::ReopenPane {
+                handle,
+                list: false,
+                ..
+            } => {
+                let mut node = KdlNode::new("ReopenPane");
+                if let Some(handle) = handle {
+                    node.push(handle.clone());
+                }
+                Some(node)
+            },
             Action::BreakPane => Some(KdlNode::new("BreakPane")),
             Action::BreakPaneRight => Some(KdlNode::new("BreakPaneRight")),
             Action::BreakPaneLeft => Some(KdlNode::new("BreakPaneLeft")),
@@ -2639,6 +2658,19 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
                     action_arguments,
                     kdl_action
                 )
+            },
+            // fork addition: no argument reopens the newest closed pane, a string the one that had
+            // that handle
+            "ReopenPane" => {
+                let handle = action_arguments
+                    .first()
+                    .and_then(|v| v.value().as_string())
+                    .map(|handle| handle.to_owned());
+                Ok(Action::ReopenPane {
+                    handle,
+                    list: false,
+                    output_json: false,
+                })
             },
             "BreakPane" => Ok(Action::BreakPane),
             "BreakPaneRight" => Ok(Action::BreakPaneRight),
@@ -6309,6 +6341,14 @@ impl Options {
         if let Some(nested_session_handling) = self.nested_session_handling_to_kdl(add_comments) {
             nodes.push(nested_session_handling);
         }
+        if let Some(input_while_scrolled) = self.input_while_scrolled_to_kdl(add_comments) {
+            nodes.push(input_while_scrolled);
+        }
+        if let Some(command_pane_on_clean_exit) =
+            self.command_pane_on_clean_exit_to_kdl(add_comments)
+        {
+            nodes.push(command_pane_on_clean_exit);
+        }
         if let Some(host_notification_protocol) =
             self.host_notification_protocol_to_kdl(add_comments)
         {
@@ -6463,16 +6503,9 @@ fn parse_bind_blocks<K: Ord + Clone + std::hash::Hash + Eq, V: Clone>(
     };
     for block in children.nodes() {
         if kdl_name!(block) == "shared_except" || kdl_name!(block) == "shared" {
-            let mut modes_to_exclude = vec![];
-            for mode_name in kdl_string_arguments!(block) {
-                modes_to_exclude.push(InputMode::from_str(mode_name).map_err(|_| {
-                    ConfigError::new_kdl_error(
-                        format!("Invalid mode: '{}'", mode_name),
-                        block.name().span().offset(),
-                        block.name().span().len(),
-                    )
-                })?);
-            }
+            // fork: a mode this build does not have is not bound here anyway, so excluding it
+            // changes nothing, and the rest of the block still applies
+            let modes_to_exclude = known_modes_from_kdl(block)?;
             for mode in InputMode::iter() {
                 if modes_to_exclude.contains(&mode) {
                     continue;
@@ -6481,10 +6514,8 @@ fn parse_bind_blocks<K: Ord + Clone + std::hash::Hash + Eq, V: Clone>(
             }
         }
         if kdl_name!(block) == "shared_among" {
-            let mut modes_to_include = vec![];
-            for mode_name in kdl_string_arguments!(block) {
-                modes_to_include.push(InputMode::from_str(mode_name)?);
-            }
+            // fork: a mode this build does not have cannot be bound, and the others still are
+            let modes_to_include = known_modes_from_kdl(block)?;
             for mode in InputMode::iter() {
                 if !modes_to_include.contains(&mode) {
                     continue;
@@ -11471,6 +11502,36 @@ fn input_while_scrolled_warns_on_an_unknown_value() {
 }
 
 #[test]
+fn command_pane_on_clean_exit_kdl_round_trip_for_every_variant() {
+    use crate::input::options::CommandPaneOnCleanExit;
+    let cases = [
+        ("hold", CommandPaneOnCleanExit::Hold),
+        ("shell", CommandPaneOnCleanExit::Shell),
+    ];
+    for (value, expected) in cases {
+        let fake_config = format!(
+            r##"
+                command_pane_on_clean_exit "{value}"
+            "##
+        );
+        let document: KdlDocument = fake_config.parse().unwrap();
+        let parsed = Options::from_kdl(&document).unwrap();
+        assert_eq!(
+            parsed.command_pane_on_clean_exit,
+            Some(expected),
+            "case: {value}"
+        );
+
+        let mut serialized = Options::to_kdl(&parsed, false);
+        let mut fake_document = KdlDocument::new();
+        fake_document.nodes_mut().append(&mut serialized);
+        let reparsed =
+            Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
+        assert_eq!(parsed, reparsed, "round-trip mismatch for {value}");
+    }
+}
+
+#[test]
 /// A value a newer build may add leaves the option at its default, with a warning naming it. A
 /// value of the wrong type is still an error.
 fn command_pane_on_clean_exit_warns_on_an_unknown_value() {
@@ -12489,6 +12550,114 @@ fn terminal_title_is_unset_by_default() {
     assert_eq!(config.options.session_aliases, None);
 }
 
+#[test]
+fn resurrect_commands_config_parsing_and_round_trip() {
+    assert_eq!(
+        Config::from_kdl("", None)
+            .unwrap()
+            .options
+            .resurrect_commands,
+        None
+    );
+    for (value, mode) in [
+        ("all", ResurrectCommands::All),
+        ("agents", ResurrectCommands::Agents),
+        ("prefill", ResurrectCommands::Prefill),
+    ] {
+        let config = Config::from_kdl(&format!("resurrect_commands \"{}\"", value), None).unwrap();
+        assert_eq!(config.options.resurrect_commands, Some(mode));
+        let written: String = config
+            .options
+            .to_kdl(false)
+            .iter()
+            .map(|node| node.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reparsed = Config::from_kdl(&written, None).unwrap();
+        assert_eq!(reparsed.options.resurrect_commands, Some(mode));
+    }
+}
+
+/// A mode this build does not know must not fail the config: the key is ignored.
+#[test]
+fn an_unknown_resurrect_commands_mode_is_ignored() {
+    for config in ["resurrect_commands \"someday\"", "resurrect_commands true"] {
+        let config = Config::from_kdl(config, None).unwrap();
+        assert_eq!(config.options.resurrect_commands, None);
+    }
+}
+
+#[test]
+fn default_floating_size_config_parsing() {
+    let config_with_default_floating_size = r#"
+        default_floating_size {
+            width "90%"
+            height "80%"
+        }
+    "#;
+    let config = Config::from_kdl(config_with_default_floating_size, None).unwrap();
+    let default_floating_size = config.options.default_floating_size.clone().unwrap();
+    assert_eq!(
+        default_floating_size.width,
+        Some(PercentOrFixed::Percent(90))
+    );
+    assert_eq!(
+        default_floating_size.height,
+        Some(PercentOrFixed::Percent(80))
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn default_floating_size_accepts_fixed_and_a_single_axis() {
+    let config = Config::from_kdl(
+        r#"
+        default_floating_size {
+            width 120
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let default_floating_size = config.options.default_floating_size.clone().unwrap();
+    assert_eq!(
+        default_floating_size.width,
+        Some(PercentOrFixed::Fixed(120))
+    );
+    assert_eq!(default_floating_size.height, None);
+
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn default_floating_size_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.default_floating_size, None);
+}
+
+#[test]
+fn default_floating_size_rejects_bad_values() {
+    for bad in [
+        r#"default_floating_size { width "0%" }"#,
+        r#"default_floating_size { width "120%" }"#,
+        r#"default_floating_size { width "wide" }"#,
+        r#"default_floating_size { depth "80%" }"#,
+        r#"default_floating_size { width }"#,
+    ] {
+        assert!(
+            Config::from_kdl(bad, None).is_err(),
+            "expected {:?} to be rejected",
+            bad
+        );
+    }
+}
+
 /// `pane_privacy` was a fork block that this build no longer reads. An old config that still
 /// carries one loads, with the block reported as an unknown key.
 #[test]
@@ -12696,6 +12865,120 @@ fn an_ignored_entry_is_not_written_back_out() {
         "{}",
         written_out
     );
+}
+
+#[test]
+fn resurrect_command_hints_config_parsing() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        resume_args "--continue"
+    }
+    opencode {
+        match "opencode"
+        env "OPENCODE_SESSION_ID"
+        resume_args "--session {}"
+    }
+}"#,
+        None,
+    )
+    .unwrap();
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.hints,
+        vec![
+            ResurrectCommandHint {
+                name: "claude".to_owned(),
+                match_command: "claude".to_owned(),
+                env: "CLAUDE_CODE_SESSION_ID".to_owned(),
+                resume_args: "--continue".to_owned(),
+            },
+            ResurrectCommandHint {
+                name: "opencode".to_owned(),
+                match_command: "opencode".to_owned(),
+                env: "OPENCODE_SESSION_ID".to_owned(),
+                resume_args: "--session {}".to_owned(),
+            },
+        ]
+    );
+
+    // the round trip the configuration plugin performs when it rewrites config.kdl
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn resurrect_command_hints_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.resurrect_command_hints, None);
+}
+
+/// Every way of writing a hint that cannot do anything is refused at parse time, so that
+/// `zellij setup --check` reports it rather than serialization quietly recording the bare command.
+#[test]
+fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
+    let offenders = [
+        (
+            "resurrect_command_hints {
+    claude {
+        env \"X\"
+        resume_args \"--continue\"
+    }
+}",
+            "match",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        resume_args \"--continue\"
+    }
+}",
+            "env",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+    }
+}",
+            "resume_args",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+        resume_args \"  \"
+    }
+}",
+            "empty",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+        resume_args true
+    }
+}",
+            "string value",
+        ),
+    ];
+    for (config, expected) in offenders {
+        let error = format!("{:?}", Config::from_kdl(config, None).unwrap_err());
+        assert!(
+            error.contains(expected),
+            "{:?} should have been refused for {:?}, got: {}",
+            config,
+            expected,
+            error
+        );
+    }
 }
 
 /// A binary that does not know an entry of a hint ignores it and says so, rather than failing the

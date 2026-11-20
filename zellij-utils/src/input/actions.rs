@@ -2372,7 +2372,7 @@ impl Action {
                     popup_outside_click,
                 }])
             },
-            CliAction::ListClients => Ok(vec![Action::ListClients]),
+            CliAction::ListClients { json } => Ok(vec![Action::ListClients { output_json: json }]),
             CliAction::ListPanes {
                 tab,
                 command,
@@ -2380,12 +2380,24 @@ impl Action {
                 geometry,
                 all,
                 json,
+                report_withheld: _,
             } => Ok(vec![Action::ListPanes {
                 show_tab: tab,
                 show_command: command,
                 show_state: state,
                 show_geometry: geometry,
                 show_all: all,
+                output_json: json,
+            }]),
+            CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
+            CliAction::ReopenPane {
+                last: _,
+                handle,
+                list,
+                json,
+            } => Ok(vec![Action::ReopenPane {
+                handle,
+                list,
                 output_json: json,
             }]),
             CliAction::ListTabs {

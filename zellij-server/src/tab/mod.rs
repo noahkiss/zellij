@@ -1047,6 +1047,15 @@ pub trait Pane {
     fn hold(&mut self, _exit_status: Option<i32>, _is_first_run: bool, _run_command: RunCommand) {
         // No-op by default, only terminal panes support holding
     }
+    /// Leave the held state the way ESC on a held pane does, and report the directory a shell
+    /// should take its place in. `None` when this pane is not held (or cannot hold at all).
+    ///
+    /// fork addition: extracted from `TerminalPane::handle_held_drop_to_shell` so that a caller
+    /// other than the key handler can take the same path. See `Tab::drop_held_pane_to_shell`.
+    fn drop_held_to_shell(&mut self) -> Option<Option<PathBuf>> {
+        // No-op by default, only terminal panes support holding
+        None
+    }
     fn has_bell(&self) -> bool {
         false
     }
@@ -1932,6 +1941,30 @@ impl Tab {
         down: bool,
         axis: StackListOrientation,
     ) -> bool {
+        self.select_focus_within_stack_list(client_id, down, axis, false)
+    }
+    /// Fork addition: the stack focus wrap, for stack-list rendering. The members a wrap
+    /// would land on are suppressed rather than in the grid, so `wrap_stack_focus` (which
+    /// works on in-grid stacks) sees a stack of one here and does nothing.
+    ///
+    /// Like its in-grid counterpart this is the **third** fallback: callers reach it only
+    /// after the ordinary in-list step and the grid move have both failed, so a stack list
+    /// with a neighbour above still lets you leave it upwards rather than wrapping.
+    fn wrap_focus_within_stack_list(
+        &mut self,
+        client_id: ClientId,
+        down: bool,
+        axis: StackListOrientation,
+    ) -> bool {
+        self.select_focus_within_stack_list(client_id, down, axis, true)
+    }
+    fn select_focus_within_stack_list(
+        &mut self,
+        client_id: ClientId,
+        down: bool,
+        axis: StackListOrientation,
+        wrap: bool,
+    ) -> bool {
         let active_pane_id = match self.tiled_panes.get_active_pane_id(client_id) {
             Some(id) => id,
             None => return false,
@@ -1955,12 +1988,23 @@ impl Tab {
                 Some(r) => r,
                 None => return false,
             };
+            // a one-member list must not wrap onto itself: that reports a focus change
+            // that never happened
+            let member_count = list.members.len();
             let target_rank = if down {
-                rank + 1
-            } else if rank == 0 {
-                return false;
-            } else {
+                if rank + 1 < member_count {
+                    rank + 1
+                } else if wrap && member_count > 1 {
+                    0
+                } else {
+                    return false;
+                }
+            } else if rank > 0 {
                 rank - 1
+            } else if wrap && member_count > 1 {
+                member_count - 1
+            } else {
+                return false;
             };
             match list.members.get(target_rank) {
                 Some(member) => *member,
@@ -5919,6 +5963,7 @@ impl Tab {
                     },
                     Some(AdjustedInput::DropToShellInThisPane { working_dir }) => {
                         self.pids_waiting_resize.insert(active_terminal_id);
+                        self.record_drop_to_shell(PaneId::Terminal(active_terminal_id));
                         self.senders
                             .send_to_pty(PtyInstruction::DropToShellInPane {
                                 pane_id: PaneId::Terminal(active_terminal_id),
@@ -6865,7 +6910,16 @@ impl Tab {
             {
                 return Ok(true);
             }
-            Ok(self.tiled_panes.move_focus_down(client_id))
+            if self.tiled_panes.move_focus_down(client_id) {
+                return Ok(true);
+            }
+            // at the bottom of a stack list with nothing below it, come round to the top
+            Ok(self.stacked_pane_list_is_active()
+                && self.wrap_focus_within_stack_list(
+                    client_id,
+                    true,
+                    StackListOrientation::Vertical,
+                ))
         }
     }
     pub fn move_focus_up(&mut self, client_id: ClientId) -> Result<bool> {
@@ -6895,7 +6949,16 @@ impl Tab {
             {
                 return Ok(true);
             }
-            Ok(self.tiled_panes.move_focus_up(client_id))
+            if self.tiled_panes.move_focus_up(client_id) {
+                return Ok(true);
+            }
+            // at the top of a stack list with nothing above it, come round to the bottom
+            Ok(self.stacked_pane_list_is_active()
+                && self.wrap_focus_within_stack_list(
+                    client_id,
+                    false,
+                    StackListOrientation::Vertical,
+                ))
         }
     }
     // returns a boolean that indicates whether the focus moved
@@ -7586,15 +7649,82 @@ impl Tab {
                 ));
             return;
         }
-        if self.floating_panes.panes_contain(&id) {
+        // fork addition: a command pane that has just exited cleanly does not wait to be
+        // dismissed - see `Tab::drop_held_pane_to_shell`. A pane a session resurrection brought
+        // back always takes that path; every other command pane takes it only under
+        // `command_pane_on_clean_exit "shell"`.
+        let exited_cleanly = exit_status == Some(0)
+            && (run_command.resurrected
+                || *self.command_pane_on_clean_exit.borrow() == CommandPaneOnCleanExit::Shell);
+        // The drop resolves its pane through `get_pane_with_id_mut`, which also reaches a
+        // suppressed pane, so it is confined to the two branches holding a visible one. A
+        // suppressed pane is the scrollback-editor path: replacing its command with a shell
+        // would strand the pane it stands in for.
+        let should_drop_to_shell = if self.floating_panes.panes_contain(&id) {
             self.floating_panes
                 .hold_pane(id, exit_status, is_first_run, run_command);
+            exited_cleanly
         } else if self.tiled_panes.panes_contain(&id) {
             self.tiled_panes
                 .hold_pane(id, exit_status, is_first_run, run_command);
+            exited_cleanly
         } else if let Some(pane) = self.suppressed_panes.values_mut().find(|p| p.1.pid() == id) {
             pane.1.hold(exit_status, is_first_run, run_command);
+            false
+        } else {
+            false
+        };
+        if should_drop_to_shell {
+            self.drop_held_pane_to_shell(id);
         }
+    }
+    /// fork addition: take the "drop to shell" path a held pane offers under ESC, without the ESC.
+    ///
+    /// The pane is held first and released here, rather than never held at all, so that this is
+    /// the same sequence a keypress produces: the pane resets its grid and drops its banner in
+    /// `drop_held_to_shell`, and the pty thread replaces the dead command with the default shell in
+    /// the directory the command ran in. Only a command pane that exited with status 0 reaches
+    /// this, and only when it was resurrected or `command_pane_on_clean_exit` is `"shell"`; every
+    /// other exit holds.
+    /// fork addition: a pane that has dropped to the shell is running the shell, and now says so.
+    ///
+    /// The pty swaps the dead command for the default shell and nothing told the pane, so
+    /// `invoked_with` still named the command that exited - and with it `terminal_command` in
+    /// `list-panes --json`, which is what a consumer reads to decide what a pane is doing. It
+    /// reported a command that was not running, on every pane that dropped to the shell, whether
+    /// under ESC or on a clean exit.
+    ///
+    /// `None` rather than the shell: that is what an ordinary shell pane carries - see
+    /// [`Tab::normalize_invoked_with_for_default_shell`] - and after the drop this is an ordinary
+    /// shell pane. Both callers hand the pty `self.default_shell`, so there is no other shell it
+    /// could be.
+    ///
+    /// The snapshot is unaffected either way. `update_terminal_commands` overwrites every pane's
+    /// recorded command with what the OS says its child is running before a layout is serialized,
+    /// and already wrote `None` for a pane sitting in the default shell.
+    fn record_drop_to_shell(&mut self, id: PaneId) {
+        if let Some(pane) = self.get_pane_with_id_mut(id) {
+            pane.set_invoked_with(None);
+        }
+    }
+    fn drop_held_pane_to_shell(&mut self, id: PaneId) {
+        let PaneId::Terminal(terminal_id) = id else {
+            return;
+        };
+        let Some(working_dir) = self
+            .get_pane_with_id_mut(id)
+            .and_then(|pane| pane.drop_held_to_shell())
+        else {
+            return;
+        };
+        self.pids_waiting_resize.insert(terminal_id);
+        self.record_drop_to_shell(id);
+        let _ = self.senders.send_to_pty(PtyInstruction::DropToShellInPane {
+            pane_id: id,
+            shell: Some(self.default_shell.clone()),
+            working_dir,
+            completion_tx: None,
+        });
     }
     pub fn replace_pane_with_suppressed_pane(
         &mut self,

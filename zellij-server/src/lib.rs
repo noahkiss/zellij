@@ -8,14 +8,13 @@ mod os_input_output_windows;
 pub mod host_query;
 pub mod os_input_output;
 pub mod output;
-pub mod panes;
-pub mod tab;
-pub mod vt_parser;
-
+pub mod agent_mail;
 pub mod attention;
 pub mod background_jobs;
 mod desktop_app;
 pub use desktop_app::{set_app_starter, AppStarter};
+mod bell_dwell;
+mod closed_panes;
 mod global_async_runtime;
 mod logging_pipe;
 mod mobile_web;
@@ -24,17 +23,22 @@ pub mod notifications;
 mod pane_groups;
 pub mod pane_mirror;
 mod plugins;
+pub mod program_status;
 mod pty;
 mod pty_writer;
+mod resurrect_hints;
 mod route;
 mod screen;
 mod session_layout_metadata;
 pub mod session_link;
 mod session_previews;
 pub mod session_suggestions;
+mod session_warnings;
 mod socket_folder_watcher;
 mod terminal_bytes;
+pub mod terminal_progress;
 mod thread_bus;
+mod trzsz;
 mod ui;
 
 use background_jobs::{background_jobs_main, BackgroundJob};
@@ -1451,6 +1455,10 @@ impl SessionMetaData {
                     default_editor: new_config.options.scrollback_editor,
                     post_command_discovery_hook: new_config.options.post_command_discovery_hook,
                     pane_env: pane_env.clone(),
+                    resurrect_command_hints: new_config.options.resurrect_command_hints,
+                    resurrect_commands: new_config.options.resurrect_commands,
+                    detect_agents: new_config.options.detect_agents,
+                    pane_frame_agent_name: new_config.options.pane_frame_agent_name,
                 })
                 .unwrap();
         }
@@ -5791,6 +5799,35 @@ fn delete_unused_session_after_exit(session_id: &str, session_name: &str) {
     ));
 }
 
+/// The pty thread's bus.
+///
+/// It carries a sender to the pty thread itself: the reaper of a held pane's child runs on
+/// another thread and tells this one to forget the pid (`PtyInstruction::ChildProcessExited`).
+/// Upstream's bus had no such sender, so that message was dropped and a held pane kept its dead
+/// pid. Built here, not inline, so a test can build the bus a real server runs on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pty_thread_bus(
+    pty_receiver: channels::Receiver<(PtyInstruction, zellij_utils::errors::ErrorContext)>,
+    to_screen: &SenderWithContext<ScreenInstruction>,
+    to_pty: &SenderWithContext<PtyInstruction>,
+    to_plugin: &SenderWithContext<PluginInstruction>,
+    to_server: &SenderWithContext<ServerInstruction>,
+    to_pty_writer: &SenderWithContext<PtyWriteInstruction>,
+    to_background_jobs: &SenderWithContext<BackgroundJob>,
+    os_input: Box<dyn ServerOsApi>,
+) -> Bus<PtyInstruction> {
+    Bus::new(
+        vec![pty_receiver],
+        Some(to_screen),
+        Some(to_pty), // the held-pane reaper tells this thread to forget the pid
+        Some(to_plugin),
+        Some(to_server),
+        Some(to_pty_writer),
+        Some(to_background_jobs),
+        Some(os_input),
+    )
+}
+
 fn init_session(
     os_input: Box<dyn ServerOsApi>,
     to_server: SenderWithContext<ServerInstruction>,
@@ -5874,24 +5911,26 @@ fn init_session(
         .name("pty".to_string())
         .spawn({
             let layout = layout.clone();
-            let pty = Pty::new(
-                Bus::new(
-                    vec![pty_receiver],
-                    Some(&to_screen_bounded),
-                    None,
-                    Some(&to_plugin),
-                    Some(&to_server),
-                    Some(&to_pty_writer),
-                    Some(&to_background_jobs),
-                    Some(os_input.clone()),
+            let mut pty = Pty::new(
+                pty_thread_bus(
+                    pty_receiver,
+                    &to_screen_bounded,
+                    &to_pty,
+                    &to_plugin,
+                    &to_server,
+                    &to_pty_writer,
+                    &to_background_jobs,
+                    os_input.clone(),
                 ),
                 cli_assets.is_debug,
                 config_options.scrollback_editor.clone(),
                 config_options.post_command_discovery_hook.clone(),
                 applied_env.pane_env(),
+                config_options.resurrect_command_hints.clone(),
+                config_options.resurrect_commands,
+                config_options.detect_agents,
             );
 
-            let session_id = session_id.clone();
             move || pty_thread_main(pty, layout.clone(), session_id).fatal()
         })
         .unwrap();

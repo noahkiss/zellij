@@ -1099,24 +1099,17 @@ pub(crate) fn plugin_thread_main(
                 plugin_id,
                 client_id,
             ) => {
+                // the requesting plugin's own pane stays in the layout here, unlike the layout
+                // dump above: a client asking who is attached is usually looking at that very
+                // pane, and removing it removes the pane every one of those clients is focused
+                // on - which is the whole list
                 populate_session_layout_metadata(
                     &mut session_layout_metadata,
                     &wasm_bridge,
                     &plugin_aliases,
-                    Some(plugin_id),
+                    None,
                 );
-                let mut clients_metadata = session_layout_metadata.all_clients_metadata();
-                let mut client_list_for_plugin = vec![];
-                let default_editor = session_layout_metadata.default_editor.clone();
-                for (client_metadata_id, client_metadata) in clients_metadata.iter_mut() {
-                    let is_current_client = client_metadata_id == &client_id;
-                    client_list_for_plugin.push(ClientInfo::new(
-                        *client_metadata_id,
-                        client_metadata.get_pane_id().into(),
-                        client_metadata.stringify_command(&default_editor),
-                        is_current_client,
-                    ));
-                }
+                let client_list_for_plugin = session_layout_metadata.client_infos(client_id);
                 let updates = vec![(
                     Some(plugin_id),
                     Some(client_id),

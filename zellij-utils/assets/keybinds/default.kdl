@@ -52,7 +52,8 @@ keybinds {
         bind "e" { TogglePaneEmbedOrFloating; SwitchToMode "Normal"; }
         bind "c" { SwitchToMode "RenamePane"; PaneNameInput 0;}
         bind "i" { TogglePanePinned; SwitchToMode "Normal"; }
-        bind "u" { MutePane; SwitchToMode "Normal"; }
+        bind "u" { ReopenPane; SwitchToMode "Normal"; }
+        bind "Shift u" { MutePane; SwitchToMode "Normal"; }
         bind "g" { IgnorePaneOutput; SwitchToMode "Normal"; }
         bind "v" { WatchPane; SwitchToMode "Normal"; }
     }

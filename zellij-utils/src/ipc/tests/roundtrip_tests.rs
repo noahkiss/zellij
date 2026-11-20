@@ -2157,6 +2157,7 @@ fn test_client_messages() {
                     originating_plugin: None,
                     use_terminal_title: true,
                     notify: Default::default(),
+                    resurrected: false,
                 })),
                 ..Default::default()
             }),
@@ -2189,6 +2190,7 @@ fn test_client_messages() {
                     }),
                     use_terminal_title: true,
                     notify: Default::default(),
+                    resurrected: false,
                 })),
                 ..Default::default()
             }),

@@ -4195,6 +4195,31 @@ fn request_pane_target_resolution(
     }
 }
 
+/// fork addition: the closed panes a reopen can bring back, newest first. `None` when Screen did
+/// not answer in time.
+fn request_closed_panes_from_screen(
+    senders: &ThreadSenders,
+) -> Result<Option<Vec<crate::closed_panes::ClosedPane>>> {
+    use crossbeam::channel::{unbounded, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (response_sender, response_receiver) = unbounded();
+    senders.send_to_screen(ScreenInstruction::ListClosedPanes {
+        response_channel: response_sender,
+    })?;
+    match response_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(closed) => Ok(Some(closed)),
+        Err(RecvTimeoutError::Timeout) => {
+            log::error!("ListClosedPanes timed out waiting for Screen response");
+            Ok(None)
+        },
+        Err(RecvTimeoutError::Disconnected) => {
+            log::error!("ListClosedPanes channel disconnected");
+            Ok(None)
+        },
+    }
+}
+
 fn request_panes_from_screen(
     senders: &ThreadSenders,
     show_all: bool,
@@ -4271,66 +4296,6 @@ fn request_current_tab_info_from_screen(
             Ok(None)
         },
     }
-}
-
-fn enrich_panes_with_pty_data(
-    pane_entries: &mut [PaneListEntry],
-    senders: &ThreadSenders,
-) -> Result<()> {
-    for entry in pane_entries.iter_mut() {
-        if !entry.pane_info.is_plugin {
-            let pane_id = PaneId::Terminal(entry.pane_info.id);
-            enrich_pane_with_running_command(entry, pane_id, senders)?;
-            enrich_pane_with_cwd(entry, pane_id, senders)?;
-        }
-    }
-    Ok(())
-}
-
-fn enrich_pane_with_running_command(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPaneRunningCommandResponse;
-
-    let (cmd_sender, cmd_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPaneRunningCommand {
-        pane_id,
-        response_channel: cmd_sender,
-    })?;
-
-    if let Ok(GetPaneRunningCommandResponse::Ok(command_vec)) =
-        cmd_receiver.recv_timeout(Duration::from_millis(100))
-    {
-        entry.pane_command = Some(command_vec.join(" "));
-    }
-
-    Ok(())
-}
-
-fn enrich_pane_with_cwd(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPaneCwdResponse;
-
-    let (cwd_sender, cwd_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPaneCwd {
-        pane_id,
-        response_channel: cwd_sender,
-    })?;
-
-    if let Ok(GetPaneCwdResponse::Ok(cwd)) = cwd_receiver.recv_timeout(Duration::from_millis(100)) {
-        entry.pane_cwd = Some(cwd.to_string_lossy().to_string());
-    }
-
-    Ok(())
 }
 
 fn format_panes_as_json(pane_entries: &[PaneListEntry]) -> Vec<String> {
@@ -4444,6 +4409,7 @@ fn build_table_row(
         row.push(entry.pane_info.is_focused.to_string());
         row.push(entry.pane_info.is_floating.to_string());
         row.push(entry.pane_info.exited.to_string());
+        row.push(format_note(&entry.pane_info));
     }
 
     if show_geometry {
@@ -4453,7 +4419,16 @@ fn build_table_row(
         row.push(entry.pane_info.pane_columns.to_string());
     }
 
-    row.join("  ")
+    row.push(format_agent(entry));
+
+    // a table row is one line: an agent started with a multi-line prompt has newlines in its
+    // command, and they would break the row in two. `--json` keeps every value as it is
+    row.iter()
+        .map(|cell| cell.replace(['\n', '\r', '\t'], " "))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
 }
 
 fn format_pane_id(pane_info: &zellij_utils::data::PaneInfo) -> String {

@@ -1,0 +1,910 @@
+//! Resume hints for the commands a serialized session records.
+//!
+//! Session serialization records the command a pane is running, and a restored pane holds that
+//! command on screen so Enter re-runs it. For a long-lived tool that keeps its own state - a
+//! coding agent, a REPL with a session id - re-running the bare command starts a NEW session and
+//! the old one is only reachable through whatever resume flag the tool happens to have. The pane
+//! comes back; the work in it does not.
+//!
+//! A hint says: when a pane is running `claude`, look for `CLAUDE_CODE_SESSION_ID` in that pane's
+//! processes, and if it is there record the observed command line with `--continue` appended. The
+//! restored pane then holds a command that picks the session back up.
+//!
+//! For a command this build has no session words for, the observed command line is the ground
+//! truth and is never replaced. A hint only ADDS arguments, and adds nothing when the observed
+//! arguments already say how to resume. For a harness this build knows - `claude`, `codex`,
+//! `opencode`, `pi` - the recorded command is the bare resume instead: argv0 and the hint's
+//! words, nothing else. A launch prompt kept in the argv would be sent again as a new turn on
+//! Enter. The variable is a detector, not a source: it says the pane really is running that tool.
+//! Its value reaches the recorded command only through an explicit `{}` in `resume_args`.
+//!
+//! Every part of this is best-effort. A hint that does not match, a variable that is not set, a
+//! platform that cannot read another process's environment - each records the command unchanged.
+//! Serialization must never fail because a hint did not apply.
+
+use serde::{Deserialize, Serialize};
+
+/// The placeholder a `resume_args` template substitutes the environment value into. Optional: a
+/// resume flag that needs no id - `--continue` - carries no placeholder.
+pub const HINT_PLACEHOLDER: &str = "{}";
+
+/// One hint: which command it recognises, which variable proves the tool is there, what to add.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResurrectCommandHint {
+    /// The name of the config block this hint was written under. Carried for error messages and
+    /// logs only - matching never looks at it.
+    pub name: String,
+    /// Matched against the BASENAME of the recorded command, exactly. A hint of `claude` matches
+    /// a pane running `claude` and one running `/opt/homebrew/bin/claude`, and does not match
+    /// `claude-code`.
+    pub match_command: String,
+    /// The environment variable to look for in the pane's processes. Finding it is what makes the
+    /// hint fire.
+    ///
+    /// The search is breadth first over the pane's whole process subtree, so the value can come
+    /// from a child - a subagent, a hook - rather than from the tool the pane is running. That is
+    /// harmless while the variable is only a detector, and it is the residual risk of writing a
+    /// `{}` into `resume_args`: what lands in the command is then whichever process answered
+    /// first, which need not be the session the pane holds.
+    pub env: String,
+    /// The arguments to APPEND to the observed command line, with `{}` standing for the variable's
+    /// value. Split on whitespace - it is not passed to a shell, so quoting, globs and pipes mean
+    /// nothing here.
+    pub resume_args: String,
+}
+
+impl ResurrectCommandHint {
+    /// Whether this hint applies to a command. `command` is the recorded argv0, path and all.
+    pub fn matches(&self, command: &str) -> bool {
+        basename(command) == self.match_command
+    }
+
+    /// The arguments to append to `observed_args`, with every `{}` replaced by `env_value`.
+    ///
+    /// `None` means append nothing: the template is empty, the template needs a value and the
+    /// variable is set but empty, or the observed command line already carries one of these words.
+    /// A pane started as `claude --continue`, or as `claude --resume <id>`, already says how it
+    /// resumes, and the argv it actually ran beats anything this hint could reconstruct.
+    ///
+    /// Words are compared whole, never as substrings: a hint of `--continue` does not consider
+    /// itself present because the pane ran `--continue-on-error`.
+    pub fn resume_args_for(
+        &self,
+        observed_args: &[String],
+        env_value: &str,
+    ) -> Option<Vec<String>> {
+        // an exported but empty variable proves the tool is there and gives nothing to substitute;
+        // expanding it would append a bare `--session ""` the pane could not run
+        if env_value.is_empty() && self.resume_args.contains(HINT_PLACEHOLDER) {
+            return None;
+        }
+        let words: Vec<String> = self
+            .resume_args
+            .split_whitespace()
+            .map(|word| word.replace(HINT_PLACEHOLDER, env_value))
+            .collect();
+        if words.is_empty() {
+            return None;
+        }
+        if words.iter().any(|word| observed_args.contains(word)) {
+            return None;
+        }
+        Some(words)
+    }
+
+    /// The whole argument list to record for a pane running `command`, or `None` to leave the
+    /// pane as it was.
+    ///
+    /// For a harness this build knows - `claude`, `codex`, `opencode`, `pi` - the hint's words
+    /// REPLACE the whole observed argv: the pane is recorded as the bare resume, argv0 and the
+    /// hint's words. Launch flags and a positional prompt are dropped with the old session words;
+    /// a kept prompt is sent again as a new turn when Enter re-runs the pane. For any other
+    /// command the hint only appends, by the rule in [`Self::resume_args_for`], because this build
+    /// does not know that tool's words.
+    pub fn args_for(
+        &self,
+        command: &str,
+        observed_args: &[String],
+        env_value: &str,
+    ) -> Option<Vec<String>> {
+        if agent_resume_for(command).is_some() {
+            return self.resume_args_for(&[], env_value);
+        }
+        let words = self.resume_args_for(observed_args, env_value)?;
+        let mut args = observed_args.to_vec();
+        args.extend(words);
+        Some(args)
+    }
+}
+
+/// The `resurrect_command_hints` block: hints in the order they were configured.
+///
+/// Order is the order of the config file, and the FIRST hint whose `match` applies wins. Two hints
+/// for the same command is a config mistake rather than a merge, so there is nothing to resolve.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResurrectCommandHints {
+    #[serde(default)]
+    pub hints: Vec<ResurrectCommandHint>,
+    /// Entries of a hint that this binary does not know, in the words a human should read.
+    ///
+    /// A block that parses its own children used to REJECT an unknown one, and a rejection here
+    /// fails the whole config rather than the block - so a key could never reach a shared config
+    /// before the binary that understands it reached every machine. Keeping the names instead of
+    /// erroring is what makes the order "config first, binaries after" work for a nested key the
+    /// way it already worked for a top-level one.
+    ///
+    /// Kept rather than only logged because `zellij setup --check` is where someone looks when a
+    /// key appears to do nothing, and a server log line is not there. Not written back out by
+    /// [`crate::input::config::Config::to_string`]: an ignored key is not part of this build's
+    /// configuration, and re-emitting it would make a dump claim otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_entries: Vec<String>,
+}
+
+impl ResurrectCommandHints {
+    /// Whether this block holds no hint. [`Self::unknown_entries`] deliberately does not count: an
+    /// entry this build ignores adds nothing to a recorded command, and a block holding only
+    /// ignored names is as empty as one holding nothing.
+    pub fn is_empty(&self) -> bool {
+        self.hints.is_empty()
+    }
+
+    /// Whether a hint's child names something this build reads.
+    ///
+    /// `rewrite` is here even though it is retired: it is a name this build knows and answers with
+    /// its own warning, which says what replaced it. Reporting it as merely unknown would lose
+    /// that.
+    ///
+    /// Asked BEFORE a child's value is read, because the value of every child has to be a string
+    /// and an unknown name must not be held to a rule this build made up for it.
+    pub fn is_known_hint_entry(entry: &str) -> bool {
+        matches!(entry, "match" | "env" | "resume_args" | "rewrite")
+    }
+
+    /// Record an entry of a hint that this binary does not know, and say so in the log.
+    ///
+    /// The two surfaces are one call because they answer the same question in two places: the log
+    /// line is for a session that is already running, and the kept string is what
+    /// `zellij setup --check` prints for someone holding a config that seems to be ignored.
+    pub fn note_unknown_entry(&mut self, message: String) {
+        log::warn!("{}", message);
+        self.unknown_entries.push(message);
+    }
+
+    pub fn push(&mut self, hint: ResurrectCommandHint) {
+        self.hints.push(hint);
+    }
+
+    /// The first hint that applies to `command`, if any.
+    pub fn hint_for(&self, command: &str) -> Option<&ResurrectCommandHint> {
+        self.hints.iter().find(|hint| hint.matches(command))
+    }
+}
+
+/// What a restored session does with the commands its panes were recorded running: the
+/// top-level `resurrect_commands` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResurrectCommands {
+    /// Every recorded command comes back as a command pane waiting to run. Upstream's behaviour,
+    /// and what an unset key means - except that a known agent is recorded as its bare resume, as
+    /// in the other two modes.
+    All,
+    /// Only coding agents keep their command, recorded with how to resume it, and come back as a
+    /// command pane waiting to run. Every other pane comes back as a plain shell.
+    Agents,
+    /// Only coding agents keep their command, and a restored agent pane is a plain shell with the
+    /// resume command typed at its prompt, not run. Every other pane is a plain shell.
+    Prefill,
+}
+
+impl ResurrectCommands {
+    /// The value as the config spells it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResurrectCommands::All => "all",
+            ResurrectCommands::Agents => "agents",
+            ResurrectCommands::Prefill => "prefill",
+        }
+    }
+    /// The mode a config value names, or `None` for a value this build does not know.
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(ResurrectCommands::All),
+            "agents" => Some(ResurrectCommands::Agents),
+            "prefill" => Some(ResurrectCommands::Prefill),
+            _ => None,
+        }
+    }
+    /// Whether a serialized pane keeps its command only if it is an agent's.
+    pub fn agents_only(&self) -> bool {
+        !matches!(self, ResurrectCommands::All)
+    }
+}
+
+/// Whether a word that picks a session takes the argument after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionValue {
+    /// A bare flag: `--continue`.
+    None,
+    /// A value that may be left out: `claude --resume` alone opens a picker. The next word is
+    /// taken as the value only when it is not itself a flag.
+    Optional,
+    /// A value that is always there: `--session-id <id>`.
+    Required,
+}
+
+/// How a coding agent picks a session: by id, or from its own picker.
+///
+/// From nkmk.31 there is no "newest session" entry here. Resuming the newest session in a
+/// directory is wrong whenever two panes share that directory: both come back holding the same
+/// session. A pane whose own session is known resumes it by id; one whose session is not known
+/// opens the agent's picker and lets a person choose.
+pub struct AgentResume {
+    /// The harness, as [`crate::agent_detect::AgentHarness::kind`] names it.
+    pub kind: &'static str,
+    /// The arguments that open the agent's own session picker. Empty for an agent that has no
+    /// picker flag: the bare command is then the honest fallback.
+    pub picker_args: &'static [&'static str],
+    /// The arguments that resume one session by id, with `{}` standing for the id.
+    pub session_args: &'static [&'static str],
+    /// Every word that picks a session, and whether it takes a value. Read by
+    /// [`picks_a_session`].
+    pub session_words: &'static [(&'static str, SessionValue)],
+    /// The session words whose value names the session the process was started on, as opposed
+    /// to one it forks from. Read by [`argv_session_id`].
+    pub id_words: &'static [&'static str],
+}
+
+/// Where the session id a pane is recorded or reported with came from.
+///
+/// Carried as a string to the reader - `list-agents --json` and the server log - so a reader can
+/// tell "resumes its own session" from "opens the picker because nothing named one".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSource {
+    /// The agent said so itself, on its own pane: `OSC 1337 SetUserVar=agent_session=<base64>`,
+    /// printed by a hook `zellij setup --agent-hooks` describes. Preferred over everything else.
+    Osc,
+    /// The agent's own per-process record: claude's `sessions/<pid>.json`.
+    Record,
+    /// A session file the agent's process holds open: codex's `rollout-*-<uuid>.jsonl`.
+    OpenFile,
+    /// An identity variable found in the pane's processes.
+    Env,
+    /// The argv the agent was started with. Right until the agent moves to another session.
+    Argv,
+    /// Nothing named the session. A restored pane opens the agent's picker, never its newest
+    /// session.
+    PickerFallback,
+}
+
+impl SessionSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionSource::Osc => "osc",
+            SessionSource::Record => "record",
+            SessionSource::OpenFile => "open-file",
+            SessionSource::Env => "env",
+            SessionSource::Argv => "argv",
+            SessionSource::PickerFallback => "picker-fallback",
+        }
+    }
+}
+
+/// The session words of every harness [`crate::agent_detect::HARNESSES`] knows, from each CLI's
+/// own `--help` (`opencode` from its published CLI reference).
+///
+/// The pickers: `claude --resume` with no value, `codex resume` with no id, `pi --resume`.
+/// `opencode` has no picker flag and comes back as the bare command.
+pub const AGENT_RESUMES: &[AgentResume] = &[
+    AgentResume {
+        kind: "claude",
+        picker_args: &["--resume"],
+        session_args: &["--resume", HINT_PLACEHOLDER],
+        session_words: &[
+            ("--continue", SessionValue::None),
+            ("-c", SessionValue::None),
+            ("--resume", SessionValue::Optional),
+            ("-r", SessionValue::Optional),
+            ("--session-id", SessionValue::Required),
+            ("--fork-session", SessionValue::None),
+            ("--from-pr", SessionValue::Optional),
+        ],
+        id_words: &["--resume", "-r", "--session-id"],
+    },
+    AgentResume {
+        kind: "opencode",
+        picker_args: &[],
+        session_args: &["--session", HINT_PLACEHOLDER],
+        session_words: &[
+            ("--continue", SessionValue::None),
+            ("-c", SessionValue::None),
+            ("--session", SessionValue::Required),
+            ("-s", SessionValue::Required),
+            ("--fork", SessionValue::None),
+        ],
+        id_words: &["--session", "-s"],
+    },
+    AgentResume {
+        kind: "codex",
+        picker_args: &["resume"],
+        session_args: &["resume", HINT_PLACEHOLDER],
+        session_words: &[
+            ("resume", SessionValue::Optional),
+            ("fork", SessionValue::Optional),
+            ("--last", SessionValue::None),
+            ("--all", SessionValue::None),
+        ],
+        id_words: &["resume"],
+    },
+    AgentResume {
+        kind: "pi",
+        picker_args: &["--resume"],
+        session_args: &["--session", HINT_PLACEHOLDER],
+        session_words: &[
+            ("--continue", SessionValue::None),
+            ("-c", SessionValue::None),
+            ("--resume", SessionValue::None),
+            ("-r", SessionValue::None),
+            ("--session", SessionValue::Required),
+            ("--session-id", SessionValue::Required),
+            ("--fork", SessionValue::Required),
+            ("--no-session", SessionValue::None),
+        ],
+        id_words: &["--session", "--session-id"],
+    },
+];
+
+/// The resume table entry for the harness `command` runs, if this build knows one.
+fn agent_resume_for(command: &str) -> Option<&'static AgentResume> {
+    let harness = crate::agent_detect::harness_for_command(command)?;
+    AGENT_RESUMES
+        .iter()
+        .find(|resume| resume.kind == harness.kind)
+}
+
+/// The session word `arg` is, and whether its value is glued on with `=`.
+fn session_word<'a>(resume: &'a AgentResume, arg: &str) -> Option<(&'a SessionValue, bool)> {
+    resume.session_words.iter().find_map(|(word, value)| {
+        if arg == *word {
+            Some((value, false))
+        } else if arg.starts_with(word) && arg[word.len()..].starts_with('=') {
+            Some((value, true))
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `command` is a coding agent that an agents-only mode keeps: a harness this build
+/// knows, or a command a configured hint names.
+pub fn is_resurrectable_agent(command: &str, hints: Option<&ResurrectCommandHints>) -> bool {
+    crate::agent_detect::harness_for_command(command).is_some()
+        || hints.map_or(false, |hints| hints.hint_for(command).is_some())
+}
+
+/// Whether `observed_args` already pick a session for the harness `command` runs.
+pub fn picks_a_session(command: &str, observed_args: &[String]) -> bool {
+    agent_resume_for(command).map_or(false, |resume| {
+        observed_args
+            .iter()
+            .any(|arg| session_word(resume, arg).is_some())
+    })
+}
+
+/// The bare resume for `resume`: its arguments for `session_id`, or its picker when there is
+/// none. Nothing from the observed argv is carried over.
+fn bare_resume(resume: &AgentResume, session_id: Option<&str>) -> Vec<String> {
+    match session_id {
+        Some(session_id) => resume
+            .session_args
+            .iter()
+            .map(|arg| arg.replace(HINT_PLACEHOLDER, session_id))
+            .collect(),
+        None => resume
+            .picker_args
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect(),
+    }
+}
+
+/// The arguments an agent pane is recorded with when nothing live named its session: the bare
+/// resume of the session id the argv names, or the agent's picker when it names none. `None`
+/// when `command` is not an agent this build knows.
+///
+/// Bare means only the session words: `claude --resume <id>`, `codex resume <id>`, `pi --resume`,
+/// a bare `opencode`. Every other observed word is dropped - launch flags and a positional prompt
+/// alike. A kept prompt was sent again as a new turn when Enter re-ran the restored pane.
+///
+/// Never the newest session, without exceptions: before nkmk.31 this added `--continue` or
+/// `resume --last`, and kept an argv that already carried one. Two panes in one directory then
+/// both came back holding whichever session was newest. From nkmk.31 a `--continue`, `-c` or
+/// `resume --last` in the argv is replaced by the picker too; only an explicit id survives.
+pub fn builtin_resume_args(command: &str, observed_args: &[String]) -> Option<Vec<String>> {
+    let resume = agent_resume_for(command)?;
+    let session_id = argv_session_id(command, observed_args);
+    Some(bare_resume(resume, session_id.as_deref()))
+}
+
+/// The bare resume of `session_id` for the harness `command` runs: `claude --resume <id>`,
+/// `codex resume <id>`, `opencode --session <id>`, `pi --session <id>`. `None` when `command` is
+/// not a harness this build knows.
+///
+/// The argv names the session the process STARTED with, or none. `/clear`, `/resume` and a new
+/// conversation each move a running agent to another session and leave the argv as it was, so
+/// the session the process holds now is the one recorded.
+pub fn args_for_session(command: &str, session_id: &str) -> Option<Vec<String>> {
+    let resume = agent_resume_for(command)?;
+    Some(bare_resume(resume, Some(session_id)))
+}
+
+/// The session id the argv itself names: the value of `--resume <id>`, `--session <id>`,
+/// `codex resume <id>`, glued (`--session=<id>`) or not. `None` for an argv that names none -
+/// a bare `--resume`, `--continue` - or a command that is not a harness this build knows.
+pub fn argv_session_id(command: &str, observed_args: &[String]) -> Option<String> {
+    let resume = agent_resume_for(command)?;
+    let mut words = observed_args.iter().peekable();
+    while let Some(word) = words.next() {
+        for id_word in resume.id_words {
+            if word == id_word {
+                if let Some(next) = words.peek().filter(|next| !next.starts_with('-')) {
+                    return Some((*next).clone());
+                }
+            } else if let Some(value) = word
+                .strip_prefix(id_word)
+                .and_then(|rest| rest.strip_prefix('='))
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// A command line as a person would type it at a POSIX shell prompt: every word that is not
+/// plainly safe is single-quoted. `resurrect_commands "prefill"` types this into a restored pane.
+pub fn command_line_for_prompt(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(|arg| arg.as_str()))
+        .map(quote_for_prompt)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The bytes that put `command_line` at a prompt: one bracketed paste, with no newline.
+///
+/// A paste, not keystrokes, because a line editor binds widgets to plain keys - an abbreviation
+/// expander on space, a completion menu on a character - and typed keys would run them. Inside a
+/// paste ZLE and readline insert the text literally. It is only sent once the line editor has
+/// turned bracketed paste on, so the editor is reading the markers it asked for.
+///
+/// Control characters are dropped from the text: an ESC would end the paste early and a newline
+/// would run the line, and a recorded argument carries neither on purpose.
+pub fn prefill_as_paste(command_line: &str) -> Vec<u8> {
+    let text: String = command_line.chars().filter(|c| !c.is_control()).collect();
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+fn quote_for_prompt(word: &str) -> String {
+    let is_safe = |c: char| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c);
+    if !word.is_empty() && word.chars().all(is_safe) {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The last path component of a command, as a string. `/usr/bin/claude` -> `claude`.
+///
+/// Deliberately string surgery rather than `Path::file_name`: the recorded command is whatever the
+/// process table reported, and a trailing separator or an empty tail should simply not match.
+fn basename(command: &str) -> &str {
+    command
+        .rsplit(std::path::MAIN_SEPARATOR)
+        .next()
+        .unwrap_or(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hint(match_command: &str, resume_args: &str) -> ResurrectCommandHint {
+        ResurrectCommandHint {
+            name: "test".to_owned(),
+            match_command: match_command.to_owned(),
+            env: "TEST_SESSION_ID".to_owned(),
+            resume_args: resume_args.to_owned(),
+        }
+    }
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn matches_on_the_basename() {
+        let hint = hint("claude", "--continue");
+        assert!(hint.matches("claude"));
+        assert!(hint.matches("/opt/homebrew/bin/claude"));
+        assert!(!hint.matches("claude-code"));
+        assert!(!hint.matches("myclaude"));
+        assert!(!hint.matches("/opt/bin/claude-code"));
+    }
+
+    #[test]
+    fn a_flag_that_needs_no_id_is_appended_on_its_own() {
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&[], "abc123"),
+            Some(args(&["--continue"]))
+        );
+    }
+
+    #[test]
+    fn expands_the_placeholder_into_an_argument() {
+        assert_eq!(
+            hint("opencode", "--session {}").resume_args_for(&[], "abc123"),
+            Some(args(&["--session", "abc123"]))
+        );
+    }
+
+    #[test]
+    fn expands_a_placeholder_glued_to_a_flag() {
+        assert_eq!(
+            hint("opencode", "--session={}").resume_args_for(&[], "xyz"),
+            Some(args(&["--session=xyz"]))
+        );
+    }
+
+    /// An exported but empty variable still fires the hint, and there is nothing to put in the
+    /// placeholder. Appending `--session ""` would record a command the pane cannot run.
+    #[test]
+    fn an_empty_value_adds_nothing_when_the_template_needs_one() {
+        assert_eq!(
+            hint("opencode", "--session {}").resume_args_for(&[], ""),
+            None
+        );
+        assert_eq!(
+            hint("opencode", "--session={}").resume_args_for(&[], ""),
+            None
+        );
+    }
+
+    /// A template with no placeholder never touches the value, so an empty one is no obstacle -
+    /// the variable did its whole job by existing.
+    #[test]
+    fn an_empty_value_still_appends_a_template_that_needs_none() {
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&[], ""),
+            Some(args(&["--continue"]))
+        );
+    }
+
+    /// The guard compares whole arguments. A pane running a longer flag that merely starts with
+    /// the hint's word has not resumed, and must still get the hint.
+    #[test]
+    fn a_longer_observed_flag_is_not_the_hints_word() {
+        let observed = args(&["--continue-on-error"]);
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&observed, "abc"),
+            Some(args(&["--continue"]))
+        );
+    }
+
+    #[test]
+    fn an_empty_template_adds_nothing() {
+        assert_eq!(hint("claude", "   ").resume_args_for(&[], "abc"), None);
+    }
+
+    /// The bug this whole surface exists to not have: the observed argv already resumed, and the
+    /// hint appended a second, contradictory resume flag over the top of it.
+    #[test]
+    fn observed_arguments_that_already_resume_win() {
+        let observed = args(&["--dangerously-skip-permissions", "--continue"]);
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&observed, "abc123"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_observed_resume_flag_beats_a_reconstructed_id() {
+        let observed = args(&["--resume", "the-id-that-actually-ran"]);
+        assert_eq!(
+            hint("claude", "--resume {}").resume_args_for(&observed, "some-other-id"),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_observed_arguments_do_not_block_the_hint() {
+        let observed = args(&["--dangerously-skip-permissions"]);
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&observed, "abc123"),
+            Some(args(&["--continue"]))
+        );
+    }
+
+    #[test]
+    fn first_matching_hint_wins() {
+        let mut hints = ResurrectCommandHints::default();
+        hints.push(hint("claude", "--continue"));
+        hints.push(hint("claude", "--resume {}"));
+        assert_eq!(
+            hints
+                .hint_for("/usr/local/bin/claude")
+                .map(|h| &h.resume_args),
+            Some(&"--continue".to_owned())
+        );
+        assert!(hints.hint_for("bash").is_none());
+    }
+
+    #[test]
+    fn only_known_agents_and_hinted_commands_are_resurrectable() {
+        for agent in ["claude", "/opt/homebrew/bin/codex", "opencode", "pi"] {
+            assert!(is_resurrectable_agent(agent, None), "{}", agent);
+        }
+        for other in [
+            "starship",
+            "/home/linuxbrew/.linuxbrew/bin/brew",
+            "htop",
+            "vim",
+        ] {
+            assert!(!is_resurrectable_agent(other, None), "{}", other);
+        }
+        let mut hints = ResurrectCommandHints::default();
+        hints.push(hint("aider", "--restore-chat-history"));
+        assert!(is_resurrectable_agent("aider", Some(&hints)));
+    }
+
+    /// With no session id, every agent gets its bare picker, never its newest session: two panes
+    /// in one directory would otherwise both resume the same one.
+    #[test]
+    fn with_no_session_id_an_agent_gets_its_picker_not_its_newest_session() {
+        let observed = args(&["--dangerously-skip-permissions"]);
+        assert_eq!(
+            builtin_resume_args("claude", &observed),
+            Some(args(&["--resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("/usr/bin/pi", &[]),
+            Some(args(&["--resume"]))
+        );
+        // opencode has no picker flag: the bare command, not `--continue`
+        assert_eq!(
+            builtin_resume_args("opencode", &args(&["--model", "m"])),
+            Some(Vec::new())
+        );
+        for command in ["claude", "pi", "opencode", "codex"] {
+            let recorded = builtin_resume_args(command, &[]).unwrap();
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|word| word == "--continue" || word == "--last"),
+                "{} recorded a latest flag: {:?}",
+                command,
+                recorded
+            );
+        }
+    }
+
+    /// `codex resume` is a subcommand. With no id it opens codex's picker, and the observed
+    /// options are dropped with everything else.
+    #[test]
+    fn codex_gets_its_bare_resume_subcommand() {
+        let observed = args(&["-m", "o3"]);
+        assert_eq!(
+            builtin_resume_args("codex", &observed),
+            Some(args(&["resume"]))
+        );
+    }
+
+    /// A latest flag the operator typed - `claude --continue`, `codex resume --last`,
+    /// `opencode -c`, `pi --continue` - becomes the bare picker. An id the argv names becomes the
+    /// bare resume of that id.
+    #[test]
+    fn a_latest_flag_becomes_the_picker_and_an_argv_id_the_bare_resume() {
+        let latest = args(&["--dangerously-skip-permissions", "--continue"]);
+        assert_eq!(
+            builtin_resume_args("claude", &latest),
+            Some(args(&["--resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("claude", &args(&["-c", "--model", "m"])),
+            Some(args(&["--resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("claude", &args(&["--resume"])),
+            Some(args(&["--resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("codex", &args(&["resume", "--last", "-m", "o3"])),
+            Some(args(&["resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("opencode", &args(&["--continue"])),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            builtin_resume_args("pi", &args(&["-c"])),
+            Some(args(&["--resume"]))
+        );
+        let with_id = args(&["--dangerously-skip-permissions", "--resume", "abc"]);
+        assert_eq!(
+            builtin_resume_args("claude", &with_id),
+            Some(args(&["--resume", "abc"]))
+        );
+        assert_eq!(
+            builtin_resume_args("codex", &args(&["-m", "o3", "resume", "abc"])),
+            Some(args(&["resume", "abc"]))
+        );
+        assert_eq!(
+            builtin_resume_args("pi", &args(&["--thinking", "high", "--session", "abc"])),
+            Some(args(&["--session", "abc"]))
+        );
+        assert_eq!(
+            builtin_resume_args("opencode", &args(&["-s", "ses_1", "--model", "m"])),
+            Some(args(&["--session", "ses_1"]))
+        );
+        assert_eq!(builtin_resume_args("htop", &[]), None);
+    }
+
+    #[test]
+    fn a_known_session_id_is_recorded_in_each_agents_own_bare_form() {
+        assert_eq!(
+            args_for_session("claude", "id-1"),
+            Some(args(&["--resume", "id-1"]))
+        );
+        assert_eq!(
+            args_for_session("opencode", "id-1"),
+            Some(args(&["--session", "id-1"]))
+        );
+        assert_eq!(
+            args_for_session("pi", "id-1"),
+            Some(args(&["--session", "id-1"]))
+        );
+        assert_eq!(
+            args_for_session("/opt/homebrew/bin/codex", "id-1"),
+            Some(args(&["resume", "id-1"]))
+        );
+        assert_eq!(args_for_session("htop", "id-1"), None);
+    }
+
+    /// The flightdeck pane: launch flags and a positional launch prompt, then a live session.
+    /// Keeping the prompt made Enter on the restored pane resume AND send the brief again.
+    #[test]
+    fn a_launch_prompt_and_flags_are_not_recorded_with_the_live_session() {
+        let observed = args(&[
+            "--model",
+            "opus",
+            "--dangerously-skip-permissions",
+            "Read X and do it.",
+        ]);
+        let recorded = args_for_session("claude", "live").unwrap();
+        assert_eq!(recorded, args(&["--resume", "live"]));
+        assert_eq!(
+            command_line_for_prompt("claude", &recorded),
+            "claude --resume live"
+        );
+        assert_eq!(
+            builtin_resume_args("claude", &observed),
+            Some(args(&["--resume"]))
+        );
+        assert_eq!(
+            hint("claude", "--resume {}").args_for("claude", &observed, "live"),
+            Some(args(&["--resume", "live"]))
+        );
+    }
+
+    #[test]
+    fn the_argv_names_a_session_only_with_a_value() {
+        assert_eq!(
+            argv_session_id("claude", &args(&["--resume", "abc", "--model", "m"])).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            argv_session_id("claude", &args(&["--session-id=abc"])).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            argv_session_id("claude", &args(&["--resume", "--model"])),
+            None
+        );
+        assert_eq!(argv_session_id("claude", &args(&["--continue"])), None);
+        assert_eq!(
+            argv_session_id("codex", &args(&["resume", "019a-uuid"])).as_deref(),
+            Some("019a-uuid")
+        );
+        assert_eq!(argv_session_id("codex", &args(&["resume", "--last"])), None);
+        // a fork names the session it copies, not the one the pane holds
+        assert_eq!(argv_session_id("pi", &args(&["--fork", "abc"])), None);
+        assert_eq!(
+            argv_session_id("opencode", &args(&["-s", "ses_1"])).as_deref(),
+            Some("ses_1")
+        );
+        assert_eq!(argv_session_id("htop", &args(&["--resume", "abc"])), None);
+    }
+
+    #[test]
+    fn a_hint_for_a_known_agent_records_only_its_own_words() {
+        let observed = args(&["--dangerously-skip-permissions", "--continue"]);
+        assert_eq!(
+            hint("claude", "--resume {}").args_for("claude", &observed, "fced3e97"),
+            Some(args(&["--resume", "fced3e97"]))
+        );
+        let restored = args(&["-r", "old", "--resume", "older"]);
+        assert_eq!(
+            hint("claude", "--resume {}").args_for("/usr/bin/claude", &restored, "new"),
+            Some(args(&["--resume", "new"]))
+        );
+        // an empty value gives the hint nothing to record; the pane is left for the live pass
+        assert_eq!(
+            hint("opencode", "--session {}").args_for("opencode", &observed, ""),
+            None
+        );
+    }
+
+    /// A tool this build has no session words for keeps the append-only rule.
+    #[test]
+    fn a_hint_for_another_tool_still_only_appends() {
+        let observed = args(&["--restore"]);
+        assert_eq!(
+            hint("aider", "--restore").args_for("aider", &observed, "x"),
+            None
+        );
+        assert_eq!(
+            hint("aider", "--id {}").args_for("aider", &args(&["-v"]), "x"),
+            Some(args(&["-v", "--id", "x"]))
+        );
+    }
+
+    #[test]
+    fn a_prompt_command_line_quotes_what_a_shell_would_split() {
+        assert_eq!(
+            command_line_for_prompt(
+                "claude",
+                &args(&["--dangerously-skip-permissions", "--resume", "fced3e97-31"])
+            ),
+            "claude --dangerously-skip-permissions --resume fced3e97-31"
+        );
+        assert_eq!(
+            command_line_for_prompt("codex", &args(&["it's here", "$HOME", ""])),
+            "codex 'it'\\''s here' '$HOME' ''"
+        );
+    }
+
+    #[test]
+    fn a_resurrect_commands_value_round_trips() {
+        for mode in [
+            ResurrectCommands::All,
+            ResurrectCommands::Agents,
+            ResurrectCommands::Prefill,
+        ] {
+            assert_eq!(ResurrectCommands::from_config(mode.as_str()), Some(mode));
+        }
+        assert_eq!(ResurrectCommands::from_config("never"), None);
+        assert!(!ResurrectCommands::All.agents_only());
+        assert!(ResurrectCommands::Prefill.agents_only());
+    }
+
+    #[test]
+    fn a_prefill_is_one_bracketed_paste_with_no_newline() {
+        assert_eq!(
+            prefill_as_paste("claude --resume abc"),
+            b"\x1b[200~claude --resume abc\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_prefill_cannot_end_its_paste_or_run_its_line() {
+        assert_eq!(
+            prefill_as_paste("x \x1b[201~y\nz\r"),
+            b"\x1b[200~x [201~yz\x1b[201~".to_vec()
+        );
+    }
+}

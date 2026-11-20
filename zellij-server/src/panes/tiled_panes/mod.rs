@@ -694,12 +694,15 @@ impl TiledPanes {
         self.pane_frame_style = pane_frame_style;
         let draws_full_frames = pane_frame_style.draws_full_frames();
         let draws_titles = pane_frame_style.draws_titles();
-        let single_selectable_tiled_pane = self
-            .panes
-            .values()
-            .filter(|p| p.selectable() && !p.borderless())
-            .count()
-            == 1;
+        // Fork addition: `top_only` always draws one rule per pane, so the single-pane
+        // title suppression that applies to `titles` must not apply to it.
+        let single_selectable_tiled_pane = !pane_frame_style.is_top_only()
+            && self
+                .panes
+                .values()
+                .filter(|p| p.selectable() && !p.borderless())
+                .count()
+                == 1;
         let viewport = *self.viewport.borrow();
         let no_ui_fullscreen_pane_id = if *self.fullscreen_covers_ui.borrow() {
             self.fullscreen_is_active
@@ -1366,7 +1369,10 @@ impl TiledPanes {
             .iter()
             .filter(|(_, p)| p.selectable() && !p.borderless())
             .count();
-        let omit_pane_title = self.pane_frame_style.draws_titles() && content_pane_count == 1;
+        // Fork addition: `top_only` keeps its rule even when the tab holds a single pane.
+        let omit_pane_title = self.pane_frame_style.draws_titles()
+            && !self.pane_frame_style.is_top_only()
+            && content_pane_count == 1;
         macro_rules! log_render_error {
             ($logged:expr, $failed:ident, $pane_id:expr, $err_context:expr, $result:expr) => {
                 if let Err(e) = $result {
@@ -1484,6 +1490,7 @@ impl TiledPanes {
                     pane_contents_and_ui.set_live_views(self.live_views.clone());
                 }
                 pane_contents_and_ui.set_blank_title(reserved_rows_for_pane > 0);
+                pane_contents_and_ui.set_top_only_frames(self.pane_frame_style.is_top_only());
                 for client_id in &connected_clients {
                     let client_mode = self
                         .mode_info

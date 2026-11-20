@@ -25,6 +25,31 @@ pub struct SessionLayoutMetadata {
     pub default_editor: Option<PathBuf>,
     tabs: Vec<TabLayoutMetadata>,
     session_attention_muted: bool,
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use zellij_utils::common_path::common_path_all;
+use zellij_utils::pane_size::{PaneGeom, Size};
+use zellij_utils::{
+    agent_detect::harness_for_command,
+    data::{
+        BorderStyleOverride, ClientInfo, ClientListEntry, LayoutMetadata, PaneMetadata, TabMetadata,
+    },
+    input::command::RunCommand,
+    input::layout::{Layout, Run, RunPlugin, RunPluginOrAlias},
+    input::options::StackListOrientation,
+    input::plugins::PluginAliases,
+    resurrect_command_hints::{
+        args_for_session, builtin_resume_args, is_resurrectable_agent, ResurrectCommandHints,
+    },
+    session_serialization::{
+        extract_command_and_args, extract_edit_and_line_number, extract_plugin_and_config,
+        GlobalLayoutManifest, PaneLayoutManifest, TabLayoutManifest,
+    },
+};
+
 #[derive(Default, Debug, Clone)]
 pub struct SessionLayoutMetadata {
     default_layout: Box<Layout>,
@@ -250,6 +275,36 @@ impl SessionLayoutMetadata {
 }
 
 impl SessionLayoutMetadata {
+    /// The tab names in the order they were added - which is the order a restored session gets
+    /// its tabs back in.
+    #[cfg(test)]
+    pub fn tab_names(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .map(|tab| tab.name.clone().unwrap_or_default())
+            .collect()
+    }
+    /// What the serialized layout would record for this terminal pane.
+    #[cfg(test)]
+    pub fn terminal_run(&self, terminal_id: u32) -> Option<&Run> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+            .find(|pane| pane.id == PaneId::Terminal(terminal_id))
+            .and_then(|pane| pane.run.as_ref())
+    }
+    /// Whether any terminal pane runs a harness this build knows: claude, codex, opencode or pi.
+    pub fn runs_a_known_agent(&self) -> bool {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+            .any(|pane| match (&pane.id, pane.run.as_ref()) {
+                (PaneId::Terminal(_), Some(Run::Command(run_command))) => {
+                    harness_for_command(&run_command.command.display().to_string()).is_some()
+                },
+                _ => false,
+            })
+    }
     pub fn add_tab(
         &mut self,
         name: String,
@@ -282,6 +337,20 @@ impl SessionLayoutMetadata {
             }
         }
         terminal_ids
+    }
+    /// The terminal panes whose own process is the command they were opened with - a command
+    /// pane or an editor - rather than a shell. Their children are the command's helpers, not jobs
+    /// a user started, so discovery must not mistake the newest of them for what the pane runs.
+    pub fn command_terminal_ids(&self) -> HashSet<u32> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+            .filter(|pane| matches!(pane.run, Some(Run::Command(_)) | Some(Run::EditFile(..))))
+            .filter_map(|pane| match pane.id {
+                PaneId::Terminal(id) => Some(id),
+                PaneId::Plugin(_) => None,
+            })
+            .collect()
     }
     pub fn all_plugin_ids(&self) -> Vec<u32> {
         let mut plugin_ids = vec![];
@@ -499,6 +568,169 @@ impl SessionLayoutMetadata {
             }
             for pane in tab.floating_panes.iter_mut() {
                 upgrade_pane(pane);
+            }
+        }
+    }
+    /// Appends resume arguments to the recorded command of any pane a `resurrect_command_hints`
+    /// entry applies to, so that the resurrected pane offers to resume the tool's session instead
+    /// of starting a new one.
+    ///
+    /// The recorded argv0 is kept, path and all. For a harness this build knows, the hint's words
+    /// replace the whole observed argv, so the pane holds only the bare resume; for any other
+    /// command the hint only appends to the observed argv. See `ResurrectCommandHint::args_for`.
+    ///
+    /// `read_env` is the seam over the platform: it is handed a terminal id and a variable name and
+    /// returns the value found in that pane's processes. Everything the hints decide is here;
+    /// everything about processes is on the other side of that closure.
+    ///
+    /// A pane is left exactly as it was whenever anything does not line up - no hint matches, the
+    /// variable is not set, the observed arguments already resume. There is no failure mode: a hint
+    /// that does not resolve gives the same snapshot the feature would have produced by not
+    /// existing.
+    pub fn apply_resurrect_command_hints<F>(
+        &mut self,
+        hints: &ResurrectCommandHints,
+        mut read_env: F,
+    ) where
+        F: FnMut(u32, &str) -> Option<String>,
+    {
+        if hints.is_empty() {
+            return;
+        }
+        for tab in self.tabs.iter_mut() {
+            for pane in tab
+                .tiled_panes
+                .iter_mut()
+                .chain(tab.floating_panes.iter_mut())
+            {
+                let PaneId::Terminal(terminal_id) = pane.id else {
+                    continue;
+                };
+                let Some(Run::Command(run_command)) = pane.run.as_ref() else {
+                    continue;
+                };
+                let Some(hint) = hints.hint_for(&run_command.command.display().to_string()) else {
+                    continue;
+                };
+                let Some(env_value) = read_env(terminal_id, &hint.env) else {
+                    continue;
+                };
+                let command = run_command.command.display().to_string();
+                let Some(args) = hint.args_for(&command, &run_command.args, &env_value) else {
+                    log::debug!(
+                        "resurrect_command_hints {:?}: resume_args {:?} add nothing to the observed \
+                         command of terminal {}",
+                        hint.name,
+                        hint.resume_args,
+                        terminal_id
+                    );
+                    continue;
+                };
+                let mut rewritten = run_command.clone();
+                rewritten.args = args;
+                log::debug!(
+                    "resurrect_command_hints {:?}: recording {:?} {:?} for terminal {}",
+                    hint.name,
+                    rewritten.command,
+                    rewritten.args,
+                    terminal_id
+                );
+                pane.run = Some(Run::Command(rewritten));
+            }
+        }
+    }
+    /// Records every agent pane with the bare resume of the session its agent process holds NOW,
+    /// in place of its whole observed argv: `claude --resume <id>`, `codex resume <id>`,
+    /// `opencode --session <id>`, `pi --session <id>`. Launch flags and a launch prompt are
+    /// dropped; a kept prompt is sent again as a new turn when Enter re-runs the pane.
+    ///
+    /// `live_session_id` is the seam over the platform: handed a terminal id, the harness kind and
+    /// the recorded command, it returns `Some(Some(id))` for the session the agent in that pane
+    /// holds, `Some(None)` when it looked and found none, and `None` when this pane is not to be
+    /// asked. It runs AFTER the hints, so the live session is the one that stays.
+    ///
+    /// A pane that was asked and has no session is recorded with the bare resume of the id its
+    /// arguments name, or with the agent's bare picker when they name none - never with a "newest
+    /// session" flag, whether the argv or a configured hint put it there.
+    pub fn pin_live_agent_sessions<F>(&mut self, mut live_session_id: F)
+    where
+        F: FnMut(u32, &str, &str) -> Option<Option<String>>,
+    {
+        for tab in self.tabs.iter_mut() {
+            for pane in tab
+                .tiled_panes
+                .iter_mut()
+                .chain(tab.floating_panes.iter_mut())
+            {
+                let PaneId::Terminal(terminal_id) = pane.id else {
+                    continue;
+                };
+                let Some(Run::Command(run_command)) = pane.run.as_mut() else {
+                    continue;
+                };
+                let command = run_command.command.display().to_string();
+                let Some(harness) = harness_for_command(&command) else {
+                    continue;
+                };
+                let Some(found) = live_session_id(terminal_id, harness.kind, &command) else {
+                    continue;
+                };
+                let Some(session_id) = found else {
+                    if let Some(args) = builtin_resume_args(&command, &run_command.args) {
+                        run_command.args = args;
+                    }
+                    continue;
+                };
+                let Some(args) = args_for_session(&command, &session_id) else {
+                    continue;
+                };
+                run_command.args = args;
+                log::debug!(
+                    "resurrect: terminal {} records {}'s live session {}",
+                    terminal_id,
+                    harness.kind,
+                    session_id
+                );
+            }
+        }
+    }
+    /// `resurrect_commands "agents"` or `"prefill"`: keeps the command of every pane running a
+    /// coding agent and drops
+    /// every other one, so a restored session offers to resume its agents and nothing else.
+    ///
+    /// An agent is a harness this build knows - `claude`, `codex`, `opencode`, `pi` - or a command
+    /// one of `hints` names. A known harness is recorded as its bare resume: the id its arguments
+    /// name, or its picker. A hinted command keeps its argv. Any other terminal pane loses its `run` and comes back as a
+    /// plain shell in its directory: a long-lived tool, an editor, and a short-lived process that
+    /// happened to be the newest child of an idle shell when the tick ran - a prompt being drawn,
+    /// a shell init step.
+    pub fn keep_only_agent_commands(&mut self, hints: Option<&ResurrectCommandHints>) {
+        for tab in self.tabs.iter_mut() {
+            for pane in tab
+                .tiled_panes
+                .iter_mut()
+                .chain(tab.floating_panes.iter_mut())
+            {
+                if !matches!(pane.id, PaneId::Terminal(_)) {
+                    continue;
+                }
+                match pane.run.as_mut() {
+                    Some(Run::Command(run_command)) => {
+                        let command = run_command.command.display().to_string();
+                        if !is_resurrectable_agent(&command, hints) {
+                            log::debug!(
+                                "resurrect_commands: {:?} is not an agent, recording a shell",
+                                command
+                            );
+                            pane.run = None;
+                        } else if let Some(args) = builtin_resume_args(&command, &run_command.args)
+                        {
+                            run_command.args = args;
+                        }
+                    },
+                    Some(Run::EditFile(..)) => pane.run = None,
+                    _ => {},
+                }
             }
         }
     }
@@ -834,16 +1066,6 @@ mod tests {
             None,
             None,
             Default::default(),
-        )
-    }
-
-    fn session_with_editor(editor: &str, panes: Vec<PaneLayoutMetadata>) -> SessionLayoutMetadata {
-        let mut meta = SessionLayoutMetadata::default();
-        meta.default_editor = Some(PathBuf::from(editor));
-        meta.add_tab("tab1".to_string(), true, false, panes, vec![]);
-        meta
-    }
-
             None,
             None,
         )
@@ -854,6 +1076,26 @@ mod tests {
         meta.default_editor = Some(PathBuf::from(editor));
         meta.add_tab("tab1".to_string(), true, false, panes, vec![]);
         meta
+    }
+
+    #[test]
+    fn command_and_editor_panes_run_their_own_command() {
+        let mut meta = SessionLayoutMetadata::default();
+        let mut editor = make_plain_pane(3);
+        editor.run = Some(Run::EditFile(PathBuf::from("file.txt"), None, None));
+        let floating_command = make_command_pane(4, "claude", vec![]);
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            false,
+            vec![
+                make_command_pane(1, "claude", vec![]),
+                make_plain_pane(2),
+                editor,
+            ],
+            vec![floating_command],
+        );
+        assert_eq!(meta.command_terminal_ids(), HashSet::from([1, 3, 4]));
     }
 
     fn get_first_tiled_run(meta: &SessionLayoutMetadata) -> Option<&Run> {
@@ -1016,6 +1258,208 @@ mod tests {
         );
     }
 
+    fn hints(entries: &[(&str, &str, &str)]) -> ResurrectCommandHints {
+        let mut hints = ResurrectCommandHints::default();
+        for (match_command, env, resume_args) in entries {
+            hints.push(
+                zellij_utils::resurrect_command_hints::ResurrectCommandHint {
+                    name: match_command.to_string(),
+                    match_command: match_command.to_string(),
+                    env: env.to_string(),
+                    resume_args: resume_args.to_string(),
+                },
+            );
+        }
+        hints
+    }
+
+    fn session_with_panes(panes: Vec<PaneLayoutMetadata>) -> SessionLayoutMetadata {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, panes, vec![]);
+        meta
+    }
+
+    /// The env-reading seam every test below stands in for: a fixed answer, so that what is
+    /// exercised is the decision and not the platform.
+    fn env_always(value: Option<&str>) -> impl FnMut(u32, &str) -> Option<String> {
+        let value = value.map(|v| v.to_string());
+        move |_terminal_id, _var| value.clone()
+    }
+
+    #[test]
+    fn appends_resume_args_when_the_variable_is_found() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec![])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            env_always(Some("abc-123")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("claude"));
+                assert_eq!(rc.args, vec!["--continue".to_owned()]);
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    /// A hint used to REPLACE the command line, so the recorded command lost its path. The path
+    /// is kept. For a tool this build has no session words for, so is every observed argument:
+    /// the observed argv plus the resume flag, and nothing else.
+    #[test]
+    fn keeps_the_observed_path_and_an_unknown_tools_arguments() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "/opt/homebrew/bin/claude", vec!["--model", "opus"]),
+            make_command_pane(2, "/opt/bin/aider", vec!["--model", "opus"]),
+        ]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[
+                ("claude", "CLAUDE_CODE_SESSION_ID", "--continue"),
+                ("aider", "AIDER_ID", "--restore-chat-history"),
+            ]),
+            env_always(Some("abc-123")),
+        );
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "/opt/homebrew/bin/claude".to_owned(),
+                owned(&["--continue"])
+            ))
+        );
+        assert_eq!(
+            command_line(&meta, 1),
+            Some((
+                "/opt/bin/aider".to_owned(),
+                owned(&["--model", "opus", "--restore-chat-history"])
+            ))
+        );
+    }
+
+    /// A pane of a tool this build has no session words for, that already ran the hint's resume
+    /// flag, is recorded exactly as it ran. The environment value is a detector here, and must
+    /// not become a second, contradictory resume argument.
+    #[test]
+    fn observed_arguments_that_already_resume_are_left_alone() {
+        let mut meta = session_with_panes(vec![make_command_pane(
+            1,
+            "aider",
+            vec!["--model", "opus", "--restore-chat-history"],
+        )]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("aider", "AIDER_ID", "--restore-chat-history")]),
+            env_always(Some("an-internal-session-id")),
+        );
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "aider".to_owned(),
+                owned(&["--model", "opus", "--restore-chat-history"])
+            ))
+        );
+    }
+
+    #[test]
+    fn leaves_the_command_alone_when_the_variable_is_missing() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["--verbose"])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            env_always(None),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("claude"));
+                assert_eq!(rc.args, vec!["--verbose".to_owned()]);
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leaves_an_unmatched_command_alone_and_never_reads_its_environment() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "htop", vec![])]);
+        let mut reads = 0;
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            |_terminal_id, _var| {
+                reads += 1;
+                Some("abc-123".to_owned())
+            },
+        );
+        assert_eq!(reads, 0, "an unmatched pane must cost no process lookup");
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => assert_eq!(rc.command, PathBuf::from("htop")),
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expands_a_placeholder_that_sits_in_an_argument() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "opencode", vec![])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("opencode", "OPENCODE_SESSION_ID", "--session={} --continue")]),
+            env_always(Some("xyz")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("opencode"));
+                assert_eq!(
+                    rc.args,
+                    vec!["--session=xyz".to_owned(), "--continue".to_owned()]
+                );
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_hints_configured_changes_nothing() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec![])]);
+        meta.apply_resurrect_command_hints(
+            &ResurrectCommandHints::default(),
+            env_always(Some("abc-123")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("claude"));
+                assert!(rc.args.is_empty());
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_pane_running_no_command_is_untouched() {
+        let mut pane = make_command_pane(1, "claude", vec![]);
+        pane.run = None;
+        let mut meta = session_with_panes(vec![pane]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            env_always(Some("abc-123")),
+        );
+        assert_eq!(get_first_tiled_run(&meta), None);
+    }
+
+    #[test]
+    fn floating_panes_get_resume_args_too() {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            false,
+            vec![],
+            vec![make_command_pane(1, "claude", vec![])],
+        );
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            env_always(Some("abc-123")),
+        );
+        match meta.tabs[0].floating_panes[0].run.as_ref() {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.args, vec!["--continue".to_owned()])
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
     #[test]
     fn absolute_file_path_preserved() {
         let pane = make_command_pane(1, "nvim", vec!["/home/user/file.txt"]);
@@ -1030,6 +1474,32 @@ mod tests {
             ))
         );
     }
+
+    fn make_focused_pane(id: PaneId, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {
+        PaneLayoutMetadata::new(
+            id,
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            !focused_clients.is_empty(),
+            None,
+            focused_clients,
+            None,
+            None,
+            Default::default(),
+            None,
+            None,
+        )
+    }
+
+    fn focused_pane_ids(meta: &SessionLayoutMetadata) -> Vec<(ClientId, PaneId)> {
+        meta.all_clients_metadata()
+            .into_iter()
+            .map(|(client_id, client_metadata)| (client_id, client_metadata.get_pane_id()))
+            .collect()
+    }
+
     #[test]
     fn a_panes_handle_reaches_the_serialized_layout() {
         // the wiring the snapshot rests on: what `Pane::pane_handle` reports at save time is what
@@ -1051,6 +1521,59 @@ mod tests {
         );
         let manifest: PaneLayoutManifest = pane.into();
         assert_eq!(manifest.pane_handle.as_deref(), Some("sunny-otter"));
+    }
+
+    #[test]
+    fn client_list_covers_both_pane_layers() {
+        // client 2 is focused on a tiled pane while the tab shows floating panes: floating
+        // visibility is per tab, focus is per client, so this is not a contradiction
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+        assert_eq!(
+            focused_pane_ids(&meta),
+            vec![(1, PaneId::Plugin(3)), (2, PaneId::Terminal(1))]
+        );
+    }
+
+    #[test]
+    fn client_list_describes_a_client_by_the_layer_it_sees() {
+        // the same client is remembered by both layers - only the one on screen is where it is
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![1]);
+        let floating = make_focused_pane(PaneId::Terminal(2), vec![1]);
+
+        let mut floating_shown = SessionLayoutMetadata::default();
+        floating_shown.add_tab(
+            "tab1".to_string(),
+            true,
+            false,
+            vec![tiled.clone()],
+            vec![floating.clone()],
+        );
+        assert_eq!(
+            focused_pane_ids(&floating_shown),
+            vec![(1, PaneId::Terminal(2))]
+        );
+
+        let mut floating_hidden = SessionLayoutMetadata::default();
+        floating_hidden.add_tab("tab1".to_string(), true, true, vec![tiled], vec![floating]);
+        assert_eq!(
+            focused_pane_ids(&floating_hidden),
+            vec![(1, PaneId::Terminal(1))]
+        );
+    }
+
+    #[test]
+    fn rendered_client_list_names_every_client() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+        let rendered = meta.list_clients_metadata(2);
+        assert_eq!(rendered.lines().count(), 3, "a header and two clients");
+        assert!(rendered.contains("plugin_3"), "{}", rendered);
+        assert!(rendered.contains("terminal_1"), "{}", rendered);
     }
 
     #[test]
@@ -1127,6 +1650,18 @@ mod tests {
         assert_eq!(meta.list_clients_metadata_json(1), "[]");
     }
 
+    #[test]
+    fn removing_a_plugin_takes_the_clients_focused_on_it() {
+        // why the client list must not drop the plugin that asked for it: the pane it would drop
+        // is the pane its clients are looking at
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1, 2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![], vec![floating]);
+        assert_eq!(meta.all_clients_metadata().len(), 2);
+        meta.remove_plugin_from_layout(3);
+        assert!(meta.all_clients_metadata().is_empty());
+    }
+
     fn pane_focused_by(terminal_id: u32, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {
         PaneLayoutMetadata::new(
             PaneId::Terminal(terminal_id),
@@ -1194,4 +1729,254 @@ mod tests {
         assert_eq!(clients.get(&1).and_then(|c| c.terminal_size()), None);
     }
 
+    fn command_line(meta: &SessionLayoutMetadata, index: usize) -> Option<(String, Vec<String>)> {
+        match meta.tabs[0].tiled_panes[index].run.as_ref() {
+            Some(Run::Command(rc)) => Some((rc.command.display().to_string(), rc.args.clone())),
+            _ => None,
+        }
+    }
+
+    fn owned(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// The operator's report: a restored pane offered `starship` and `brew`. With the switch on,
+    /// a pane that is not an agent comes back with no command at all.
+    #[test]
+    fn only_agents_survive_and_the_rest_become_shells() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "claude", vec!["--dangerously-skip-permissions"]),
+            make_command_pane(2, "starship", vec!["prompt"]),
+            make_command_pane(3, "/home/linuxbrew/.linuxbrew/bin/brew", vec!["shellenv"]),
+            make_command_pane(4, "/opt/bin/codex", vec!["-m", "o3"]),
+            make_command_pane(5, "htop", vec![]),
+        ]);
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume"])))
+        );
+        assert_eq!(command_line(&meta, 1), None);
+        assert_eq!(command_line(&meta, 2), None);
+        assert_eq!(
+            command_line(&meta, 3),
+            Some(("/opt/bin/codex".to_owned(), owned(&["resume"])))
+        );
+        assert_eq!(command_line(&meta, 4), None);
+    }
+
+    /// The operator's report of 2026-10-06: several panes in one directory all resumed the same
+    /// session, because each was recorded with the agent's "newest session" flag. Each agent pane
+    /// is recorded with the session its own process holds, in that agent's own form.
+    #[test]
+    fn every_agent_pane_records_its_own_session_in_its_own_form() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(
+                1,
+                "claude",
+                vec!["--dangerously-skip-permissions", "--resume"],
+            ),
+            make_command_pane(2, "/opt/bin/codex", vec!["-m", "o3"]),
+            make_command_pane(3, "opencode", vec!["--continue"]),
+            make_command_pane(4, "pi", vec![]),
+            make_command_pane(5, "htop", vec![]),
+        ]);
+        let mut asked = Vec::new();
+        meta.pin_live_agent_sessions(|terminal_id, kind, _command| {
+            asked.push(kind.to_owned());
+            Some(Some(format!("{}-{}", kind, terminal_id)))
+        });
+        meta.keep_only_agent_commands(None);
+        assert_eq!(asked, owned(&["claude", "codex", "opencode", "pi"]));
+        assert_eq!(
+            command_line(&meta, 0).unwrap().1,
+            owned(&["--resume", "claude-1"])
+        );
+        assert_eq!(
+            command_line(&meta, 1),
+            Some(("/opt/bin/codex".to_owned(), owned(&["resume", "codex-2"])))
+        );
+        assert_eq!(
+            command_line(&meta, 2).unwrap().1,
+            owned(&["--session", "opencode-3"])
+        );
+        assert_eq!(
+            command_line(&meta, 3).unwrap().1,
+            owned(&["--session", "pi-4"])
+        );
+        assert_eq!(command_line(&meta, 4), None);
+    }
+
+    /// With no session found, no agent pane is recorded with a "newest session" flag: it gets
+    /// its bare picker, or the bare resume of the id its own argv named.
+    #[test]
+    fn with_no_session_found_no_agent_is_recorded_resuming_its_newest_session() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "claude", vec!["--dangerously-skip-permissions"]),
+            make_command_pane(2, "codex", vec![]),
+            make_command_pane(3, "opencode", vec![]),
+            make_command_pane(4, "pi", vec![]),
+            make_command_pane(5, "pi", vec!["--thinking", "high", "--session", "argv-id"]),
+        ]);
+        meta.pin_live_agent_sessions(|_, _, _| Some(None));
+        meta.keep_only_agent_commands(None);
+        assert_eq!(command_line(&meta, 0).unwrap().1, owned(&["--resume"]));
+        assert_eq!(command_line(&meta, 1).unwrap().1, owned(&["resume"]));
+        assert_eq!(command_line(&meta, 2).unwrap().1, Vec::<String>::new());
+        assert_eq!(command_line(&meta, 3).unwrap().1, owned(&["--resume"]));
+        assert_eq!(
+            command_line(&meta, 4).unwrap().1,
+            owned(&["--session", "argv-id"])
+        );
+    }
+
+    /// The flightdeck pane of 2026-10-11: launch flags and a positional launch prompt. It came back
+    /// holding the prompt, and Enter would have resumed AND sent the brief again as a new turn.
+    /// Every path records only the bare resume.
+    #[test]
+    fn a_launch_prompt_never_reaches_the_restored_pane() {
+        let launched = vec![
+            "--model",
+            "opus",
+            "--dangerously-skip-permissions",
+            "Read X and do it.",
+        ];
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "/usr/local/bin/claude", launched.clone()),
+            make_command_pane(2, "claude", launched.clone()),
+            make_command_pane(3, "claude", launched.clone()),
+        ]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            |terminal_id, _var| (terminal_id == 3).then(|| "hinted".to_owned()),
+        );
+        meta.pin_live_agent_sessions(|terminal_id, _, _| match terminal_id {
+            1 => Some(Some("live".to_owned())),
+            2 => Some(None),
+            _ => None,
+        });
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "/usr/local/bin/claude".to_owned(),
+                owned(&["--resume", "live"])
+            ))
+        );
+        assert_eq!(
+            command_line(&meta, 1),
+            Some(("claude".to_owned(), owned(&["--resume"])))
+        );
+        assert_eq!(
+            command_line(&meta, 2),
+            Some(("claude".to_owned(), owned(&["--resume", "hinted"])))
+        );
+    }
+
+    #[test]
+    fn a_hinted_command_is_an_agent_too() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "aider", vec![])]);
+        let hints = hints(&[("aider", "AIDER_ID", "--restore-chat-history")]);
+        meta.keep_only_agent_commands(Some(&hints));
+        assert_eq!(command_line(&meta, 0), Some(("aider".to_owned(), vec![])));
+    }
+
+    #[test]
+    fn an_editor_pane_becomes_a_shell_when_only_agents_survive() {
+        let mut meta = session_with_editor("nvim", vec![make_command_pane(1, "nvim", vec!["f"])]);
+        meta.detect_editor_panes();
+        meta.keep_only_agent_commands(None);
+        assert_eq!(get_first_tiled_run(&meta), None);
+    }
+
+    /// The operator's other report: the hint offered the FIRST session the pane's claude ran.
+    /// The live record names the current one, and it replaces whatever the argv said.
+    #[test]
+    fn a_claude_pane_records_its_live_session() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "claude", vec!["--resume", "first"]),
+            make_command_pane(2, "htop", vec![]),
+        ]);
+        meta.pin_live_agent_sessions(|_, _, _| Some(Some("live".to_owned())));
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume", "live"])))
+        );
+        assert_eq!(command_line(&meta, 1), Some(("htop".to_owned(), vec![])));
+    }
+
+    /// The order the pty thread runs them in: hints, then the live session, then the filter. The
+    /// live session replaces the id the hint read from a stale environment.
+    #[test]
+    fn the_live_session_replaces_the_hints_stale_id() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["--continue"])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            env_always(Some("first")),
+        );
+        meta.pin_live_agent_sessions(|_, _, _| Some(Some("live".to_owned())));
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume", "live"])))
+        );
+    }
+
+    #[test]
+    fn a_pane_not_asked_about_is_left_alone() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["-c"])]);
+        meta.pin_live_agent_sessions(|_, _, _| None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["-c"])))
+        );
+    }
+
+    /// The operator's third report: `claude --dangerously-skip-permissions --continue --resume
+    /// <id>`. A hint for a known agent replaces the whole argv with its own words instead of
+    /// stacking a second session on it.
+    #[test]
+    fn a_hint_replaces_the_session_the_argv_picked() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(
+                1,
+                "claude",
+                vec!["--dangerously-skip-permissions", "--continue"],
+            ),
+            make_command_pane(2, "claude", vec!["--resume", "old-id", "--model", "opus"]),
+        ]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            env_always(Some("new-id")),
+        );
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume", "new-id"])))
+        );
+        assert_eq!(
+            command_line(&meta, 1),
+            Some(("claude".to_owned(), owned(&["--resume", "new-id"])))
+        );
+    }
+
+    /// A pane restored once carries its old `--resume <id>` into the next restart. Recording it
+    /// again must leave exactly one resume, naming the live session.
+    #[test]
+    fn a_second_restart_keeps_one_resume() {
+        let mut meta = session_with_panes(vec![make_command_pane(
+            1,
+            "claude",
+            vec!["--dangerously-skip-permissions", "--resume", "first"],
+        )]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            env_always(Some("first")),
+        );
+        meta.pin_live_agent_sessions(|_, _, _| Some(Some("second".to_owned())));
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume", "second"])))
+        );
+    }
 }

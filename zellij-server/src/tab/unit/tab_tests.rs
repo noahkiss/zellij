@@ -21751,6 +21751,254 @@ pub fn making_a_pane_tiled_by_pane_id_hides_floating_panes_and_focuses_it() {
     assert!(!tab.are_floating_panes_visible());
     assert_eq!(tab.get_active_pane_id(client_id), Some(new_pane_id));
 }
+
+fn drain_visible_events(
+    plugin_receiver: &Receiver<(PluginInstruction, ErrorContext)>,
+) -> Vec<(Option<u32>, bool)> {
+    let mut visible_events = vec![];
+    while let Ok((instruction, _)) = plugin_receiver.try_recv() {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _client_id, event) in updates {
+                if let Event::Visible(is_visible) = event {
+                    visible_events.push((pid, is_visible));
+                }
+            }
+        }
+    }
+    visible_events
+}
+
+#[test]
+fn floating_surface_toggles_in_a_hidden_tab_do_not_notify_plugins() {
+    let (mut tab, plugin_receiver) = tab_with_floating_plugin_pane(1);
+    tab.visible(false).unwrap();
+    drain_visible_events(&plugin_receiver);
+
+    tab.hide_floating_panes();
+    tab.show_floating_panes();
+
+    assert!(
+        drain_visible_events(&plugin_receiver).is_empty(),
+        "a plugin in a hidden tab should not be told it became visible because the floating surface was toggled"
+    );
+}
+
+// fork additions: a command a session resurrection brought back does not wait to be dismissed when
+// it exits cleanly - it takes the same "drop to shell" path ESC offers on a held pane. A failure
+// still holds, and a layout command pane is untouched.
+
+fn tab_with_pty_receiver(stacked_resize: bool) -> (Tab, Receiver<(PtyInstruction, ErrorContext)>) {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, stacked_resize);
+    let (to_pty, pty_receiver): ChannelWithContext<PtyInstruction> = unbounded();
+    tab.senders.replace_to_pty(SenderWithContext::new(to_pty));
+    (tab, pty_receiver)
+}
+
+fn held_run_command(resurrected: bool) -> RunCommand {
+    let mut run_command = RunCommand::new(PathBuf::from("codex"));
+    run_command.args = vec!["resume".to_owned()];
+    run_command.cwd = Some(PathBuf::from("/tmp/a-working-dir"));
+    run_command.hold_on_close = true;
+    run_command.resurrected = resurrected;
+    run_command
+}
+
+#[test]
+fn a_resurrected_command_pane_drops_to_the_shell_when_its_command_exits_cleanly() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(true));
+
+    assert!(
+        !tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a resurrected command pane should not stay held after a clean exit"
+    );
+    let (instruction, _err_ctx) = pty_receiver
+        .try_recv()
+        .expect("expected the pane to be dropped to the shell");
+    match instruction {
+        PtyInstruction::DropToShellInPane {
+            pane_id,
+            shell,
+            working_dir,
+            ..
+        } => {
+            assert_eq!(pane_id, PaneId::Terminal(1));
+            assert_eq!(shell, Some(PathBuf::from("my_default_shell")));
+            assert_eq!(working_dir, Some(PathBuf::from("/tmp/a-working-dir")));
+        },
+        other => panic!("expected DropToShellInPane, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_resurrected_command_pane_still_holds_when_its_command_fails() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+
+    tab.hold_pane(PaneId::Terminal(1), Some(1), false, held_run_command(true));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a failure must stay on screen, so a non-zero exit still holds"
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a failing resurrected command pane should not be dropped to the shell"
+    );
+}
+
+#[test]
+fn a_layout_command_pane_still_holds_when_its_command_exits_cleanly() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a layout command pane keeps its hold and its ENTER-to-re-run banner"
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a layout command pane should not be dropped to the shell"
+    );
+}
+
+// fork additions: `command_pane_on_clean_exit "shell"` extends that same drop to every command
+// pane, however it was started. A failure still holds, the default `"hold"` keeps the upstream
+// behaviour, and a suppressed pane is never dropped.
+
+#[test]
+fn a_command_pane_drops_to_the_shell_on_a_clean_exit_under_shell() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert!(
+        !tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a command pane should not stay held after a clean exit under \"shell\""
+    );
+    let (instruction, _err_ctx) = pty_receiver
+        .try_recv()
+        .expect("expected the pane to be dropped to the shell");
+    match instruction {
+        PtyInstruction::DropToShellInPane {
+            pane_id,
+            shell,
+            working_dir,
+            ..
+        } => {
+            assert_eq!(pane_id, PaneId::Terminal(1));
+            assert_eq!(shell, Some(PathBuf::from("my_default_shell")));
+            assert_eq!(working_dir, Some(PathBuf::from("/tmp/a-working-dir")));
+        },
+        other => panic!("expected DropToShellInPane, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_command_pane_still_holds_when_its_command_fails_under_shell() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(7), false, held_run_command(false));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a failure must stay on screen, so a non-zero exit still holds under \"shell\""
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a failing command pane should not be dropped to the shell"
+    );
+}
+
+#[test]
+fn a_command_pane_still_holds_on_a_clean_exit_under_hold() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Hold;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "the default \"hold\" keeps the upstream hold and its ENTER-to-re-run banner"
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a command pane under \"hold\" should not be dropped to the shell"
+    );
+}
+
+#[test]
+fn a_suppressed_pane_is_never_dropped_to_the_shell() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+    tab.vertical_split(PaneId::Terminal(2), None, 1, None, None)
+        .unwrap();
+    // pane 2 is now the scrollback editor's replaced pane, reachable by id but not on screen
+    tab.replace_active_pane_with_editor_pane(PaneId::Terminal(3), 1)
+        .unwrap();
+    assert_eq!(
+        tab.suppressed_panes
+            .get(&PaneId::Terminal(3))
+            .unwrap()
+            .1
+            .pid(),
+        PaneId::Terminal(2),
+        "pane 2 should be suppressed behind the editor pane"
+    );
+
+    tab.hold_pane(PaneId::Terminal(2), Some(0), false, held_run_command(true));
+
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a suppressed pane must keep its hold, so the pane it stands in for is restored"
+    );
+}
+
+// fork addition: what a dropped pane says it is running. `terminal_command` in `list-panes --json`
+// reads `invoked_with`, and until the drop updated it a pane that had fallen back to the shell
+// still named the command that exited.
+
+#[test]
+fn a_pane_dropped_to_the_shell_stops_naming_the_command_that_exited() {
+    let (mut tab, _pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert_eq!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .invoked_with(),
+        &None,
+        "a pane that dropped to the shell is an ordinary shell pane, and reports no command"
+    );
+}
+
+#[test]
+fn a_pane_that_still_holds_still_names_its_command() {
+    let (mut tab, _pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Hold;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert_eq!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .invoked_with(),
+        &Some(zellij_utils::input::layout::Run::Command(held_run_command(
+            false
+        ))),
+        "a held pane can be re-run with ENTER, so its command is still what it is running"
+    );
+}
+
 // fork addition: a pane stacked without focus - an agent's `new-pane --stacked --near-current-pane`
 // - collapsed the pane the person was focused on and left it active: hidden, highlighted, and deaf
 // to a click. The focused pane stays expanded, and the newcomer waits collapsed behind it. Each

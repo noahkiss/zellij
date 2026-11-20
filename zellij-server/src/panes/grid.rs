@@ -4336,6 +4336,20 @@ impl Grid {
         None
     }
 
+    /// fork addition: the command line `resurrect_commands "prefill"` typed at this restored
+    /// shell's prompt, for as long as nobody has touched it since.
+    ///
+    /// Set once the paste is written, not while it waits for the line editor. Any input that
+    /// reaches the pane clears it - see [`Grid::note_typed_input`] - and so does a command start
+    /// (`OSC 133;C`), which is the line having run.
+    pub fn prefilled_command(&self) -> Option<&str> {
+        self.prefilled_command.as_deref()
+    }
+
+    pub fn set_prefilled_command(&mut self, command: Option<String>) {
+        self.prefilled_command = command;
+    }
+
     #[cfg(test)]
     pub fn osc133_end_exit_codes(&self) -> Vec<Option<i32>> {
         let first_line = -(self.lines_above.len() as isize);

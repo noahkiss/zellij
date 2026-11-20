@@ -176,6 +176,34 @@ impl FromStr for InputWhileScrolled {
     }
 }
 
+/// What happens to a command pane when its command exits with status 0.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+pub enum CommandPaneOnCleanExit {
+    /// The pane holds, showing EXIT CODE: 0 and waiting for ENTER, ESC or Ctrl-C.
+    #[serde(alias = "hold")]
+    Hold,
+    /// The pane drops to a shell, exactly as an ESC press does.
+    #[serde(alias = "shell")]
+    Shell,
+}
+
+impl Default for CommandPaneOnCleanExit {
+    fn default() -> Self {
+        Self::Hold
+    }
+}
+
+impl FromStr for CommandPaneOnCleanExit {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Hold" | "hold" => Ok(Self::Hold),
+            "Shell" | "shell" => Ok(Self::Shell),
+            _ => Err(format!("No such command_pane_on_clean_exit: {}", s)),
+        }
+    }
+}
+
 impl Default for OnForceClose {
     fn default() -> Self {
         Self::Detach
@@ -485,6 +513,26 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub session_aliases: Option<BTreeMap<String, String>>,
+
+    /// How to record the command of a pane running a tool that keeps its own session state, so
+    /// that a resurrected pane offers to RESUME that state instead of starting over. A hint names
+    /// a command, an environment variable the tool exports, and what to record when the variable
+    /// is found in the pane's processes. Unset means record every command as it is - which is what
+    /// zellij has always done, and what a pane whose hint does not apply still gets.
+    /// config.kdl only - it is read by the server when it serializes a session.
+    #[clap(skip)]
+    #[serde(default)]
+    pub resurrect_command_hints: Option<ResurrectCommandHints>,
+
+    /// Which recorded commands a restored session offers, and how: "all" (default) offers every
+    /// command as a pane waiting to run; "agents" offers only coding agents - `claude`, `codex`,
+    /// `opencode`, `pi`, or a command a `resurrect_command_hints` entry names - with how to resume
+    /// them; "prefill" offers the same agents as a shell with the resume command typed at the
+    /// prompt, not run. In "agents" and "prefill" every other pane comes back as a plain shell.
+    /// config.kdl only - it is read by the server when it serializes and restores a session.
+    #[clap(skip)]
+    #[serde(default)]
+    pub resurrect_commands: Option<ResurrectCommands>,
 
     /// The size floating panes get when nothing asks for a specific one.
     /// config.kdl only - it is a nested block, which no CLI flag can express.
@@ -1015,6 +1063,10 @@ impl Options {
         let mode_hints_when_bars_hidden = other
             .mode_hints_when_bars_hidden
             .or(self.mode_hints_when_bars_hidden);
+        let input_while_scrolled = other.input_while_scrolled.or(self.input_while_scrolled);
+        let command_pane_on_clean_exit = other
+            .command_pane_on_clean_exit
+            .or(self.command_pane_on_clean_exit);
 
         Options {
             stacked_pane_list_orientation,
@@ -1277,6 +1329,10 @@ impl Options {
             other.mode_hints_when_bars_hidden,
             self.mode_hints_when_bars_hidden,
         );
+        let input_while_scrolled = other.input_while_scrolled.or(self.input_while_scrolled);
+        let command_pane_on_clean_exit = other
+            .command_pane_on_clean_exit
+            .or(self.command_pane_on_clean_exit);
 
         Options {
             stacked_pane_list_orientation,

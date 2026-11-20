@@ -214,6 +214,8 @@ impl Display for ContextType {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ScreenContext {
     HandlePtyBytes,
+    PrefillPane,
+    UpdatePaneProcessInfo,
     PluginBytes,
     Render,
     RenderToClients,
@@ -570,6 +572,7 @@ pub enum ScreenContext {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PtyContext {
     SpawnTerminal,
+    SpawnReopenedTerminal,
     OpenInPlaceEditor,
     SpawnTerminalVertically,
     SpawnTerminalHorizontally,

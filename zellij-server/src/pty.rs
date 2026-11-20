@@ -8,15 +8,19 @@ use crate::terminal_bytes::TerminalBytes;
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
+    resurrect_hints::{claude_sessions_dir, open_files_of, process_env, LiveSession, ProcessTree},
     screen::{ScreenInstruction, TabOverrideResult},
     session_layout_metadata::SessionLayoutMetadata,
     thread_bus::{Bus, ThreadSenders},
     ClientId, ServerInstruction,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+};
 use tokio::task::JoinHandle;
+use zellij_utils::agent_detect::{self, AgentHarness};
 use zellij_utils::{
     data::{
         CommandOrPlugin, Event, FloatingPaneCoordinates, GetPaneCwdResponse, GetPanePidResponse,
@@ -33,6 +37,10 @@ use zellij_utils::{
         },
     },
     pane_size::Size,
+    resurrect_command_hints::{
+        builtin_resume_args, command_line_for_prompt, is_resurrectable_agent,
+        ResurrectCommandHints, ResurrectCommands,
+    },
     session_serialization,
 };
 
@@ -74,6 +82,18 @@ pub enum PtyInstruction {
         Option<PaneId>,
     ), // bool (if Some) is
     // should_float, String is an optional pane name
+    /// fork addition: `reopen-pane`'s shell, in the closed pane's directory, with the line to
+    /// type at its prompt and the handle it takes back. Both are handed to the screen before the
+    /// pane is, so neither can arrive after the pane is reported or its shell is reading.
+    SpawnReopenedTerminal {
+        default_shell: Option<TerminalAction>,
+        cwd: Option<PathBuf>,
+        placement: NewPanePlacement,
+        client_or_tab_index: ClientTabIndexOrPaneId,
+        completion_tx: Option<NotificationEnd>,
+        prefill: Option<String>,
+        handle: String,
+    },
     OpenInPlaceEditor(
         PathBuf,
         Option<usize>,
@@ -213,6 +233,19 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::ClosePaneThatWasNotCreated(..) => {
                 PtyContext::ClosePaneThatWasNotCreated
             },
+impl From<&PtyInstruction> for PtyContext {
+    fn from(pty_instruction: &PtyInstruction) -> Self {
+        match *pty_instruction {
+            PtyInstruction::SpawnTerminal(..) => PtyContext::SpawnTerminal,
+            PtyInstruction::SpawnReopenedTerminal { .. } => PtyContext::SpawnReopenedTerminal,
+            PtyInstruction::OpenInPlaceEditor(..) => PtyContext::OpenInPlaceEditor,
+            PtyInstruction::UpdateActivePane(..) => PtyContext::UpdateActivePane,
+            PtyInstruction::GoToTab(..) => PtyContext::GoToTab,
+            PtyInstruction::ClosePane(..) => PtyContext::ClosePane,
+            PtyInstruction::ClosePaneThatWasNotCreated(..) => {
+                PtyContext::ClosePaneThatWasNotCreated
+            },
+            PtyInstruction::ChildProcessExited(..) => PtyContext::ChildProcessExited,
             PtyInstruction::CloseTab(_) => PtyContext::CloseTab,
             PtyInstruction::NewTab(..) => PtyContext::NewTab,
             PtyInstruction::OverrideLayout(..) => PtyContext::OverrideLayout,
@@ -239,6 +272,33 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::SetResurrectCommand { .. } => PtyContext::SetResurrectCommand,
             PtyInstruction::PromptReturned(..) => PtyContext::PromptReturned,
             PtyInstruction::Exit => PtyContext::Exit,
+        }
+    }
+}
+
+/// What a held pane keeps of the agent it ran, once its process has exited.
+///
+/// The pid goes, because the OS may hand it to another process; the session the agent held does
+/// not. Without this a held agent pane would serialize with its picker and lose the session it
+/// was on. Frozen by `Pty::forget_child_pid`, dropped when the pane re-runs or closes.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct HeldPane {
+    /// The session id last resolved for the pane's agent while it ran: its `OSC 1337` report, or
+    /// the id its own record, open file or identity variable gave the last tick.
+    agent_session_id: Option<String>,
+    /// The agent half of the pane's last [`PaneProcessInfo`], as it was.
+    agent_env: BTreeMap<String, String>,
+    agent_session_source: Option<String>,
+    osc_agent_session: Option<String>,
+}
+
+impl HeldPane {
+    /// Where `agent_session_id` came from, in `session_source`'s words.
+    fn session_source(&self) -> &str {
+        if self.osc_agent_session.is_some() {
+            "osc"
+        } else {
+            self.agent_session_source.as_deref().unwrap_or("env")
         }
     }
 }
@@ -284,6 +344,33 @@ pub(crate) struct Pty {
     default_editor: Option<PathBuf>,
     post_command_discovery_hook: Option<String>,
     pane_env: PaneEnv,
+    resurrect_command_hints: Option<ResurrectCommandHints>,
+    /// `resurrect_commands`: which recorded commands a serialized session keeps, and how a
+    /// restored agent pane offers its command.
+    /// fork: renamed from `resurrect_commands`, which upstream's per-pane override map now holds
+    resurrect_mode: ResurrectCommands,
+    /// terminal_id -> command line, set aside by `prefill_for_resurrected` until the layout that
+    /// opens those panes has reached the screen
+    pending_prefills: Vec<(u32, String)>,
+    /// Whether to work out which panes run a coding agent at all. `detect_agents`, default true.
+    detect_agents: bool,
+    pub pane_frame_agent_name: bool,
+    last_reported_pane_frame_agent_name: Option<bool>,
+    /// terminal_id -> the harness session-id variables last found in that pane's processes. Only
+    /// panes whose command matched a harness appear here.
+    terminal_agent_envs: HashMap<u32, BTreeMap<String, String>>,
+    /// terminal_id -> when that pane was last walked for an identity, and what came of it. This is
+    /// what keeps the walk off the tick for a pane whose answer is already known.
+    agent_env_probes: HashMap<u32, AgentEnvProbe>,
+    agent_record_cache: HashMap<u32, AgentRecordCache>,
+    /// terminal_id -> the session the pane's agent reported itself with `OSC 1337`.
+    osc_agent_sessions: HashMap<u32, OscAgentSession>,
+    /// terminal_id -> what a held pane kept of its agent when its pid was forgotten. See
+    /// [`HeldPane`].
+    held_panes: HashMap<u32, HeldPane>,
+    /// terminal_id -> why the last serialization found no session id for that agent pane. Kept so
+    /// the reason is logged when it changes, not every serialization.
+    resume_misses: HashMap<u32, String>,
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -293,6 +380,35 @@ pub(crate) struct Pty {
     terminals_with_prompt_markers: HashSet<u32>,
     terminals_with_shell_cwd: HashSet<u32>,
     resurrect_commands: HashMap<u32, ResurrectCommand>,
+    /// The terminal panes whose own process is the command they were opened with - a command
+    /// pane or an editor - rather than a shell. Discovery asks these about their own process, not
+    /// about the newest of their children, which are the command's helpers.
+    command_terminal_ids: HashSet<u32>,
+    /// The `detect_agents` value last sent to Screen, so a config flip reaches it even on a
+    /// session whose process info has not changed. `None` until the first report.
+    last_reported_detect_agents: Option<bool>,
+    /// The last map `report_pane_process_info` sent, so an unchanged tick sends nothing.
+    last_reported_process_info: HashMap<u32, PaneProcessInfo>,
+    /// Whether the next serialization tick must write the resurrection cache even though the
+    /// session is clean.
+    ///
+    /// A clean session does not write, so without this the cache on disk keeps whatever the last
+    /// dirty tick put there. A session that opens a pane and closes it again is clean and
+    /// diverged at once, and the next resurrection hands back the pane that was closed. Writing
+    /// once on the dirty -> clean transition makes the cache match the shape the session returned
+    /// to.
+    ///
+    /// It starts `true` for the same reason: a session that never diverges from its layout would
+    /// otherwise never write a cache at all and could not be resurrected. The first tick writes
+    /// the base shape, and every clean tick after it is silent.
+    pending_layout_serialization: bool,
+    /// The digest of the metadata at the last tick that serialized, so a tick can tell whether
+    /// anything it would write has changed. `None` until the first one.
+    ///
+    /// It is what keeps a clean session's cache honest: `pending_layout_serialization` above only
+    /// knows whether the session diverges from its layout, and a session can be clean and still
+    /// have renamed a pane, moved one, changed a cwd or pinned a floating pane.
+    last_serialized_layout_fingerprint: Option<u64>,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: String) -> Result<()> {
@@ -437,6 +553,56 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                             }
                         },
                         _ => Err::<(), _>(err).non_fatal(),
+                    },
+                }
+            },
+            PtyInstruction::SpawnReopenedTerminal {
+                default_shell,
+                cwd,
+                placement,
+                client_or_tab_index,
+                mut completion_tx,
+                prefill,
+                handle,
+            } => {
+                let shell = pty.get_default_terminal(cwd, default_shell);
+                match pty.spawn_terminal(Some(shell), client_or_tab_index, None) {
+                    Ok((pid, _starts_held)) => {
+                        if let Some(prefill) = prefill {
+                            let _ = pty
+                                .bus
+                                .senders
+                                .send_to_screen(ScreenInstruction::PrefillPane(pid, prefill));
+                        }
+                        let _ =
+                            pty.bus
+                                .senders
+                                .send_to_screen(ScreenInstruction::ExpectReopenedPane {
+                                    terminal_id: pid,
+                                    handle,
+                                });
+                        // a plain shell, so no command and no title of its own: the pane is told
+                        // what an ordinary shell pane is told
+                        pty.bus
+                            .senders
+                            .send_to_screen(ScreenInstruction::NewPane(
+                                PaneId::Terminal(pid),
+                                None,
+                                None,
+                                None,
+                                placement,
+                                false,
+                                client_or_tab_index,
+                                completion_tx,
+                                false,
+                            ))
+                            .context("failed to hand a reopened pane to the screen")?;
+                    },
+                    Err(err) => {
+                        log::error!("Failed to reopen a pane: {:?}", err);
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!("Failed to reopen the pane: {}", err));
+                        }
                     },
                 }
             },
@@ -976,9 +1142,21 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                 default_editor,
                 post_command_discovery_hook,
                 pane_env,
+                resurrect_command_hints,
+                resurrect_commands,
+                detect_agents,
+                pane_frame_agent_name,
                 client_id: _,
             } => {
-                pty.reconfigure(default_editor, post_command_discovery_hook, pane_env);
+                pty.pane_frame_agent_name = pane_frame_agent_name.unwrap_or(false);
+                pty.reconfigure(
+                    default_editor,
+                    post_command_discovery_hook,
+                    pane_env,
+                    resurrect_command_hints,
+                    resurrect_commands,
+                    detect_agents,
+                );
             },
             PtyInstruction::SendSigintToPaneId(pane_id) => {
                 pty.send_sigint_to_pane(pane_id);
@@ -1367,6 +1545,9 @@ impl Pty {
 
         self.task_handles.insert(terminal_id, terminal_bytes);
         self.pane_activity_flags.insert(terminal_id, activity_flag);
+        if runs_its_own_command {
+            self.command_terminal_ids.insert(terminal_id);
+        }
         if let Some(child_pid) = child_pid {
             self.id_to_child_pid.insert(terminal_id, child_pid);
             self.capture_initial_cwd(terminal_id, child_pid);
@@ -1421,10 +1602,21 @@ impl Pty {
         }
 
         let extracted_run_instructions = layout.extract_run_instructions();
-        let extracted_floating_run_instructions = floating_panes_layout
+        let extracted_floating_run_instructions: Vec<Option<Run>> = floating_panes_layout
             .iter()
             .filter(|f| !f.already_running)
-            .map(|f| f.run.clone());
+            .map(|f| f.run.clone())
+            .collect();
+        // `resurrect_commands "prefill"`: the instructions above still name the commands, which
+        // is what `prefill_for_resurrected` types; the layout the screen builds panes from names
+        // a shell, so a pane is not titled or listed as running a command it is not running
+        let mut floating_panes_layout = floating_panes_layout;
+        if self.resurrect_mode == ResurrectCommands::Prefill {
+            layout.recursively_open_resurrected_as_shells();
+            for floating_pane_layout in floating_panes_layout.iter_mut() {
+                floating_pane_layout.open_resurrected_as_shell();
+            }
+        }
         let mut new_pane_pids: Vec<(u32, bool, Option<RunCommand>, Result<Box<dyn AsyncReader>>)> =
             vec![]; // (terminal_id,
                     // starts_held,
@@ -1541,6 +1733,7 @@ impl Pty {
                 blocking_terminal,
             ))
             .with_context(err_context)?;
+        self.send_pending_prefills()?;
         let mut terminals_to_start = vec![];
 
         terminals_to_start.append(&mut new_pane_pids);
@@ -1718,6 +1911,9 @@ impl Pty {
             new_floating_pane_pids: new_tab_floating_pane_ids,
             plugin_ids,
         };
+        // an override reaches the screen batched with others, later, so there is no point at
+        // which a prefill is known to arrive before its pane's bytes; the panes stay plain shells
+        self.pending_prefills.clear();
 
         let mut terminals_to_start = vec![];
 
@@ -1806,6 +2002,13 @@ impl Pty {
         // starts_held,
         // command
         // successfully opened
+        if let Some((shell_run, prefill)) = self.prefill_for_resurrected(&run_instruction) {
+            let spawned = self.apply_run_instruction(shell_run, default_shell)?;
+            if let (Some(prefill), Some((terminal_id, ..))) = (prefill, spawned.as_ref()) {
+                self.pending_prefills.push((*terminal_id, prefill));
+            }
+            return Ok(spawned);
+        }
         let err_context = || format!("failed to apply run instruction");
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
@@ -1983,6 +2186,7 @@ impl Pty {
                     .with_context(err_context)
                 {
                     Ok((terminal_id, reader, child_pid)) => {
+                        self.command_terminal_ids.insert(terminal_id);
                         if let Some(child_pid) = child_pid {
                             self.id_to_child_pid.insert(terminal_id, child_pid);
                             self.capture_initial_cwd(terminal_id, child_pid);
@@ -2032,6 +2236,105 @@ impl Pty {
             Some(Run::Plugin(_)) => Ok(None),
         }
     }
+    /// `resurrect_commands "prefill"`: the plain shell a resurrected command pane is opened as
+    /// instead, and the command line to type at that shell's prompt.
+    ///
+    /// `None` for anything else - another mode, a command a person's layout names, a pane that is
+    /// not a command - which is opened exactly as before. A resurrected command is opened as the
+    /// default shell in the command's directory; only an agent's command is typed, so any other
+    /// command a snapshot recorded comes back as a shell with nothing typed.
+    ///
+    /// A known harness is typed as its bare resume, whatever the snapshot recorded: a snapshot
+    /// written before nkmk.32 can still hold a launch prompt, which Enter would send again.
+    ///
+    /// No pane is ever held, so nothing here goes near the held-pane exit path.
+    fn prefill_for_resurrected(
+        &self,
+        run_instruction: &Option<Run>,
+    ) -> Option<(Option<Run>, Option<String>)> {
+        if self.resurrect_mode != ResurrectCommands::Prefill {
+            return None;
+        }
+        let Some(Run::Command(command)) = run_instruction else {
+            return None;
+        };
+        if !command.resurrected {
+            return None;
+        }
+        let program = command.command.display().to_string();
+        let prefill =
+            is_resurrectable_agent(&program, self.resurrect_command_hints.as_ref()).then(|| {
+                let args = builtin_resume_args(&program, &command.args)
+                    .unwrap_or_else(|| command.args.clone());
+                command_line_for_prompt(&program, &args)
+            });
+        Some((command.cwd.clone().map(Run::Cwd), prefill))
+    }
+    /// The commands `prefill_for_resurrected` set aside, handed to the screen once the panes
+    /// they belong to exist. Called right after `ApplyLayout` is sent, which is before any byte
+    /// from those panes is read, so the screen holds the text before the shell can draw a prompt.
+    fn send_pending_prefills(&mut self) -> Result<()> {
+        for (terminal_id, prefill) in self.pending_prefills.drain(..) {
+            self.bus
+                .senders
+                .send_to_screen(ScreenInstruction::PrefillPane(terminal_id, prefill))
+                .context("failed to hand a prefill to the screen")?;
+        }
+        Ok(())
+    }
+    /// Forget the pid of a child that has been reaped while its pane stays open.
+    ///
+    /// Only a `hold_on_close` pane gets here: its process exits and the pane waits to be re-run.
+    /// The OS is free to hand that pid number to an unrelated process the moment it is reaped, so
+    /// a held pane must neither report it as `pane_pid` nor let a signal be delivered to it. A
+    /// re-run spawns a fresh process and records the new pid.
+    ///
+    /// The session its agent held is kept, so the held pane still serializes and lists with it:
+    /// see [`HeldPane`]. The pane's pty fd is forgotten too. It closed with the process, and the
+    /// next pane opened may be handed the same number - asking it for a foreground process group
+    /// would then answer for that pane. A re-run records a fresh fd.
+    pub fn forget_child_pid(&mut self, terminal_id: u32) {
+        let held = self.freeze_held_pane(terminal_id);
+        self.held_panes.insert(terminal_id, held);
+        self.id_to_child_pid.remove(&terminal_id);
+        self.terminal_foreground_cmds.remove(&terminal_id);
+        if let Some(os_input) = self.bus.os_input.as_ref() {
+            os_input
+                .clear_terminal_id(terminal_id)
+                .with_context(|| format!("failed to forget the pty fd of held pane {terminal_id}"))
+                .non_fatal();
+        }
+        // `command_terminal_ids` keeps the pane: it is still a command pane, waiting to re-run
+    }
+    /// What a pane's agent was last known to hold, taken out of the maps that only describe a
+    /// live process.
+    fn freeze_held_pane(&mut self, terminal_id: u32) -> HeldPane {
+        let osc_agent_session = self
+            .osc_agent_sessions
+            .remove(&terminal_id)
+            .map(|report| report.session_id);
+        let agent_env = self
+            .terminal_agent_envs
+            .remove(&terminal_id)
+            .unwrap_or_default();
+        let agent_session_source = self
+            .agent_env_probes
+            .remove(&terminal_id)
+            .and_then(|probe| probe.live_session)
+            .map(|live| live.source().as_str().to_owned());
+        // the id the last tick wrote down, read the way detection reads it - not re-read from the
+        // record or the open file, which went with the process
+        let env_session_id = self
+            .reported_command_for(terminal_id)
+            .and_then(|command| agent_detect::detect(command, &agent_env))
+            .and_then(|agent| agent.agent_id);
+        HeldPane {
+            agent_session_id: osc_agent_session.clone().or(env_session_id),
+            agent_env,
+            agent_session_source,
+            osc_agent_session,
+        }
+    }
     pub fn close_pane(&mut self, id: PaneId) -> Result<()> {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
@@ -2051,12 +2354,14 @@ impl Pty {
                         .non_fatal();
                 }
                 self.pane_activity_flags.remove(&id);
+                self.held_panes.remove(&id);
                 self.terminal_cwds.remove(&id);
                 self.terminal_cmds.remove(&id);
                 self.terminal_foreground_cmds.remove(&id);
                 self.terminals_with_shell_cwd.remove(&id);
                 self.resurrect_commands.remove(&id);
                 self.origin_pane_ids.remove(&id);
+                self.command_terminal_ids.remove(&id);
                 self.bus
                     .os_input
                     .as_ref()
@@ -2125,6 +2430,8 @@ impl Pty {
                 }
                 let _ = self.task_handles.remove(&id); // if all is well, this shouldn't be here
                 let _ = self.id_to_child_pid.remove(&id); // if all is wlel, this shouldn't be here
+                                                          // a re-run is a new process with a session of its own
+                self.held_panes.remove(&id);
 
                 let hold_on_close = run_command.hold_on_close;
                 let command_text = run_command.to_string();
@@ -2192,6 +2499,8 @@ impl Pty {
 
                 self.task_handles.insert(id, terminal_bytes);
                 self.pane_activity_flags.insert(id, activity_flag);
+                // a re-run is always a command, including one that started held and never ran
+                self.command_terminal_ids.insert(id);
                 if let Some(child_pid) = child_pid {
                     self.id_to_child_pid.insert(id, child_pid);
                     self.capture_initial_cwd(id, child_pid);
@@ -2258,13 +2567,26 @@ impl Pty {
             .iter()
             .filter_map(|id| self.id_to_child_pid.get(id).map(|pid| (*id, *pid)))
             .collect();
+        // a pane whose process is its own command is asked about that process, not about the
+        // newest of its children: an agent run as a command pane would otherwise be recorded as
+        // one of its MCP servers or tool shells
+        let command_terminal_ids = session_layout_metadata.command_terminal_ids();
+        let (command_panes, shell_panes): (Vec<(u32, u32)>, Vec<(u32, u32)>) = panes
+            .iter()
+            .partition(|(id, _)| command_terminal_ids.contains(id));
         let foreground_cmds = self
             .bus
             .os_input
             .as_ref()
-            .map(|os_input| os_input.get_foreground_cmds(&panes, &self.post_command_discovery_hook))
+            .map(|os_input| {
+                let post_hook = &self.post_command_discovery_hook;
+                let mut cmds = os_input.get_foreground_cmds(&shell_panes, post_hook);
+                cmds.extend(os_input.get_foreground_cmds_of_commands(&command_panes, post_hook));
+                cmds
+            })
             .unwrap_or_default();
 
+        let mut explicit_overrides: HashMap<u32, Vec<String>> = HashMap::new();
         for terminal_id in terminal_ids {
             let process_id = self.id_to_child_pid.get(&terminal_id);
             let cwd = process_id.and_then(|pid| pids_to_cwds.get(pid));
@@ -2281,6 +2603,7 @@ impl Pty {
             if let Some(resurrect) = self.resurrect_commands.get(&terminal_id) {
                 let mut command_line = vec![resurrect.command.to_string_lossy().into_owned()];
                 command_line.extend(resurrect.args.iter().cloned());
+                explicit_overrides.insert(terminal_id, command_line.clone());
                 terminal_ids_to_commands.insert(terminal_id, command_line);
                 if let Some(cwd) = &resurrect.cwd {
                     terminal_ids_to_cwds.insert(terminal_id, cwd.clone());
@@ -2292,6 +2615,132 @@ impl Pty {
         session_layout_metadata.update_terminal_cwds(terminal_ids_to_cwds);
         session_layout_metadata.update_default_editor(&self.default_editor);
         session_layout_metadata.detect_editor_panes();
+        self.apply_resurrect_command_hints(session_layout_metadata, &panes);
+        // fork: an explicit `set-resurrect-command` wins over the fork's hints, agent pinning and
+        // `resurrect_commands` mode, so it is written again after them
+        if !explicit_overrides.is_empty() {
+            session_layout_metadata.update_terminal_commands(explicit_overrides);
+        }
+    }
+    /// Rewrites the commands `resurrect_command_hints` applies to, once the commands themselves
+    /// have been discovered, records every known agent as its bare resume, and in an agents-only
+    /// `resurrect_commands` mode drops every command that is not an agent's.
+    ///
+    /// It runs here, in the pty thread, because this is the thread that knows a pane's pid - and
+    /// last, after the rest of discovery, so that it decides against the command that would
+    /// otherwise have been recorded.
+    ///
+    /// Three passes, in this order. The configured hints run first, as they always have. Every
+    /// known agent is then pinned to its live session and recorded as its bare resume, in every
+    /// mode, so the live id replaces whatever the hint read from a stale environment and a launch
+    /// prompt is never recorded. The agents-only filter runs last, on the commands the first two
+    /// produced.
+    fn apply_resurrect_command_hints(
+        &mut self,
+        session_layout_metadata: &mut SessionLayoutMetadata,
+        panes: &[(u32, u32)],
+    ) {
+        let hints = self
+            .resurrect_command_hints
+            .as_ref()
+            .filter(|hints| !hints.is_empty());
+        let agents_only = self.resurrect_mode.agents_only();
+        // a known agent is recorded as its bare resume in every mode, `"all"` included: its argv
+        // can carry a launch prompt, which a restore would send again as a new turn
+        if hints.is_none() && !agents_only && !session_layout_metadata.runs_a_known_agent() {
+            return;
+        }
+        let terminal_ids_to_pids: HashMap<u32, u32> = panes.iter().copied().collect();
+        // one process-table read for the whole session, not one per pane
+        let process_tree = ProcessTree::read();
+        if let Some(hints) = hints {
+            session_layout_metadata.apply_resurrect_command_hints(hints, |terminal_id, var| {
+                terminal_ids_to_pids
+                    .get(&terminal_id)
+                    .and_then(|pid| process_tree.find_env(*pid, var))
+            });
+        }
+        // every known agent is pinned to the session it holds now, in every mode; one with no
+        // session found is recorded with the bare resume of the id its argv names, or its
+        // picker - never its newest session
+        let claude_dir = claude_sessions_dir();
+        let osc_sessions: HashMap<u32, String> = self
+            .osc_agent_sessions
+            .iter()
+            .map(|(terminal_id, report)| (*terminal_id, report.session_id.clone()))
+            .collect();
+        // a held pane has no process to ask, but keeps the session its agent held
+        let held_sessions: HashMap<u32, (String, String)> = self
+            .held_panes
+            .iter()
+            .filter_map(|(terminal_id, held)| {
+                let session_id = held.agent_session_id.clone()?;
+                Some((*terminal_id, (session_id, held.session_source().to_owned())))
+            })
+            .collect();
+        let mut misses: HashMap<u32, String> = HashMap::new();
+        session_layout_metadata.pin_live_agent_sessions(|terminal_id, kind, _command| {
+            if let Some(session_id) = osc_sessions.get(&terminal_id) {
+                log::debug!(
+                    "resurrect: terminal {} records {}'s session {} (session_source: osc)",
+                    terminal_id,
+                    kind,
+                    session_id
+                );
+                return Some(Some(session_id.clone()));
+            }
+            let Some(pid) = terminal_ids_to_pids.get(&terminal_id) else {
+                if let Some((session_id, source)) = held_sessions.get(&terminal_id) {
+                    log::debug!(
+                        "resurrect: held terminal {} records {}'s session {} (session_source: {})",
+                        terminal_id,
+                        kind,
+                        session_id,
+                        source
+                    );
+                    return Some(Some(session_id.clone()));
+                }
+                misses.insert(terminal_id, format!("the pane has no process ({})", kind));
+                return Some(None);
+            };
+            match process_tree.own_session(
+                *pid,
+                kind,
+                claude_dir.as_deref(),
+                open_files_of,
+                process_env,
+            ) {
+                Ok(own) => {
+                    log::debug!(
+                        "resurrect: terminal {} records {}'s session {} (session_source: {})",
+                        terminal_id,
+                        kind,
+                        own.id,
+                        own.live.source().as_str()
+                    );
+                    Some(Some(own.id))
+                },
+                Err(miss) => {
+                    misses.insert(terminal_id, format!("{} ({})", miss, kind));
+                    Some(None)
+                },
+            }
+        });
+        for (terminal_id, miss) in &misses {
+            if self.resume_misses.get(terminal_id) != Some(miss) {
+                log::warn!(
+                    "resurrect: terminal {} has no session id: {}; it is recorded with its \
+                     picker unless its argv names a session by id (session_source: \
+                     picker-fallback)",
+                    terminal_id,
+                    miss
+                );
+            }
+        }
+        self.resume_misses = misses;
+        if agents_only {
+            session_layout_metadata.keep_only_agent_commands(hints);
+        }
     }
     pub fn fill_plugin_cwd(
         &self,
@@ -2447,22 +2896,33 @@ impl Pty {
             }
         }
 
-        let panes: Vec<(u32, u32)> = active_terminal_ids
+        // Detection discovers silent foreground jobs on every tick. CWD stays activity-driven.
+        let command_terminal_ids: Vec<u32> = if self.detect_agents {
+            self.id_to_child_pid.keys().copied().collect()
+        } else {
+            active_terminal_ids.clone()
+        };
+        let panes: Vec<(u32, u32)> = command_terminal_ids
             .iter()
             .filter_map(|id| self.id_to_child_pid.get(id).map(|pid| (*id, *pid)))
             .collect();
+        // the same split serialization makes: a command pane is asked about its own process, so
+        // an agent run as one is reported as itself, not as one of its MCP servers or tool shells
+        let (command_panes, shell_panes): (Vec<(u32, u32)>, Vec<(u32, u32)>) = panes
+            .iter()
+            .partition(|(id, _)| self.command_terminal_ids.contains(id));
         let foreground_cmds = self
             .bus
             .os_input
             .as_ref()
-            .map(|os_input| os_input.get_foreground_cmds(&panes, &self.post_command_discovery_hook))
+            .map(|os_input| {
+                let post_hook = &self.post_command_discovery_hook;
+                let mut cmds = os_input.get_foreground_cmds(&shell_panes, post_hook);
+                cmds.extend(os_input.get_foreground_cmds_of_commands(&command_panes, post_hook));
+                cmds
+            })
             .unwrap_or_default();
 
-        for terminal_id in &active_terminal_ids {
-            let foreground_cmd: Vec<String> = foreground_cmds
-                .get(terminal_id)
-                .cloned()
-                .unwrap_or_default();
 
             if self.terminal_foreground_cmds.get(terminal_id) != Some(&foreground_cmd) {
                 let pane_id = PaneId::Terminal(*terminal_id);
@@ -2531,6 +2991,18 @@ impl Pty {
 
     pub fn notify_cwd_from_osc7(&mut self, terminal_id: u32, path: PathBuf) {
         use std::sync::atomic::Ordering;
+
+        resurrect_command_hints: Option<ResurrectCommandHints>,
+        resurrect_commands: Option<ResurrectCommands>,
+        detect_agents: Option<bool>,
+    ) {
+        self.default_editor = default_editor;
+        self.post_command_discovery_hook = post_command_discovery_hook;
+        self.pane_env = pane_env;
+        self.resurrect_command_hints = resurrect_command_hints;
+        self.resurrect_mode = resurrect_commands.unwrap_or(ResurrectCommands::All);
+        self.detect_agents = detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT);
+    }
 
     /// A shell told us its cwd directly, so we do not have to read it off the process.
     ///

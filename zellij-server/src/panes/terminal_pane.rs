@@ -1388,6 +1388,9 @@ impl Pane for TerminalPane {
         self.notification_end = Some(waiter);
         None
     }
+    fn set_invoked_with(&mut self, invoked_with: Option<Run>) {
+        self.invoked_with = invoked_with;
+    }
     fn set_title(&mut self, title: String) {
         self.pane_title = title;
     }
@@ -1482,10 +1485,23 @@ impl Pane for TerminalPane {
         // is not in the right sort of state
         self.is_held.take().map(|(_, _, run_command)| {
             self.is_held = None;
+            // the failure mark describes the run that just ended, and this is a new one
+            self.note = None;
             self.grid.reset_terminal_state();
             self.set_should_render(true);
             self.remove_banner();
             run_command.clone()
+        })
+    }
+    fn drop_held_to_shell(&mut self) -> Option<Option<PathBuf>> {
+        self.is_held.take().map(|(_, _, run_command)| {
+            // Drop to shell in the same working directory as the command was run
+            let working_dir = run_command.cwd.clone();
+            self.is_held = None;
+            self.grid.reset_terminal_state();
+            self.set_should_render(true);
+            self.remove_banner();
+            working_dir
         })
     }
     fn update_theme(&mut self, theme: Styling) {

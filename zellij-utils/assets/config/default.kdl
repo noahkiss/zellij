@@ -210,6 +210,20 @@ context_menu {
 //
 // input_while_scrolled "scroll-mode"
 
+// Choose what a command pane does when its command exits with status 0
+// Options:
+//   - hold (Default - the pane holds, waiting for ENTER, ESC or Ctrl-C)
+//   - shell (the pane drops to a shell, exactly as an ESC press does)
+//
+// command_pane_on_clean_exit "hold"
+
+//  Send a request for a simplified ui (without arrow fonts) to plugins
+//  Options:
+//    - true
+//    - false (Default)
+//
+// simplified_ui true
+
 // Paths in this file - default_shell, default_cwd, default_layout, layout_dir, theme_dir,
 // scrollback_editor, snapshot_dir, web_server_cert, web_server_key and the plugin locations in
 // plugin_permissions - are expanded like a layout's paths are:
@@ -669,6 +683,38 @@ context_menu {
 //
 // session_aliases {
 //     my-session "MS"
+// }
+
+// How to record the command of a pane that is running a tool with its own session state, so that
+// a resurrected pane offers to RESUME that state instead of starting over
+// A pane comes back holding the command it was running, and Enter re-runs it - which for a coding
+// agent or any tool keyed by a session id starts a NEW session and leaves the old work unreachable
+// Each block is one hint. Its name is a label; matching never looks at it
+// - match:   compared against the BASENAME of the recorded command, exactly. `claude` matches a
+//            pane running `claude` and one running `/opt/homebrew/bin/claude`, not `claude-code`
+// - env:     the variable to look for, in the pane's process and every process under it. The first
+//            one that has it wins. Read from /proc on Linux and from sysctl(KERN_PROCARGS2) on
+//            macOS; on any other platform nothing is found and the command is recorded as it is
+// - resume_args: arguments APPENDED to the command the pane was observed running, with `{}`
+//            standing for the variable's value. Split on whitespace - it is not passed to a shell.
+//            `{}` is optional: a resume flag that needs no id carries none
+// A hint that does not match, or whose variable is not set, records the command unchanged. So does
+// a pane whose observed arguments already carry one of these words - the argv that ran wins
+// `resume_args` replaces the earlier `rewrite`, which held a whole command line. A hint still
+// written with `rewrite` is skipped with a warning, and the rest of the config loads as usual
+// Default: no hints, every command recorded as it is
+//
+// resurrect_command_hints {
+//     claude {
+//         match "claude"
+//         env "CLAUDE_CODE_SESSION_ID"
+//         resume_args "--continue"
+//     }
+//     opencode {
+//         match "opencode"
+//         env "OPENCODE_SESSION_ID"
+//         resume_args "--session {}"
+//     }
 // }
 
 // A command to run (will be wrapped with sh -c and provided the RESURRECT_COMMAND env variable)

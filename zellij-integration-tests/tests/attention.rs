@@ -780,9 +780,10 @@ fn press_in_mode(zellij: &TestSession, mode: char, key: char) {
 fn the_pane_tab_and_session_mode_keys_mute_ignore_and_watch() {
     let (mut zellij, _left, right) =
         start_with_two_panes(runner().with_config(SESSION_INDICATOR_ON));
-    press_in_mode(&zellij, 'p', 'u');
+    // fork: pane-mode `u` reopens a closed pane, so pane mute is on `Shift u`
+    press_in_mode(&zellij, 'p', 'U');
     wait_for_markers(&zellij, "⊘");
-    press_in_mode(&zellij, 'p', 'u');
+    press_in_mode(&zellij, 'p', 'U');
     wait_for_markers(&zellij, "");
     press_in_mode(&zellij, 'p', 'g');
     let_the_startup_grace_pass();
@@ -822,7 +823,7 @@ fn the_unlock_first_preset_mutes_the_pane_from_pane_mode() {
     });
     zellij.send_stdin(&keys::ctrl('g'));
     zellij.send_stdin(&keys::key('p'));
-    zellij.send_stdin(&keys::key('u'));
+    zellij.send_stdin(&keys::key('U'));
     zellij.wait_until("the status bar says the pane is muted", |grid_snapshot| {
         grid_snapshot
             .lines()
