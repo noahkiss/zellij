@@ -22,6 +22,7 @@ pub mod background_jobs;
 mod desktop_app;
 pub use desktop_app::{set_app_starter, AppStarter};
 mod bell_dwell;
+mod close_tab_or_confirm;
 mod closed_panes;
 mod global_async_runtime;
 mod logging_pipe;

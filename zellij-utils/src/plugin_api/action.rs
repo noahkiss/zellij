@@ -645,6 +645,10 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(_) => Err("CloseTab should not have a payload"),
                 None => Ok(Action::CloseTab),
             },
+            Some(ProtobufActionName::CloseTabOrConfirm) => match protobuf_action.optional_payload {
+                Some(_) => Err("CloseTabOrConfirm should not have a payload"),
+                None => Ok(Action::CloseTabOrConfirm),
+            },
             Some(ProtobufActionName::GoToTab) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::GoToTabPayload(index)) => Ok(Action::GoToTab { index }),
                 _ => Err("Wrong payload for Action::GoToTab"),
@@ -2087,6 +2091,10 @@ impl TryFrom<Action> for ProtobufAction {
             }),
             Action::CloseTab => Ok(ProtobufAction {
                 name: ProtobufActionName::CloseTab as i32,
+                optional_payload: None,
+            }),
+            Action::CloseTabOrConfirm => Ok(ProtobufAction {
+                name: ProtobufActionName::CloseTabOrConfirm as i32,
                 optional_payload: None,
             }),
             Action::GoToTab { index: tab_index } => Ok(ProtobufAction {
@@ -4368,5 +4376,15 @@ mod tests {
         }
         .try_into();
         assert!(listing.is_err());
+    }
+
+    /// The tab-mode close key reaches the plugins that draw key hints, with its own name: a hint
+    /// plugin has to see it to label it `close`.
+    #[test]
+    fn close_tab_or_confirm_reaches_plugins() {
+        let protobuf: ProtobufAction = Action::CloseTabOrConfirm.try_into().expect("encode");
+        assert_eq!(protobuf.name, ProtobufActionName::CloseTabOrConfirm as i32);
+        let decoded: Action = protobuf.try_into().expect("decode");
+        assert_eq!(decoded, Action::CloseTabOrConfirm);
     }
 }

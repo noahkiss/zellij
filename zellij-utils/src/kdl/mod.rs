@@ -126,6 +126,7 @@ pub fn action_without_arguments(
         "GoToNextTab" => Ok(Action::GoToNextTab),
         "GoToPreviousTab" => Ok(Action::GoToPreviousTab),
         "CloseTab" => Ok(Action::CloseTab),
+        "CloseTabOrConfirm" => Ok(Action::CloseTabOrConfirm),
         "ToggleTab" => Ok(Action::ToggleTab),
         "UndoRenameTab" => Ok(Action::UndoRenameTab),
         "UndoRenameSession" => Ok(Action::UndoRenameSession),
@@ -956,6 +957,7 @@ impl Action {
             Action::GoToNextTab => Some(KdlNode::new("GoToNextTab")),
             Action::GoToPreviousTab => Some(KdlNode::new("GoToPreviousTab")),
             Action::CloseTab => Some(KdlNode::new("CloseTab")),
+            Action::CloseTabOrConfirm => Some(KdlNode::new("CloseTabOrConfirm")),
             Action::GoToTab { index } => {
                 let mut node = KdlNode::new("GoToTab");
                 node.push(KdlValue::Base10(*index as i64));
@@ -2004,6 +2006,9 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
             },
             "CloseTab" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
+            "CloseTabOrConfirm" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
             "ToggleTab" => parse_kdl_action_arguments!(action_name, action_arguments, kdl_action),
             "UndoRenameTab" => {
                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)

@@ -608,6 +608,7 @@ enum ActionName {
     // fork additions live in a block from 900; 200 was ReopenPane before
     reserved 200;
     ReopenPane = 900;
+    CloseTabOrConfirm = 901;
 }
 
 message Position {

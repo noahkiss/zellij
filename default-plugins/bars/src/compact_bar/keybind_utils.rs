@@ -467,7 +467,7 @@ impl KeybindProcessor {
                     // fork addition: `|| launches_plugin(..)` because tab mode's close key is
                     // bound to the confirmation prompt, not to `CloseTab`
                     |action: &Action| {
-                        matches!(action, Action::CloseTab)
+                        matches!(action, Action::CloseTab | Action::CloseTabOrConfirm)
                             || action.launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN)
                     },
                     |action: &Action| {

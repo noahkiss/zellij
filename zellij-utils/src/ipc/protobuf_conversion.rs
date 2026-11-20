@@ -1523,6 +1523,7 @@ impl From<crate::input::actions::Action>
             ClosePluginPaneAction,
             CloseTabAction,
             CloseTabByIdAction,
+            CloseTabOrConfirmAction,
             CloseTerminalPaneAction,
             ConfirmAction,
             CopyAction,
@@ -2101,6 +2102,9 @@ impl From<crate::input::actions::Action>
                 ActionType::GoToPreviousTab(GoToPreviousTabAction {})
             },
             crate::input::actions::Action::CloseTab => ActionType::CloseTab(CloseTabAction {}),
+            crate::input::actions::Action::CloseTabOrConfirm => {
+                ActionType::CloseTabOrConfirm(CloseTabOrConfirmAction {})
+            },
             crate::input::actions::Action::GoToTab { index } => {
                 ActionType::GoToTab(GoToTabAction { index })
             },
@@ -3262,6 +3266,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::GoToNextTab(_) => Ok(crate::input::actions::Action::GoToNextTab),
             ActionType::GoToPreviousTab(_) => Ok(crate::input::actions::Action::GoToPreviousTab),
             ActionType::CloseTab(_) => Ok(crate::input::actions::Action::CloseTab),
+            ActionType::CloseTabOrConfirm(_) => {
+                Ok(crate::input::actions::Action::CloseTabOrConfirm)
+            },
             ActionType::GoToTab(go_to_tab_action) => Ok(crate::input::actions::Action::GoToTab {
                 index: go_to_tab_action.index,
             }),

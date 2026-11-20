@@ -25441,3 +25441,112 @@ fn a_working_or_blocked_agent_holds_and_a_shell_or_no_wait_refuses() {
     assert_eq!(shell.status, Status::Refused);
     assert_eq!(shell.reason, Some(Reason::NotAgent));
 }
+
+// fork addition: the tab-mode close key, `CloseTabOrConfirm`. Tab 0 holds one plugin pane and
+// tab 1 two terminal panes. The main client sits on tab 1 and a second client on tab 0, so each
+// press is judged by the tab of the client that pressed it and by nothing else.
+fn close_tab_or_confirm_with_two_clients(
+    presser: impl FnOnce(ClientId, ClientId) -> ClientId,
+) -> Vec<PtyInstruction> {
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let pty_receiver = mock_screen.pty_receiver.take().unwrap();
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let received_pty_instructions = Arc::new(Mutex::new(vec![]));
+    let pty_thread = log_actions_in_thread!(
+        received_pty_instructions,
+        PtyInstruction::Exit,
+        pty_receiver
+    );
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let client_id = presser(mock_screen.main_client_id, second_client_id);
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::CloseTabOrConfirm(client_id, None));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![pty_thread, screen_thread]);
+    let instructions = received_pty_instructions.lock().unwrap().clone();
+    instructions
+}
+
+fn closed_tab_panes(instructions: &[PtyInstruction]) -> Vec<Vec<PaneId>> {
+    instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            PtyInstruction::CloseTab(pane_ids) => Some(pane_ids.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn launched_plugins(instructions: &[PtyInstruction]) -> Vec<(String, usize, ClientId, bool)> {
+    instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            PtyInstruction::FillPluginCwd(
+                should_float,
+                _,
+                _,
+                _,
+                run_plugin,
+                tab_index,
+                _,
+                client_id,
+                ..,
+            ) => Some((
+                run_plugin.location_string(),
+                *tab_index,
+                *client_id,
+                *should_float == Some(true),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+pub fn close_tab_or_confirm_closes_a_one_pane_tab_without_launching_anything() {
+    let instructions = close_tab_or_confirm_with_two_clients(|_main, second| second);
+    assert_eq!(
+        closed_tab_panes(&instructions),
+        vec![vec![PaneId::Plugin(2)]],
+        "the pressing client's one-pane tab closes, and only that tab"
+    );
+    assert!(
+        launched_plugins(&instructions).is_empty(),
+        "no prompt pane may exist for a tab worth nothing: {:?}",
+        launched_plugins(&instructions)
+    );
+}
+
+#[test]
+pub fn close_tab_or_confirm_asks_for_a_multi_pane_tab_and_closes_nothing() {
+    let instructions = close_tab_or_confirm_with_two_clients(|main, _second| main);
+    assert!(
+        closed_tab_panes(&instructions).is_empty(),
+        "a tab with two panes must not close before the user answers, nor may the other \
+         client's one-pane tab: {:?}",
+        closed_tab_panes(&instructions)
+    );
+    assert_eq!(
+        launched_plugins(&instructions),
+        vec![("zellij:confirm-close-tab".to_owned(), 1, 1, true)],
+        "the prompt floats in the pressing client's tab, for the pressing client"
+    );
+}
+
+#[test]
+pub fn close_tab_or_confirm_from_a_client_with_no_tab_does_nothing() {
+    let instructions = close_tab_or_confirm_with_two_clients(|_main, _second| 42);
+    assert!(closed_tab_panes(&instructions).is_empty());
+    assert!(launched_plugins(&instructions).is_empty());
+}

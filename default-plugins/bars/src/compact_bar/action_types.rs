@@ -148,7 +148,7 @@ impl ActionType {
             Action::ToggleFloatingPanes => ActionType::ToggleFloatingPanes,
             Action::CloseFocus => ActionType::CloseFocus,
             Action::ReopenPane { .. } => ActionType::ReopenPane,
-            Action::CloseTab => ActionType::CloseTab,
+            Action::CloseTab | Action::CloseTabOrConfirm => ActionType::CloseTab,
             Action::ToggleActiveSyncTab => ActionType::ToggleActiveSyncTab,
             Action::ToggleTab => ActionType::ToggleTab,
             Action::BreakPane => ActionType::BreakPane,

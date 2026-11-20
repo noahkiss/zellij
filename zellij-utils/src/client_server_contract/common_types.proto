@@ -374,6 +374,7 @@ message Action {
     ReopenPaneAction reopen_pane = 906;
     SendMessageAction send_message = 900;
     MessageStatusAction message_status = 901;
+    CloseTabOrConfirmAction close_tab_or_confirm = 907;
   }
 }
 
@@ -432,6 +433,8 @@ message NoOpAction {}
 message GoToNextTabAction {}
 message GoToPreviousTabAction {}
 message CloseTabAction {}
+// fork addition: the tab-mode close key, which asks first when the tab holds more than one pane
+message CloseTabOrConfirmAction {}
 message ToggleTabAction {}
 message UndoRenameTabAction {}
 message UndoRenameSessionAction {}

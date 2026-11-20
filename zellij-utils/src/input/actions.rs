@@ -414,6 +414,13 @@ pub enum Action {
     GoToPreviousTab,
     /// Close the current tab.
     CloseTab,
+    /// fork addition: close the current tab if it holds one selectable pane at most, and ask
+    /// first otherwise.
+    ///
+    /// The server decides for the client that sent it, before any pane exists: a tab worth
+    /// nothing closes at once, and a tab with more launches `zellij:confirm-close-tab` to ask.
+    /// It is the tab-mode close key; `zellij action close-tab` stays `CloseTab`.
+    CloseTabOrConfirm,
     GoToTab {
         index: u32,
     },

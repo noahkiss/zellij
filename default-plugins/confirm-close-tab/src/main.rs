@@ -1,8 +1,11 @@
 //! A confirmation prompt for the interactive close-tab key.
 //!
-//! The tab-mode close key launches this plugin as a floating pane instead of sending `CloseTab`.
-//! If the focused tab holds one selectable pane at most, the plugin closes the tab at once and
-//! never renders. Otherwise it asks, and offers to close only the pane the user was in.
+//! The tab-mode close key sends `CloseTabOrConfirm`. The server closes a tab that holds one
+//! selectable pane at most and launches this plugin, as a floating pane, only for a tab with more.
+//! The plugin then asks, and offers to close only the pane the user was in.
+//!
+//! The plugin keeps the same rule itself, for a config that still launches it directly: if the
+//! focused tab holds one selectable pane at most, it closes the tab at once and never renders.
 //!
 //! The CLI path is untouched: `zellij action close-tab` confirms client-side, before the action
 //! reaches the server, and never launches a plugin.

@@ -6372,23 +6372,29 @@ Nothing crosses a contract: no `Action` is added, no message is renumbered, and 
 
 The tab-mode close key and `zellij action close-tab` used to be the same button. One is pressed by
 somebody who meant to close a *pane* and reached one menu too far; the other is typed on purpose.
-Now only the key is gated, by a new bundled plugin, `zellij:confirm-close-tab`.
+Now only the key is gated: a fork action, `CloseTabOrConfirm`, and a bundled plugin,
+`zellij:confirm-close-tab`, that asks.
 
-The default binding is no longer `CloseTab`:
+The default binding is no longer `CloseTab`, in both presets (`default` and `unlock-first`; the
+latter leaves to `"Locked"`, where every key reaches the prompt too):
 
 ```
-bind "x" {
-    LaunchOrFocusPlugin "zellij:confirm-close-tab" {
-        floating true
-        move_to_focused_tab true
-    };
-    SwitchToMode "Normal"
-}
+bind "x" { CloseTabOrConfirm; SwitchToMode "Normal"; }
 ```
 
-- **A tab with one pane closes with no prompt at all.** The plugin decides in `load`, from
-  `get_focused_pane_info` and `get_tab_info`, before it has rendered a frame. There is nothing to
-  confirm when closing the tab loses nothing, and the key stays as fast as it was.
+- **A tab with one pane closes with no prompt at all, and no pane.** The server decides, for the
+  client that pressed the key, before anything is drawn (`zellij-server/src/close_tab_or_confirm.rs`).
+  It counts the selectable panes in that client's tab, both layers, hidden floating panes
+  included: the same counts the plugin reads from `TabInfo`, and the same rule as its
+  `TabShape::decide`. One at most closes the tab as `CloseTab` does. More launches the plugin,
+  floating and moved to that client's tab, as the old binding did. Another client's tab is never
+  consulted, and a client with no tab of its own changes nothing.
+- **Why the server and not the plugin.** The binding used to launch the plugin every time, and the
+  plugin closed a worthless tab from `load`. Its floating pane was on screen for a frame or two
+  first: a visible flash on every close of a one-pane tab. A plugin cannot decide before it has a
+  pane, and a keybinding that messages an already-running plugin reaches every client's instance
+  with no word of which client pressed it, so the decision moved to the one place that knows the
+  presser.
 - **A tab with more than one asks**, in a small floating pane: `close tab? 3 panes open  [y/N/p]`.
   `y` closes the tab. `n`, `Esc` and `Enter` cancel. `p` closes only the pane you were in and
   leaves the tab, which is what the miss-press usually meant.
@@ -6437,15 +6443,21 @@ worth nothing either, and closed it too. With two tabs open and two clients that
 session and took the server down with it. The cost of the guard is small and visible only to a
 second client: it sees an empty floating pane until the client that asked answers the prompt.
 
-**Only the `default` preset binds it.** Upstream v0.46.0 keeps its keybindings in presets
-(`zellij-utils/assets/keybinds/`). The `unlock-first` preset's tab-mode `x` is still upstream's
-`CloseTab`, with no prompt.
+**The plugin keeps its own rule.** A config that still binds `x` to `LaunchOrFocusPlugin
+"zellij:confirm-close-tab"` works as before, flash included: the plugin closes a worthless tab
+from `load`.
 
-**Rollout order is the reverse of the usual one.** The binding lives in the binary's own
-`default` preset, so nothing has to be rolled out at all: an older binary keeps `CloseTab` and a
-newer one gets the prompt. A user `config.kdl` that already overrides tab-mode `x` keeps its own
-binding and sees no change until it is rewritten — and it must not be rewritten ahead of the
-binary, because `zellij:confirm-close-tab` is a plugin location an older build does not have.
+**Rollout order is the reverse of the usual one.** The binding lives in the binary's own presets
+(`zellij-utils/assets/keybinds/`), so nothing has to be rolled out at all: an older binary keeps
+its own binding and a newer one gets `CloseTabOrConfirm`. A user `config.kdl` that already
+overrides tab-mode `x` keeps its own binding and sees no change until it is rewritten — and it must
+not name `CloseTabOrConfirm` ahead of the binary: a build without the action rejects the whole
+config, and a tolerant one warns and skips the action.
+
+**What it costs.** One client/server `Action` tag (`close_tab_or_confirm`, 907) and one plugin
+`ActionName` (`CloseTabOrConfirm`, 901), so a hint plugin sees the key: both in the fork block. A
+plugin built before this drops the unknown action from its keybinding table, so its close hint has
+no key; the checked-in plugins are rebuilt with it.
 
 ### The tab-mode close hint follows the key that launches the prompt
 
@@ -6457,7 +6469,8 @@ stops naming a key the mode still has is worse than one that names nothing, beca
 
 One lookup answers it, in `default-plugins/bars/src/status_bar/mod.rs` and called from both hint tables
 (`second_line.rs` and `one_line_ui.rs`): the first key in the mode bound to exactly two actions,
-where the first launches `zellij:confirm-close-tab` and the second leaves the mode. It runs only as
+where the first is `CloseTabOrConfirm` or launches `zellij:confirm-close-tab` and the second leaves
+the mode. It runs only as
 a **fallback**, when the direct `CloseTab` lookup found nothing — a config that still binds
 `CloseTab` is answered exactly as before, and no hint ever lists two keys for one verb.
 
@@ -6474,10 +6487,11 @@ predicates over single actions (`derive.rs`, `keybind_utils.rs`), takes the firs
 action matches, and then gathers every other key in the mode whose first action projects to the
 same `ActionType`. Two edits per bar follow from that shape:
 
-- the tab-mode close predicate becomes `matches!(a, Action::CloseTab) ||
-  a.launches_plugin("zellij:confirm-close-tab")`, so the key is found at all;
-- `ActionType::from_action` maps that same launch to `ActionType::CloseTab`, so the key is
-  *labelled* `close` and gathered into the close hint rather than into a hint of its own.
+- the tab-mode close predicate becomes `matches!(a, Action::CloseTab | Action::CloseTabOrConfirm)
+  || a.launches_plugin("zellij:confirm-close-tab")`, so the key is found at all;
+- `ActionType::from_action` maps `CloseTabOrConfirm` and that same launch to
+  `ActionType::CloseTab`, so the key is *labelled* `close` and gathered into the close hint rather
+  than into a hint of its own.
 
 The second edit is the one that does the work, and it sits beside the four rows already there for
 `session-manager`, `configuration`, `plugin-manager` and `zellij:about` — a `LaunchOrFocusPlugin`
@@ -9272,6 +9286,7 @@ stay small: no upstream message shares their numbering.
 | client/server `Action`: `resolve_pane_target`, `list_tree`, `new_shell_pane`, `reopen_pane` | 167, 168, 173, 174 | 902, 903, 905, 906 |
 | client/server `Action`: `move_tab_to_index` | 172, then 904 | reserved: `move-tab --to-index` maps onto upstream's `MoveTabToPosition` |
 | client/server `Action`: `send_message`, `message_status` | 900, 901 | unchanged |
+| client/server `Action`: `close_tab_or_confirm` | new | 907 |
 | `ClientToServerMsg.fork_subscribe_to_session_events` | 28 | 900 |
 | `ServerToClientMsg.fork_session_event` | 20 | 900 |
 | `ListClientsAction.output_json`, `FocusPaneByPaneIdAction.no_focus`, `GoToTabNameAction.no_focus` | 1, 2, 3 | 900 |
@@ -9281,6 +9296,7 @@ stay small: no upstream message shares their numbering.
 | plugin `ModeUpdatePayload.session_warnings` | 23 | 900 |
 | plugin `ClientInfo.tty` | 102 | 900 |
 | plugin `Action.reopen_pane_payload`, `ActionName.ReopenPane` | 200 | 900 |
+| plugin `ActionName.CloseTabOrConfirm` | new | 901 |
 | `PaneFrameStyle.TopOnly` (`event.proto` and `pane_frame_style.proto`) | 100 | 900 |
 
 The two session-event messages are renamed `ForkSubscribeToSessionEventsMsg` and

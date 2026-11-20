@@ -1535,6 +1535,14 @@ fn route_action_with_origin(
                 ))
                 .with_context(err_context)?;
         },
+        Action::CloseTabOrConfirm => {
+            senders
+                .send_to_screen(ScreenInstruction::CloseTabOrConfirm(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::GoToTab { index } => {
             senders
                 .send_to_screen(ScreenInstruction::GoToTab(

@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use zellij_utils::agent_detect::{self, PaneAgent};
 use zellij_utils::event_stream::{EventStream, StreamEvent, StreamModel, StreamTab};
 
+use crate::close_tab_or_confirm;
 use crate::closed_panes::{ClosedPane, ClosedPaneKind, ClosedPanes, ClosingPane};
 use zellij_utils::data::{
     BorderStyle, BorderStyleOverride, CommandOrPlugin, ContextMenuContext, ContextMenuEntry,
@@ -573,6 +574,9 @@ pub enum ScreenInstruction {
     SwitchTabPrev(ClientId, Option<NotificationEnd>),
     ToggleActiveSyncTab(ClientId, Option<NotificationEnd>),
     CloseTab(ClientId, Option<NotificationEnd>),
+    /// fork addition: the tab-mode close key. Closes the client's tab if it holds one selectable
+    /// pane at most, and launches the confirmation prompt otherwise.
+    CloseTabOrConfirm(ClientId, Option<NotificationEnd>),
     GoToTab(u32, Option<ClientId>, Option<NotificationEnd>), // this Option is a hacky workaround, please do not copy this behaviour
     GoToTabName(
         String,
@@ -1468,6 +1472,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::SwitchTabNext(..) => ScreenContext::SwitchTabNext,
             ScreenInstruction::SwitchTabPrev(..) => ScreenContext::SwitchTabPrev,
             ScreenInstruction::CloseTab(..) => ScreenContext::CloseTab,
+            ScreenInstruction::CloseTabOrConfirm(..) => ScreenContext::CloseTabOrConfirm,
             ScreenInstruction::GoToTab(..) => ScreenContext::GoToTab,
             ScreenInstruction::GoToTabName(..) => ScreenContext::GoToTabName,
             ScreenInstruction::UpdateTabName(..) => ScreenContext::UpdateTabName,
@@ -14614,6 +14619,42 @@ pub(crate) fn screen_thread_main(
             ) => {
                 screen.switch_tab_prev(None, true, client_id)?;
                 screen.render(None)?;
+            },
+            ScreenInstruction::CloseTabOrConfirm(client_id, completion_tx) => {
+                // Only the client that pressed the key: a client with no tab of its own has
+                // nothing to close, and must never fall back to another client's tab.
+                let panes = screen
+                    .get_active_tab(client_id)
+                    .ok()
+                    .map(close_tab_or_confirm::panes_at_stake);
+                match panes.map(close_tab_or_confirm::decide) {
+                    None => {},
+                    Some(close_tab_or_confirm::Decision::CloseTabNow) => {
+                        screen
+                            .bus
+                            .senders
+                            .send_to_screen(ScreenInstruction::CloseTab(
+                                client_id,
+                                completion_tx,
+                            ))?;
+                    },
+                    Some(close_tab_or_confirm::Decision::Ask) => {
+                        screen.bus.senders.send_to_screen(
+                            ScreenInstruction::LaunchOrFocusPlugin(
+                                close_tab_or_confirm::prompt_plugin(),
+                                true,  // floating
+                                true,  // move_to_focused_tab
+                                false, // in place
+                                false, // close_replaced_pane
+                                None,
+                                false, // skip_cache
+                                client_id,
+                                completion_tx,
+                                None,
+                            ),
+                        )?;
+                    },
+                }
             },
             ScreenInstruction::CloseTab(client_id, mut completion_tx) => {
                 let closed = screen.tab_summary_for_client(client_id);

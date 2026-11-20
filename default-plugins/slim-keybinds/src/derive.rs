@@ -333,9 +333,12 @@ fn predicates_for_mode(mode: InputMode) -> &'static [fn(&Action) -> bool] {
         InputMode::Tab => &[
             |a| matches!(a, Action::GoToPreviousTab | Action::GoToNextTab),
             |a| matches!(a, Action::NewTab { .. }),
-            // `|| launches_plugin(..)` because this fork binds tab mode's close key to the
-            // confirmation prompt, not to `CloseTab` - see `ActionType::from_action`.
-            |a| matches!(a, Action::CloseTab) || a.launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN),
+            // This fork binds tab mode's close key to `CloseTabOrConfirm`, and an older config to
+            // the confirmation prompt itself, not to `CloseTab` - see `ActionType::from_action`.
+            |a| {
+                matches!(a, Action::CloseTab | Action::CloseTabOrConfirm)
+                    || a.launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN)
+            },
             |a| {
                 matches!(
                     a,

@@ -1283,6 +1283,7 @@ pub enum ActionName {
     ToggleStackListOrientation = 155,
     ToggleStackListOrientationByPaneId = 156,
     ReopenPane = 900,
+    CloseTabOrConfirm = 901,
 }
 impl ActionName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1446,6 +1447,7 @@ impl ActionName {
             ActionName::ToggleStackListOrientation => "ToggleStackListOrientation",
             ActionName::ToggleStackListOrientationByPaneId => "ToggleStackListOrientationByPaneId",
             ActionName::ReopenPane => "ReopenPane",
+            ActionName::CloseTabOrConfirm => "CloseTabOrConfirm",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1606,6 +1608,7 @@ impl ActionName {
             "ToggleStackListOrientation" => Some(Self::ToggleStackListOrientation),
             "ToggleStackListOrientationByPaneId" => Some(Self::ToggleStackListOrientationByPaneId),
             "ReopenPane" => Some(Self::ReopenPane),
+            "CloseTabOrConfirm" => Some(Self::CloseTabOrConfirm),
             _ => None,
         }
     }

@@ -310,6 +310,7 @@ pub enum ScreenContext {
     SwitchTabNext,
     SwitchTabPrev,
     CloseTab,
+    CloseTabOrConfirm,
     GoToTab,
     GoToTabName,
     UpdateTabName,
