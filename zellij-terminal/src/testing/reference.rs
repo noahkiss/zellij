@@ -537,7 +537,13 @@ fn link_uri(anchor: Option<LinkAnchor>, links: &LinkHandler) -> Option<String> {
             let mut parts = osc8.splitn(3, ';');
             parts.next()?;
             parts.next()?;
-            Some(parts.next()?.trim_end_matches("\u{1b}\\").to_owned())
+            Some(
+                parts
+                    .next()?
+                    .trim_end_matches("\u{1b}\\")
+                    .trim_end_matches('\u{07}')
+                    .to_owned(),
+            )
         }),
         _ => None,
     }
