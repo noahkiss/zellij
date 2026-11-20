@@ -115,8 +115,8 @@ jobs:
       # artifact for `v0.45.0-nkmk.17-rc.1` then reports `0.45.0-nkmk.17`,
       # indistinguishable from a final release it has not become.
       #
-      # The three files a `chore: bump version` commit touches, for the same
-      # reason it touches them: the two manifests carry the workspace version
+      # The four files a `chore: bump version` commit touches, for the same
+      # reason it touches them: the three manifests carry the workspace version
       # and the path-dependency pins, and `--locked` below reads `Cargo.lock`.
       # A candidate is the only build that patches its own checkout; a final tag
       # builds what main says, untouched.
@@ -139,7 +139,7 @@ jobs:
           # not. The pattern is a literal version string, so its dots are
           # escaped rather than left to match anything.
           pattern="$(printf '%s' "$current" | sed 's/[][\.^$*|]/\\&/g')"
-          for f in Cargo.toml zellij-integration-tests/Cargo.toml Cargo.lock; do
+          for f in Cargo.toml zellij-integration-tests/Cargo.toml zellij-terminal/Cargo.toml Cargo.lock; do
             sed "s|${pattern}|${RELEASE_VERSION}|g" "$f" > "${f}.rc"
             mv "${f}.rc" "$f"
             grep -q -F "$RELEASE_VERSION" "$f" \
