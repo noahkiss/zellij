@@ -90,7 +90,12 @@ impl SessionManager for RealSessionManager {
         if !session_exists {
             spawn_new_session(session_name, os_input.clone(), zellij_ipc_pipe);
         }
-        os_input.connect_to_server(&zellij_ipc_pipe);
+        if let Err(e) = os_input.connect_to_server(&zellij_ipc_pipe) {
+            // `send_to_server` below already tolerates an unconnected client (it logs and drops
+            // the message), so this is not fatal to the process - just to this browser client,
+            // which never gets a session and is left to the caller's usual failure handling.
+            log::error!("{}", e);
+        }
         os_input.send_to_server(first_message);
     }
 }

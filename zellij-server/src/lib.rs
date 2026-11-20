@@ -1466,6 +1466,91 @@ impl SessionMetaData {
     }
 }
 
+/// How long teardown waits for one session thread to finish before leaving it behind.
+///
+/// These joins used to be unbounded, and that is what turned a stuck session thread into a server
+/// that stays alive forever holding its listening socket: the socket file is unlinked at the very
+/// end of `start_server_impl`, after this `Drop` returns, so a join that never returns leaves an
+/// orphan that accepts connections and answers none of them.
+///
+/// Five separate waits rather than one shared budget. The plugin thread's `BeforeClose` window and
+/// the background-jobs thread's web-request drain are each bounded already (2s and 3s), and a
+/// shared budget would let a slow pty spend the window one of those was promised.
+const SESSION_THREAD_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long teardown waits to get the session out of its lock.
+///
+/// The wait is normally instant: [`route_thread_main`] holds the read guard for a statement at a
+/// time and never across a blocking call, which is a rule the router already keeps deliberately.
+/// This bound is for the day something breaks it, because the cost of that is the whole process.
+const SESSION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the session out of its lock, or give up and leave it where it is.
+///
+/// The lock is taken on a helper thread and waited for over a channel rather than polled with
+/// `try_write`: a poll would livelock against the route threads reading the same lock, while a
+/// real blocking `write()` queues ahead of new readers and is guaranteed to get in as soon as the
+/// guards in flight are dropped.
+///
+/// Giving up means the session's `Drop` never runs on this thread. Nothing is lost by that at this
+/// point -- the process is about to exit, which closes the pane shells' ptys and the listening
+/// socket. If the helper does get the lock later, it drops the session there instead, on its own
+/// bounded joins.
+fn take_session_within(
+    session_data: &Arc<RwLock<Option<SessionMetaData>>>,
+    timeout: std::time::Duration,
+) -> Option<SessionMetaData> {
+    let (taken_sender, taken_receiver) = channels::bounded(1);
+    let session_data = session_data.clone();
+    let _ = thread::Builder::new()
+        .name("server_session_take".to_string())
+        .spawn(move || {
+            let taken = session_data
+                .write()
+                .ok()
+                .and_then(|mut session| session.take());
+            // the receiver is gone if we were too slow: drop the session here instead
+            if let Err(
+                channels::TrySendError::Full(session)
+                | channels::TrySendError::Disconnected(session),
+            ) = taken_sender.try_send(taken)
+            {
+                drop(session);
+            }
+        });
+    match taken_receiver.recv_timeout(timeout) {
+        Ok(session) => session,
+        Err(_) => {
+            log::error!(
+                "could not take the session out of its lock within {:?}, exiting without it",
+                timeout
+            );
+            None
+        },
+    }
+}
+
+/// Join a session thread, or give up on it and say which one it was.
+///
+/// Giving up leaves the thread running and lets teardown carry on, which is the point: the process
+/// is on its way out, and exiting closes the pane shells' ptys and the listening socket with it.
+/// A thread that will not finish costs a log line, not the session's ability to end.
+fn join_or_give_up(handle: thread::JoinHandle<()>, thread_name: &str) {
+    let deadline = std::time::Instant::now() + SESSION_THREAD_JOIN_TIMEOUT;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            log::error!(
+                "the {} thread did not finish within {:?}, leaving it behind so the session can exit",
+                thread_name,
+                SESSION_THREAD_JOIN_TIMEOUT
+            );
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let _ = handle.join();
+}
+
 impl Drop for SessionMetaData {
     fn drop(&mut self) {
         if let Some(watcher) = self.config_file.keybinds_dir_watcher.as_mut() {
@@ -1901,14 +1986,57 @@ mod env_sync_tests {
 }
 
 #[cfg(test)]
-mod session_state_tests {
+mod open_files_and_accept_tests {
     use super::*;
 
-    fn with_client(id: ClientId) -> SessionState {
-        let mut s = SessionState::new();
-        s.clients.insert(id, None);
-        s
+    #[test]
+    fn the_macos_default_is_raised_to_the_ceiling() {
+        // 256 soft, unlimited hard: what a macOS server inherits from a shell.
+        assert_eq!(
+            desired_open_file_limit(256, u64::MAX),
+            Some(DESIRED_OPEN_FILES)
+        );
     }
+
+    #[test]
+    fn the_hard_limit_is_never_exceeded() {
+        // Raising the hard limit needs privileges the server does not have, so a process capped
+        // below what it wants takes the cap.
+        assert_eq!(desired_open_file_limit(64, 1024), Some(1024));
+    }
+
+    #[test]
+    fn a_process_that_already_has_enough_is_left_alone() {
+        assert_eq!(desired_open_file_limit(DESIRED_OPEN_FILES, u64::MAX), None);
+        assert_eq!(desired_open_file_limit(1_048_576, u64::MAX), None);
+        // Never lower a soft limit that is already above what the hard limit would allow us to
+        // ask for.
+        assert_eq!(desired_open_file_limit(4096, 4096), None);
+    }
+
+    #[test]
+    fn the_accept_backoff_doubles_up_to_a_ceiling() {
+        assert_eq!(accept_backoff(1).as_millis(), 50);
+        assert_eq!(accept_backoff(2).as_millis(), 100);
+        assert_eq!(accept_backoff(3).as_millis(), 200);
+        assert_eq!(accept_backoff(5).as_millis(), 800);
+        assert_eq!(accept_backoff(6).as_millis(), 1000);
+        // A long run must stay at the ceiling rather than overflow the shift.
+        assert_eq!(accept_backoff(64).as_millis(), 1000);
+        assert_eq!(accept_backoff(u32::MAX).as_millis(), 1000);
+    }
+
+    #[test]
+    fn a_run_of_failures_is_logged_at_the_start_and_then_thinned_out() {
+        for n in 1..=5 {
+            assert!(should_log_accept_failure(n), "{} should be logged", n);
+        }
+        assert!(!should_log_accept_failure(6));
+        assert!(!should_log_accept_failure(59));
+        assert!(should_log_accept_failure(60));
+        assert!(should_log_accept_failure(120));
+    }
+}
 
     #[test]
     fn pick_forward_target_prefers_last_active_when_still_connected() {
@@ -3298,8 +3426,123 @@ theme \"first\"
     }
 }
 
+/// How many open files the server asks for. A session's descriptors grow with what is in it -- a
+/// pty per pane, a plugin instance per tab for each of the bars, the mounts and caches each of
+/// those holds -- so the ceiling has to clear a session that has been added to for weeks, not one
+/// that was just created. It is deliberately not "as many as the kernel will give": macOS reports
+/// an unlimited hard limit and 10240 is the value `setrlimit` there actually honours.
+const DESIRED_OPEN_FILES: u64 = 10_240;
+
+/// The soft limit to ask for, given the limits the process was started with, or `None` when the
+/// process already has enough. The soft limit is never lowered, and the hard limit is never
+/// exceeded -- raising that needs privileges the server does not have and should not want.
+fn desired_open_file_limit(soft: u64, hard: u64) -> Option<u64> {
+    let target = hard.min(DESIRED_OPEN_FILES);
+    if target > soft {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// Raise this process's soft open-file limit towards its hard limit.
+///
+/// The server inherits whatever the shell that launched it had, and macOS still hands out 256. A
+/// session that lives for weeks walks into that ceiling and everything downstream of a descriptor
+/// -- spawning a plugin, serializing the session, accepting a client -- starts failing at once.
+///
+/// A failure here is logged and otherwise ignored: the server runs with what it has, exactly as it
+/// did before.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        log::warn!(
+            "could not read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let Some(target) = desired_open_file_limit(limit.rlim_cur as u64, limit.rlim_max as u64) else {
+        log::info!("open-file limit is {}, leaving it alone", limit.rlim_cur);
+        return;
+    };
+    let raised = libc::rlimit {
+        rlim_cur: target as libc::rlim_t,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        log::warn!(
+            "could not raise the open-file limit from {} to {}: {}",
+            limit.rlim_cur,
+            target,
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    log::info!(
+        "raised the open-file limit from {} to {}",
+        limit.rlim_cur,
+        target
+    );
+}
+
+/// How long to wait after `accept()` has failed `consecutive_failures` times in a row.
+///
+/// EMFILE is the failure this exists for and it is transient: a descriptor comes back, or the
+/// operator raises the limit, and the next accept succeeds. So the wait starts short enough to be
+/// invisible to a client that is merely unlucky, and doubles up to a ceiling so that a failure
+/// which is not transient costs one log line a second instead of a spinning thread.
+fn accept_backoff(consecutive_failures: u32) -> std::time::Duration {
+    const FIRST_BACKOFF_MS: u64 = 50;
+    const MAX_BACKOFF_MS: u64 = 1_000;
+    // The exponent is clamped before the shift, not after: `50 << 63` wraps to zero and would
+    // turn a long run of failures into a spin.
+    let exponent = consecutive_failures.saturating_sub(1).min(16);
+    std::time::Duration::from_millis((FIRST_BACKOFF_MS << exponent).min(MAX_BACKOFF_MS))
+}
+
+/// Whether a failure this far into a run of them is worth a log line. Every one of the first few
+/// is, because that is the run an operator is going to read; after that the run is a condition
+/// rather than an event, and at the backoff ceiling one line a minute is enough to show it is
+/// still going.
+fn should_log_accept_failure(consecutive_failures: u32) -> bool {
+    consecutive_failures <= 5 || consecutive_failures % 60 == 0
+}
+
 pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
+    // The listener below unlinks whatever sits at this path before it binds, which is right for a
+    // socket a dead server left behind and catastrophic for one a live server is still holding:
+    // the old server keeps running, keeps its panes, and becomes unreachable by any client,
+    // because a unix socket cannot be given its pathname back. Nothing upstream of here is
+    // guaranteed to have checked -- the client's check is a liveness probe, and a busy server can
+    // fail one -- so the last thing that can still refuse, does.
+    #[cfg(unix)]
+    if zellij_utils::consts::ipc_connect(&socket_path).is_ok() {
+        let message = format!(
+            "refusing to start: a server is already listening on {}",
+            socket_path.display()
+        );
+        log::error!("{}", message);
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
+
     info!("Starting Zellij server!");
+
+    // Record the build this server started as, while the file at its path is still that build.
+    // An upgrade can rename a new build over it at any moment after this, and the superseded-build
+    // badge needs the identity from before that happens.
+    zellij_utils::session_lifecycle::record_running_build(socket_path.clone());
+
+    // Before anything opens a descriptor, and while this is still the only thread. Only the real
+    // server process does this -- the in-process server the integration tests run must not touch
+    // the harness's limits.
+    #[cfg(unix)]
+    raise_open_file_limit();
 
     #[cfg(unix)]
     {
@@ -3807,6 +4050,14 @@ pub fn start_server_impl(
     // No-op off macOS.
     zellij_utils::session_lifecycle::probe_protected_locations();
 
+    let (to_server, server_receiver): ChannelWithContext<ServerInstruction> = channels::bounded(50);
+    let to_server = SenderWithContext::new(to_server);
+    let session_data: Arc<RwLock<Option<SessionMetaData>>> = Arc::new(RwLock::new(None));
+    let session_state = Arc::new(RwLock::new(SessionState::new()));
+    // Set the moment the main loop breaks, and read by the accept loop below. Nothing past that
+    // point can serve a client, and a connection accepted anyway is worse than one refused -- see
+    // the accept loop for what it costs.
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     if install_panic_hook {
         std::panic::set_hook({
@@ -3834,6 +4085,7 @@ pub fn start_server_impl(
             let to_server = to_server.clone();
             let socket_path = socket_path.clone();
             let server_socket = server_socket.clone();
+            let shutting_down = shutting_down.clone();
             move || {
                 let listener = match server_socket.bind() {
                     Ok(listener) => listener,
@@ -3895,12 +4147,42 @@ pub fn start_server_impl(
                 }
 
                 #[cfg(not(windows))]
+                let mut consecutive_accept_failures: u32 = 0;
+                #[cfg(not(windows))]
                 for stream in listener.incoming() {
                     match stream {
-                        Ok(stream) => route(stream),
+                        Ok(stream) => {
+                            consecutive_accept_failures = 0;
+                            if shutting_down.load(Ordering::Acquire) {
+                                // fork: the main loop has broken and nothing behind this socket
+                                // will answer again. Registering the connection anyway allocates
+                                // a client id and two threads for a client nothing can serve, and
+                                // leaves the caller waiting on a reply that is not coming. Closing
+                                // the stream answers honestly instead, and the liveness probe
+                                // reads that as "not a session" rather than blocking on it.
+                                drop(stream);
+                                continue;
+                            }
+                            route(stream)
+                        },
                         Err(err) => {
-                            log::error!("Failed to accept connection: {:?}", err);
-                            thread::sleep(ACCEPT_ERROR_BACKOFF);
+                            // A connection that could not be accepted is one client that has to
+                            // try again. It used to be every pane in the session: this panicked,
+                            // and the panic hook takes the server down with it. EMFILE is the
+                            // failure that made that a real loss -- a session with enough tabs
+                            // runs out of descriptors, and the attach that finds the ceiling is
+                            // not the thing that deserves to be blamed for it.
+                            consecutive_accept_failures = consecutive_accept_failures.saturating_add(1);
+                            let backoff = accept_backoff(consecutive_accept_failures);
+                            if should_log_accept_failure(consecutive_accept_failures) {
+                                log::error!(
+                                    "failed to accept a client connection ({} in a row), retrying in {:?}: {:?}",
+                                    consecutive_accept_failures,
+                                    backoff,
+                                    err
+                                );
+                            }
+                            thread::sleep(backoff);
                         },
                     }
                 }

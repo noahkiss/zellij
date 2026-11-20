@@ -185,6 +185,12 @@ pub fn attach_by_name(
     match &session_name {
         Some(session) if create => match session_exists(session) {
             Ok(true) => Ok(ClientInfo::Attach(session_name.unwrap(), config_options)),
+            // `--create` turns "I could not see it" into "make one", and the make unlinks the
+            // socket it could not see. A server that is bound but did not answer the probe is a
+            // live session, so refuse rather than take its name away from it.
+            Ok(false) if socket_is_occupied(session) => {
+                refuse_to_replace_live_session(session, "attach --create")
+            },
             Ok(false) => Ok(ClientInfo::New(session_name.unwrap(), None, None, None)),
             Err(kind) => Err(ResolutionFailure::to_stderr(
                 session_listing_error_message(kind),
@@ -203,10 +209,14 @@ pub fn attach_by_name(
                 1,
             )
             .listing(SessionListing::Named(sessions))),
-            Ok(SessionNameMatch::None) => Err(ResolutionFailure::to_stderr(
-                format!("No session with the name '{}' found!", prefix),
-                1,
-            )),
+            Ok(SessionNameMatch::None) => {
+                let mut message = format!("No session with the name '{}' found!", prefix);
+                if let Some(help) = contract_mismatch_help(prefix, Some(&config_options)) {
+                    message.push('\n');
+                    message.push_str(&help);
+                }
+                Err(ResolutionFailure::to_stderr(message, 1))
+            },
             Err(kind) => Err(ResolutionFailure::to_stderr(
                 session_listing_error_message(kind),
                 1,
@@ -214,18 +224,14 @@ pub fn attach_by_name(
         },
         None => match get_active_session() {
             ActiveSession::None if create => create_new_client(),
-            ActiveSession::None => Err(ResolutionFailure::to_stderr(
-                "No active zellij sessions found.",
-                1,
-            )),
+            ActiveSession::None => Err(no_session_answers_to("No active zellij sessions found.")),
             ActiveSession::One(session_name) => {
                 Ok(ClientInfo::Attach(session_name, config_options))
             },
-            ActiveSession::Many => Err(ResolutionFailure::to_stdout(
-                "Please specify the session to attach to, either by using the full name or a unique prefix.\nThe following sessions are active:",
-                1,
-            )
-            .listing(SessionListing::Active)),
+            ActiveSession::Many => Err(no_session_answers_to(
+                "Please specify the session to attach to, either by using the full name or a \
+                 unique prefix.\nThe following sessions are active:",
+            )),
         },
     }
 }
@@ -250,14 +256,71 @@ pub fn resolve_attach(
             .as_ref()
             .and_then(|s| session_exists(&s).ok())
             .unwrap_or(false);
-        let resurrection_layout = match session_name
-            .as_ref()
-            .filter(|_| !session_exists)
-            .map(|s| resurrection_layout(&s))
-            .transpose()
-        {
-            Ok(layout) => layout.flatten(),
-            Err(e) => return Err(ResolutionFailure::to_stderr(format!("{}", e), 2)),
+        // fork: every branch below that creates -- a fresh session, a resurrection, a snapshot
+        // restore -- starts a server on this name's socket, and starting one unlinks whatever is
+        // bound there. `session_exists` is a liveness probe and a bound server can fail one, so
+        // ask the smaller question before any of them.
+        if create && !session_exists {
+            if let Some(name) = session_name.as_ref() {
+                if socket_is_occupied(name) {
+                    refuse_to_replace_live_session(name, "attach --create");
+                }
+            }
+        }
+        // fork: --restore is the counterpart to --no-resurrect: three explicit behaviours for a
+        // dead name - resurrect from the in-place file (default), start clean (--no-resurrect), or
+        // rebuild from a chosen snapshot
+        let snapshot_to_restore = match args.restore.as_ref() {
+            Some(_) if session_exists => {
+                return Err(ResolutionFailure::to_stderr(
+                    format!(
+                        "Session '{}' is running, so there is nothing to restore into.",
+                        session_name.as_deref().unwrap_or_default()
+                    ),
+                    2,
+                ))
+            },
+            Some(id) => Some(
+                resolve_snapshot(
+                    &SnapshotSettings::from_options(Some(&config_options)),
+                    id,
+                    session_name.as_deref(),
+                )
+                .map_err(|e| ResolutionFailure::to_stderr(e, 2))?,
+            ),
+            None => None,
+        };
+        let resurrection_layout = if let Some(snapshot) = snapshot_to_restore.as_ref() {
+            report_snapshot_version_drift(snapshot);
+            match snapshot.layout() {
+                Ok(layout) => Some(layout),
+                Err(e) => {
+                    return Err(ResolutionFailure::to_stderr(
+                        format!("Cannot restore snapshot {}: {}", snapshot.id, e),
+                        2,
+                    ))
+                },
+            }
+        } else if args.no_resurrect {
+            // --no-resurrect: the snapshot is discarded rather than merely ignored: leaving it on
+            // disk would keep the session name taken by a dead session and block the fresh start
+            // the flag asks for
+            if !session_exists {
+                if let Some(session_name) = session_name.as_ref() {
+                    discard_resurrection_snapshot(session_name);
+                }
+            }
+            None
+        } else {
+            match session_name
+                .as_ref()
+                .filter(|_| !session_exists)
+                .map(|s| resurrection_layout(&s))
+                .transpose()
+            {
+                Ok(layout) => layout.flatten(),
+                Err(e) => return Err(ResolutionFailure::to_stderr(format!("{}", e), 2)),
+            }
         };
         if create && !session_exists && resurrection_layout.is_none() {
             session_name.clone().map(|name| assert_session_ne(&name));
@@ -267,13 +330,17 @@ pub fn resolve_attach(
                 if args.force_run_commands {
                     resurrection_layout.recursively_add_start_suspended(Some(false));
                 }
-                ClientInfo::Resurrect(
-                    session_name.clone(),
+                let path_to_layout = match snapshot_to_restore.as_ref() {
+                    Some(snapshot) => snapshot.layout_file(),
                     // The layout cache is keyed by session id (== name for legacy sessions).
-                    session_layout_cache_file_name(
+                    None => session_layout_cache_file_name(
                         &zellij_utils::sessions::resolve_session_id(session_name)
                             .unwrap_or_else(|| session_name.to_string()),
                     ),
+                };
+                ClientInfo::Resurrect(
+                    session_name.clone(),
+                    path_to_layout,
                     args.force_run_commands,
                     new_session_cwd,
                 )

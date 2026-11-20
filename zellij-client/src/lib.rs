@@ -36,10 +36,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(feature = "web_server_capability")]
+use zellij_utils::errors::prelude::Context;
 use zellij_utils::errors::FatalError;
 use zellij_utils::shared::web_server_base_url;
 
-pub use server_launch::{launch_style, spawn_server, spawn_server_with, LaunchStyle, ServerLaunch};
+pub use server_launch::{
+    launch_style, record_pinned_server_exe, spawn_server, spawn_server_with, LaunchStyle,
+    ServerLaunch,
+};
 
 #[cfg(feature = "web_server_capability")]
 use futures_util::{SinkExt, StreamExt};
@@ -103,6 +108,17 @@ impl OuterGraphemeClusterMode {
         self.enabled
     }
 }
+
+/// Contexts for the teardown calls below. Everything a client does after it has decided to leave
+/// is talking to a terminal that may already be gone - an ssh transport that dropped, a window
+/// that was closed - and on such a tty every one of these calls returns EIO. None of them can
+/// achieve anything at that point, so a failure is logged and stepped over rather than unwrapped.
+/// The startup counterparts stay unguarded on purpose: there the tty is expected live, and a
+/// failure means the client cannot run at all.
+#[cfg(feature = "web_server_capability")]
+const RAW_MODE_TEARDOWN_ERR: &str = "failed to unset raw mode on the way out";
+#[cfg(feature = "web_server_capability")]
+const TEARDOWN_WRITE_ERR: &str = "failed to write the teardown message to a terminal that is gone";
 
 /// Spawn an async runtime for this client instance.
 ///
@@ -1037,12 +1053,18 @@ pub fn start_remote_client(
             let _ = stdout.flush();
         }
         os_input.discard_pending_input();
-        os_input.unset_raw_mode().unwrap();
+        os_input
+            .unset_raw_mode()
+            .context(RAW_MODE_TEARDOWN_ERR)
+            .non_fatal();
         os_input.restore_console_mode();
         let error = terminal_teardown_message(&e, full_screen_ws.rows, false, false);
         let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(error.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        stdout
+            .write_all(error.as_bytes())
+            .and_then(|_| stdout.flush())
+            .context(TEARDOWN_WRITE_ERR)
+            .non_fatal();
         if exit_status == 0 {
             log::info!("{}", e);
         } else {
@@ -1077,8 +1099,11 @@ pub fn start_remote_client(
     } else {
         let clear_screen = "\u{1b}[2J";
         let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(clear_screen.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        stdout
+            .write_all(clear_screen.as_bytes())
+            .and_then(|_| stdout.flush())
+            .context(TEARDOWN_WRITE_ERR)
+            .non_fatal();
     }
 
     Ok(reconnect_to_session)
@@ -1142,6 +1167,7 @@ pub fn first_message(
             host_terminal_env: host_terminal_env.clone(),
             initial_panes,
             switch_context: switch_context.clone(),
+            tty: own_tty(),
         }
     };
 

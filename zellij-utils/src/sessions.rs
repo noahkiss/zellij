@@ -245,28 +245,77 @@ fn assert_socket(name: &str) -> bool {
     use crate::consts::ipc_connect;
     let path = &*ZELLIJ_SOCK_DIR.join(name);
     match ipc_connect(path) {
-        Ok(stream) => {
-            // a wedged server accepts connections but never replies; without a
-            // read timeout `zellij ls` would block forever on recv below
-            {
-                use interprocess::local_socket::prelude::*;
-                let _ = stream.set_recv_timeout(Some(std::time::Duration::from_secs(5)));
-            }
-            let mut sender: IpcSenderWithContext<ClientToServerMsg> =
-                IpcSenderWithContext::new(stream);
-            let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
-            let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
-            match receiver.recv_server_msg() {
-                Some((ServerToClientMsg::Connected, _)) => true,
-                None | Some((_, _)) => false,
-            }
-        },
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            drop(fs::remove_file(path));
-            false
-        },
-        Err(_) => false,
-    }
+/// How long the liveness probe gives one server to answer before calling it unresponsive.
+///
+/// A server that accepts the connection and then never replies is the case this exists for. The
+/// probe used to block in `recv` with no deadline, so a single session whose teardown had wedged
+/// hung every command that enumerates sessions -- `zellij ls`, `attach`, `delete-session`,
+/// `kill-session`, `session up` -- for every session in the socket directory, not just its own.
+/// One bad tab close took session enumeration out machine-wide until the pid was killed by hand.
+///
+/// The scan is serial and the wait is per socket, so this is short enough that a directory holding
+/// several dead sockets still answers, and long enough that a merely busy server is not mistaken
+/// for a dead one.
+///
+/// A probe that gives up costs a session its row in a listing and nothing more. The *destructive*
+/// paths do not ask this question: [`socket_is_occupied`] asks whether anything is listening and
+/// waits for no reply at all, which is what keeps a slow server from being replaced out from under
+/// its own panes.
+#[cfg(unix)]
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether a server is bound to this session's socket, without asking it anything.
+///
+/// [`assert_socket`] is the listing question: it wants a server that answers, and a server that
+/// accepts the connection but does not reply is reported as absent. That is the right answer for a
+/// listing and the wrong one for a *destructive* decision, because creating a session of the same
+/// name unlinks that socket and takes the name -- orphaning a server whose panes are still running,
+/// with nothing left that can reach it.
+///
+/// So this asks the smaller question that cannot go wrong: is the accept queue there. A successful
+/// connect means a live process is listening, whatever it goes on to say.
+#[cfg(unix)]
+pub fn socket_is_occupied(name: &str) -> bool {
+    socket_path_is_occupied(&ZELLIJ_SOCK_DIR.join(session_id_for(name)))
+}
+
+/// [`socket_is_occupied`] for a path, so the answer can be tested without a global socket
+/// directory.
+#[cfg(unix)]
+pub fn socket_path_is_occupied(path: &std::path::Path) -> bool {
+    crate::consts::ipc_connect(path).is_ok()
+}
+
+/// Windows has no socket file to bind over; the marker file plus a pid check is the whole answer.
+#[cfg(not(unix))]
+pub fn socket_is_occupied(name: &str) -> bool {
+    assert_socket(&session_id_for(name))
+}
+
+/// Refuse, loudly, to do something that would take the name of a session a server still holds.
+///
+/// Says what it found and what to do about it, and never falls through: the caller's next move
+/// would destroy the session it is describing.
+pub fn refuse_to_replace_live_session(name: &str, what: &str) -> ! {
+    eprintln!(
+        "{}: a server is already listening for session '{}'.",
+        what, name
+    );
+    eprintln!(
+        "  socket: {}",
+        ZELLIJ_SOCK_DIR.join(session_id_for(name)).display()
+    );
+    eprintln!(
+        "  It did not answer the liveness probe, so it is not in `zellij ls` -- but it is there,"
+    );
+    eprintln!("  and creating a session by this name would unlink its socket and orphan it: its");
+    eprintln!("  panes would keep running with nothing able to reach them.");
+    eprintln!(
+        "  Try `zellij attach {}` to reach it, or `zellij session restart {}` to replace it",
+        name, name
+    );
+    eprintln!("  deliberately. Pick another name to start something new.");
+    process::exit(1);
 }
 
 /// On Windows, reads the server PID from the marker file and checks whether
@@ -844,6 +893,19 @@ pub fn assert_session_ne(name: &str) {
     if let Err(e) = validate_session_name(name) {
         eprintln!("{}", e);
         process::exit(1);
+    }
+
+pub fn assert_session_ne(name: &str) {
+    if let Err(e) = validate_session_name(name) {
+        eprintln!("{}", e);
+        process::exit(1);
+    }
+
+    // `session_exists` is a listing question and a listing can be wrong in the one direction that
+    // costs a session here: a server that is bound but does not answer reads as absent, and the
+    // create that follows would unlink its socket. Ask the smaller question first.
+    if socket_is_occupied(name) && !session_exists(name).unwrap_or(false) {
+        refuse_to_replace_live_session(name, "session create");
     }
 
     match session_exists(name) {

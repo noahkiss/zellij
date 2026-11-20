@@ -2412,6 +2412,21 @@ fn socket_for(session_name: &str) -> Result<PathBuf, String> {
     Ok(sock_dir)
 }
 
+pub fn start_subscribe_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    subscribe_cli: SubscribeCli,
+) {
+    let zellij_ipc_pipe: PathBuf = {
+        let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+        fs::create_dir_all(&sock_dir).unwrap();
+        zellij_utils::shared::set_permissions(&sock_dir, 0o700).unwrap();
+        sock_dir.push(zellij_utils::sessions::session_id_for(session_name));
+        sock_dir
+    };
+    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", e);
         process::exit(1);
     }
 

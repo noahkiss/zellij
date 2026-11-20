@@ -29,6 +29,10 @@ use zellij_utils::{
 };
 
 const SIGWINCH_CB_THROTTLE_DURATION: time::Duration = time::Duration::from_millis(50);
+/// How long a CLI client retries connecting to a session's socket before giving up on it. Distinct
+/// from `SERVER_APPEARANCE_TIMEOUT` in `src/session_commands.rs`, which is `session up`'s own wait
+/// for a server it just asked to spawn.
+pub(crate) const CONNECT_TO_SERVER_TIMEOUT: time::Duration = time::Duration::from_secs(5);
 
 pub(crate) const ENABLE_MOUSE_SUPPORT: &str =
     "\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1003h\u{1b}[?1015h\u{1b}[?1006h";
@@ -179,7 +183,10 @@ pub trait ClientOsApi: Send + Sync + std::fmt::Debug {
         resize_receiver: Option<std::sync::mpsc::Receiver<()>>,
     );
     /// Establish a connection with the server socket, waiting for the server to start listening.
-    /// Fails only when the server refuses this client.
+    ///
+    /// The wait is bounded (`CONNECT_TO_SERVER_TIMEOUT` on Unix): a session that answers to no
+    /// server at all fails instead of hanging. `Err` means the deadline passed without a
+    /// connection, or the server refused this client.
     fn connect_to_server(&self, path: &Path) -> std::io::Result<()>;
     fn spawn_server(&self, socket_path: &Path, debug: bool) -> Result<(), std::io::Error> {
         crate::spawn_server(socket_path, debug)

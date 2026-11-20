@@ -83,10 +83,33 @@ pub(crate) fn connect_ipc(
     IpcSenderWithContext<zellij_utils::ipc::ClientToServerMsg>,
     IpcReceiverWithContext<zellij_utils::ipc::ServerToClientMsg>,
 )> {
+    // Bounded, unlike the poll `session up` runs while a server it just spawned is still binding
+    // its socket (`wait_for_server` in `src/session_commands.rs`). A session that answers to no
+    // server at all (crashed, never started, socket left behind) used to retry every 50ms forever,
+    // so every verb against a down session hung instead of failing.
+    let deadline = std::time::Instant::now() + super::os_input_output::CONNECT_TO_SERVER_TIMEOUT;
     let socket = loop {
         match zellij_utils::consts::ipc_connect(path) {
             Ok(socket) => break socket,
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    // the socket file is named by the session's id; the index maps it back to
+                    // the name (a session from before ids is named by its name)
+                    let session_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(zellij_utils::sessions::display_name_for_session_id)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "session '{}' is not running (or its server is unreachable): {}",
+                            session_name, e
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            },
         }
     };
     let sender = IpcSenderWithContext::new(socket);
