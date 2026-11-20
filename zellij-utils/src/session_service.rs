@@ -3847,6 +3847,35 @@ mod tests {
         }
     }
 
+    /// The memory limits are `service` directives like any other, the swap limit included: the
+    /// generated unit carries all three in `[Service]`, and a unit missing the swap limit drifts.
+    #[test]
+    fn the_memory_and_swap_limits_reach_the_unit_and_their_drift_is_seen() {
+        let mut extras = SessionServiceOptions::default();
+        for directive in ["MemoryHigh=16G", "MemoryMax=19G", "MemorySwapMax=3G"] {
+            extras.add_systemd_directive("service", directive).unwrap();
+        }
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras), None);
+        let service = unit
+            .split("[Service]\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("a [Service] section");
+        for directive in ["MemoryHigh=16G", "MemoryMax=19G", "MemorySwapMax=3G"] {
+            assert!(service.lines().any(|line| line == directive), "{}", unit);
+        }
+
+        let without_swap = unit.replace("MemorySwapMax=3G\n", "");
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = installed_unit(&dir, Some(&without_swap), &unit);
+        match drift_of(&files) {
+            UnitDrift::Drifted { files } => {
+                assert_eq!(files[0].differing_keys(), "MemorySwapMax differs");
+            },
+            other => panic!("expected drift, got {:?}", other),
+        }
+    }
+
     /// Every file under `dir`, with its bytes and its modification time, in a stable order.
     fn tree_of(dir: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
         let mut tree: Vec<_> = std::fs::read_dir(dir)

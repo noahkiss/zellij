@@ -2496,6 +2496,25 @@ plist key with any plist value, XML-escaped. zellij models neither schema: a cop
 specifications that already exist would be worse than both, and would reject every key added to
 them after it was written.
 
+**Memory and swap limits are directives too.** A session's cgroup limits go in `service`, beside
+any other directive, and the generated unit carries them in `[Service]`:
+
+```kdl
+session_service {
+    systemd {
+        service "MemoryHigh=16G" "MemoryMax=19G" "MemorySwapMax=3G"
+    }
+}
+```
+
+`MemorySwapMax` matters as much as the other two: without it the cgroup may swap without limit, and a
+runaway process drains the machine's swap before `MemoryMax` kills it. `session status` reports a
+changed or missing limit as drift, like any directive. Every build passes the string through, so an
+older build reads the same config unchanged. Set a limit here, not with `systemctl --user
+set-property`: that writes a drop-in under `~/.config/systemd/user.control/`, which the generator
+and `session status` do not see and which outlives a config edit. launchd has no swap limit, so
+macOS has no equivalent.
+
 **Arrays and dictionaries, not only scalars.** A scalar was enough for as long as the plists were
 written by hand — anything the config could not express, you wrote yourself. Once the plist is
 *generated*, this block is the only route any local knowledge has into the file, so the ceiling
