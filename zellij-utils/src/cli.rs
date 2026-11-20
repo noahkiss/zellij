@@ -3186,7 +3186,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     /// matched no agent or several.
     SendMessage {
         /// Who gets it: a pane handle, a tab name, an agent name or a project directory name
-        #[clap(long, value_parser, required_unless_present = "reply-to")]
+        #[clap(long, value_parser, required_unless_present = "reply_to")]
         to: Option<String>,
 
         /// Answer a message this session delivered: its sender is the target. With --to, the
@@ -4184,6 +4184,24 @@ mod tests {
             Some(Command::Action { action, .. }) => *action,
             other => panic!("Expected Action, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn send_message_takes_reply_to_alone_and_needs_one_of_the_two() {
+        match parse_action(&["send-message", "--reply-to", "3", "--", "Done."]) {
+            CliAction::SendMessage { to, reply_to, .. } => {
+                assert_eq!(to, None);
+                assert_eq!(reply_to.as_deref(), Some("3"));
+            },
+            other => panic!("expected send-message, got {:?}", other),
+        }
+        assert!(parse_cli(
+            ["zellij", "action", "send-message", "--", "Done."]
+                .iter()
+                .map(|word| word.to_string())
+                .collect()
+        )
+        .is_err());
     }
 
     #[test]
