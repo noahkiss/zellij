@@ -1,0 +1,3 @@
+# The local pre-push hygiene hook skips these built-in hits: <path><TAB><rule>.
+# Upstream fixture: a test snapshot the fork edits carries upstream's own sample path.
+zellij-server/src/tab/unit/snapshots/zellij_server__tab__tab_integration_tests__search_tab_nothing_highlighted.snap	home-path
