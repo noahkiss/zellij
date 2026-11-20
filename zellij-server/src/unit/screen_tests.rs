@@ -25625,6 +25625,31 @@ fn an_agent_that_ever_reported_is_never_refused_as_silent() {
     }
 }
 
+/// An agent that reported before the session's first look at the pane, then lost its state: the
+/// state the first look found counts as a report, so it is held, never settled as `no_state`.
+#[test]
+fn an_agent_that_reported_before_the_first_look_is_never_refused_as_silent() {
+    use zellij_utils::agent_mail::{Reason, Status, STARTUP_MS};
+    let (mut screen, _writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    assert!(screen.agent_seen_at.is_empty(), "no look yet");
+    screen.note_agent_starts(std::time::Instant::now());
+    // a full reset removes the state, and a long time passes with none
+    pane_bytes(&mut screen, "\x1bc");
+    screen.agent_seen_at.get_mut(&1).unwrap().since = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(STARTUP_MS * 3))
+        .unwrap();
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(record.reason, Some(Reason::Starting));
+    screen.drain_agent_messages();
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Queued,
+        "held, not settled"
+    );
+}
+
 /// A same-harness relaunch within one process tick: neither the kind nor the command line the
 /// tick reads changes, but the new program's query starts the window again.
 #[test]

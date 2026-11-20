@@ -2208,6 +2208,7 @@ pub(crate) struct AgentStart {
     /// The pane's `OSC 7501` query count at the last look.
     pub queries: u64,
     /// The pane's report count when this agent was first seen; one above it means it reported.
+    /// A state the pane already shows at the first look counts as one of this agent's reports.
     pub reports_before: u64,
 }
 
@@ -8385,12 +8386,18 @@ impl Screen {
     /// ever reported a state, starting or restarting the clock at this look as [`AgentStart`]
     /// says.
     fn agent_start(&mut self, terminal_id: u32, kind: &str, now: Instant) -> (u64, bool) {
-        let (reports, queries) = self
+        let (reports, queries, shows_state) = self
             .tabs
             .values()
             .find_map(|tab| tab.get_pane_with_id(PaneId::Terminal(terminal_id)))
             .and_then(|pane| pane.agent_prompt(now))
-            .map_or((0, 0), |prompt| (prompt.reports, prompt.queries));
+            .map_or((0, 0, false), |prompt| {
+                (
+                    prompt.reports,
+                    prompt.queries,
+                    prompt.program_status.is_some(),
+                )
+            });
         let command = self
             .pane_process_info
             .get(&terminal_id)
@@ -8402,10 +8409,19 @@ impl Screen {
             queries,
             reports_before: reports,
         };
-        let entry = self
-            .agent_seen_at
-            .entry(terminal_id)
-            .or_insert(fresh.clone());
+        let entry = self.agent_seen_at.entry(terminal_id).or_insert_with(|| {
+            // an agent that reported before the session first looked: its state counts as
+            // its report
+            let reports_before = if shows_state {
+                reports.saturating_sub(1)
+            } else {
+                reports
+            };
+            AgentStart {
+                reports_before,
+                ..fresh.clone()
+            }
+        });
         if entry.kind != kind {
             *entry = fresh;
         } else if entry.queries != queries || entry.command != command {

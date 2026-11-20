@@ -9150,7 +9150,9 @@ when that cannot mix with a person's typing, and otherwise holds it.
   starting) or its foreground command changes; another harness in the same pane is a new agent.
   An agent that has reported a state even once is never refused as `no_state`: a query, a full
   reset (RIS) or the harness's own `state=clear` leaves it with no state, and a message to it is
-  held as `starting` until it reports again.
+  held as `starting` until it reports again. A state the pane already shows when the session
+  first sees the agent counts as one of its reports, so an agent that reported before the first
+  process tick is never refused as silent either.
 - **The draft** is read from the bytes that reach the pane, the same ones that set
   `input_since_state`: characters and pastes add, Backspace and Delete take away, Ctrl c and
   Ctrl u clear, cursor moves change nothing, and a key whose effect cannot be known (Up, Tab, Esc
