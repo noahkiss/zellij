@@ -94,6 +94,8 @@ fn every_option_set() -> Options {
         bars_hidden_on_start: Some(crate::data::HiddenBars::from_names(&["tab-bar"])),
         hidden_bars_notification: Some(false),
         mode_hints_when_bars_hidden: Some(false),
+        // fork options are not on the settings screen
+        ..Default::default()
     }
 }
 

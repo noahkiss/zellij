@@ -106,15 +106,14 @@ use zellij_utils::{
         ClientAttributes, ClientToServerMsg, ExitReason, IpcReceiveError, IpcReceiverWithContext,
         ServerToClientMsg,
     },
-    shared::web_server_base_url,
+    session_service::configured_pinned_exe,
+    session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
+    shared::{set_terminal_title_format, web_server_base_url, TerminalTitleFormat},
 };
 
 pub use zellij_utils::data::ClientId;
 
 pub(crate) type SharedKeybinds = Arc<zellij_utils::data::KeybindsVec>;
-
-#[cfg(not(windows))]
-const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 const PRE_HANDSHAKE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const UNREADABLE_FIRST_MESSAGE_ERROR: &str = "This session could not read the request. It may be running a different version of Zellij that does not support it.";

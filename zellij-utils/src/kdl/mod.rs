@@ -1,5 +1,6 @@
 mod kdl_layout_parser;
 use crate::data::ClientId;
+pub mod unknown;
 use crate::data::{
     BareKey, BorderStyleOverride, Direction, FloatingPaneCoordinates, InputMode, KeyWithModifier,
     LayoutInfo, LayoutMetadata, LineStyle, MouseTarget, MouseTrigger, MultiplayerColors, Palette,
@@ -412,6 +413,26 @@ macro_rules! keys_from_kdl {
     };
 }
 
+/// The modes a `shared_except` or `shared_among` block names. A mode this build does not have is
+/// noted and left out.
+fn known_modes_from_kdl(kdl_node: &KdlNode) -> Result<Vec<InputMode>, ConfigError> {
+    let mut modes = vec![];
+    for mode_name in kdl_string_arguments!(kdl_node) {
+        match InputMode::from_str(mode_name) {
+            Ok(mode) => modes.push(mode),
+            Err(_) => note_unknown(
+                kdl_node.span().offset(),
+                format!(
+                    "unknown mode {:?} in {}, ignored",
+                    mode_name,
+                    kdl_name!(kdl_node)
+                ),
+            ),
+        }
+    }
+    Ok(modes)
+}
+
 #[macro_export]
 macro_rules! actions_from_kdl {
     ( $kdl_node:expr, $config_options:expr ) => {
@@ -526,7 +547,7 @@ impl Action {
             "ApplyFloatingSwapLayout" => Ok(Action::ApplyFloatingSwapLayout { name: string }),
             "SetPaneFrameStyle" => {
                 let style = PaneFrameStyle::from_str(string.as_str()).map_err(|e| {
-                    ConfigError::new_kdl_error(
+                    ConfigError::new_unknown_name(
                         format!("{}", e),
                         action_node.span().offset(),
                         action_node.span().len(),
@@ -537,7 +558,7 @@ impl Action {
             "SwitchToMode" => match InputMode::from_str(string.as_str()) {
                 Ok(input_mode) => Ok(Action::SwitchToMode { input_mode }),
                 Err(_e) => {
-                    return Err(ConfigError::new_kdl_error(
+                    return Err(ConfigError::new_unknown_name(
                         format!("Unknown InputMode '{}'", string),
                         action_node.span().offset(),
                         action_node.span().len(),
@@ -2862,7 +2883,8 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
             },
             "TogglePaneInGroup" => Ok(Action::TogglePaneInGroup),
             "ToggleGroupMarking" => Ok(Action::ToggleGroupMarking),
-            _ => Err(ConfigError::new_kdl_error(
+            // an action from a newer build: the keybinding parser skips the bind it is in
+            _ => Err(ConfigError::new_unknown_name(
                 format!("Unsupported action: {}", action_name).into(),
                 kdl_action.span().offset(),
                 kdl_action.span().len(),
@@ -3264,37 +3286,212 @@ macro_rules! kdl_get_int_entry {
     };
 }
 
+/// A path as the user wrote it, with `~` and `$VAR`/`${VAR}` resolved.
+///
+/// Layouts have expanded their paths since they had paths, so `~/...` works there and worked
+/// nowhere else - the same path written in the config was taken literally and silently pointed at a
+/// directory named `~`. Everything a user types a path into now goes through the same expansion, so
+/// one config can be written once and read on machines whose home directories differ.
+///
+/// A path with no `~` and no `$` is returned unchanged. Expansion that fails - an unset variable, a
+/// home directory that cannot be resolved - keeps the text as written rather than refusing the
+/// config: an unusable path fails later with a message about the file it names, while a config that
+/// does not parse takes the whole session with it.
+pub(crate) fn expand_path(path: &str) -> PathBuf {
+    match shellexpand::full(path) {
+        Ok(expanded) => PathBuf::from(expanded.as_ref()),
+        Err(e) => {
+            log::error!("Failed to expand the path {:?}: {}", path, e);
+            PathBuf::from(path)
+        },
+    }
+}
+
+/// Every top-level node a config may hold: the blocks [`Config::from_kdl`] reads, every option
+/// [`Options::from_kdl`] reads, `layout` (a layout file goes through the same parse for the
+/// options it carries) and `remote_hosts` (read by the MCP server from the same file). Anything
+/// else is a key from a newer build, or a typo, and is warned about.
+///
+/// A key read anywhere from the top level of `config.kdl` belongs here: the test
+/// `every_option_from_kdl_reads_is_a_known_top_level_node` holds [`Options::from_kdl`] to it.
+const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
+    // blocks
+    "keybinds",
+    "themes",
+    "plugins",
+    "load_plugins",
+    "plugin_permissions",
+    "ui",
+    "env",
+    "web_client",
+    "new_pane_default",
+    "layout",
+    "remote_hosts",
+    "mousebinds",
+    "context_menu",
+    "terminal",
+    "session_suggestions",
+    "attention",
+    // options
+    "advanced_mouse_actions",
+    "attach_to_session",
+    "auto_layout",
+    "bars_hidden_on_start",
+    "bell_clear_delay_ms",
+    "client_async_worker_tasks",
+    "command_pane_on_clean_exit",
+    "context_menu_enabled",
+    "copy_clipboard",
+    "copy_command",
+    "copy_on_select",
+    "dangerously_allow_web_serving_without_a_certificate",
+    "dangerously_enable_paste_buffer_read",
+    "default_cwd",
+    "default_floating_size",
+    "default_layout",
+    "default_mode",
+    "default_shell",
+    "detect_agents",
+    "disable_session_metadata",
+    "enforce_https_for_localhost",
+    "expect_full_disk_access",
+    "explicit_theme_hue",
+    "focus_follows_mouse",
+    "grapheme_clusters",
+    "hidden_bars_notification",
+    "host_notification_protocol",
+    "input_while_scrolled",
+    "keybinds_dir",
+    "layout_dir",
+    "live_view_release_key",
+    "mirror_resizes_source_pane",
+    "mirror_session",
+    "mode_hints_when_bars_hidden",
+    "mouse_click_through",
+    "mouse_hover_effects",
+    "mouse_hover_tips",
+    "mouse_mode",
+    "mouse_scroll_resize",
+    "nested_session_handling",
+    "on_force_close",
+    "on_quit",
+    "osc133_command_selection",
+    "osc8_hyperlinks",
+    "pane_frame_agent_name",
+    "pane_frame_style",
+    "pane_frames",
+    "plugin_watch",
+    "post_command_discovery_hook",
+    "resurrect_command_hints",
+    "resurrect_commands",
+    "scroll_buffer_size",
+    "scroll_mode_sync",
+    "scrollback_editor",
+    "scrollback_lines_to_serialize",
+    "serialization_interval",
+    "serialize_pane_viewport",
+    "session_aliases",
+    "session_indicator",
+    "session_name",
+    "session_restart_drop_env",
+    "session_serialization",
+    "session_service",
+    "session_snapshot_limit",
+    "session_up_resume",
+    "show_release_notes",
+    "show_startup_tips",
+    "simplified_ui",
+    "snapshot_dir",
+    "stacked_pane_list",
+    "stacked_pane_list_orientation",
+    "stacked_resize",
+    "stale_build_notice",
+    "styled_underlines",
+    "support_kitty_graphics_protocol",
+    "support_kitty_keyboard_protocol",
+    "swap_layout_notification",
+    "terminal_title_template",
+    "theme",
+    "theme_dark",
+    "theme_dir",
+    "theme_light",
+    "visual_bell",
+    "web_server",
+    "web_server_cert",
+    "web_server_ip",
+    "web_server_key",
+    "web_server_port",
+    "web_sharing",
+    "word_separators",
+];
+
+/// Note every top-level node this build does not read. Nothing is dropped: an unknown top-level
+/// node has always been ignored. What is new is that it is said.
+fn note_unknown_top_level_nodes(document: &KdlDocument) {
+    for node in document.nodes() {
+        let name = kdl_name!(node);
+        if !KNOWN_TOP_LEVEL_NODES.contains(&name) {
+            note_unknown(
+                node.span().offset(),
+                format!("unknown setting {:?}, ignored", name),
+            );
+        }
+    }
+}
+
+/// Note that a known option holds a value this build does not know. The option is left unset, so
+/// it keeps its default.
+fn note_unknown_value(option: &str, value: &str, entry: &KdlEntry, expected: &str) {
+    note_unknown(
+        entry.span().offset(),
+        format!(
+            "unknown value {:?} for {}, ignored and the default kept (expected {})",
+            value, option, expected
+        ),
+    );
+}
+
+/// The value of a string option parsed by `parse`, or - for a value it does not know - `None`,
+/// with a note. A value of the wrong TYPE is still an error, raised before this is reached.
+fn known_value_or_note<T, E>(
+    option: &str,
+    found: Option<(&str, &KdlEntry)>,
+    parse: impl FnOnce(&str) -> Result<T, E>,
+    expected: &str,
+) -> Option<T> {
+    let (value, entry) = found?;
+    match parse(value) {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            note_unknown_value(option, value, entry, expected);
+            None
+        },
+    }
+}
+
 impl Options {
     pub fn from_kdl(kdl_options: &KdlDocument) -> Result<Self, ConfigError> {
-        let on_force_close =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "on_force_close") {
-                Some((string, entry)) => Some(OnForceClose::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for on_force_close: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let on_force_close = known_value_or_note(
+            "on_force_close",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "on_force_close"),
+            OnForceClose::from_str,
+            "quit or detach",
+        );
         let simplified_ui =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "simplified_ui").map(|(v, _)| v);
         let default_shell =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "default_shell")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let default_cwd = kdl_property_first_arg_as_string_or_error!(kdl_options, "default_cwd")
-            .map(|(string, _entry)| PathBuf::from(string));
+            .map(|(string, _entry)| expand_path(string));
         let pane_frames =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frames").map(|(v, _)| v);
-        let pane_frame_style =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "pane_frame_style") {
-                Some((string, entry)) => Some(PaneFrameStyle::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for pane_frame_style: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let pane_frame_style = known_value_or_note(
+            "pane_frame_style",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "pane_frame_style"),
+            PaneFrameStyle::from_str,
+            "full, titles, none or top_only",
+        );
         let auto_layout =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "auto_layout").map(|(v, _)| v);
         let theme = kdl_property_first_arg_as_string_or_error!(kdl_options, "theme")
@@ -3303,49 +3500,48 @@ impl Options {
             .map(|(theme, _entry)| theme.to_string());
         let theme_light = kdl_property_first_arg_as_string_or_error!(kdl_options, "theme_light")
             .map(|(theme, _entry)| theme.to_string());
-        let explicit_theme_hue =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "explicit_theme_hue") {
-                Some((string, entry)) => Some(ThemeHue::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for explicit_theme_hue: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
-        let default_mode =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "default_mode") {
-                Some((string, entry)) => Some(InputMode::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(format!("Invalid input mode: '{}'", string), entry)
-                })?),
-                None => None,
-            };
+        let explicit_theme_hue = known_value_or_note(
+            "explicit_theme_hue",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "explicit_theme_hue"),
+            ThemeHue::from_str,
+            "light or dark",
+        );
+        let default_mode = known_value_or_note(
+            "default_mode",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "default_mode"),
+            InputMode::from_str,
+            "an input mode",
+        );
         let default_layout =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "default_layout")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let layout_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "layout_dir")
-            .map(|(string, _entry)| PathBuf::from(string));
+            .map(|(string, _entry)| expand_path(string));
         let theme_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "theme_dir")
-            .map(|(string, _entry)| PathBuf::from(string));
+            .map(|(string, _entry)| expand_path(string));
         let keybinds_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "keybinds_dir")
-            .map(|(string, _entry)| PathBuf::from(string));
+            .map(|(string, _entry)| expand_path(string));
         let mouse_mode =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mouse_mode").map(|(v, _)| v);
+        let plugin_watch =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "plugin_watch").map(|(v, _)| v);
+        let expect_full_disk_access =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "expect_full_disk_access")
+                .map(|(v, _)| v);
+        let stale_build_notice =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "stale_build_notice")
+                .map(|(v, _)| v);
         let scroll_buffer_size =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "scroll_buffer_size")
                 .map(|(scroll_buffer_size, _entry)| scroll_buffer_size as usize);
         let copy_command = kdl_property_first_arg_as_string_or_error!(kdl_options, "copy_command")
             .map(|(copy_command, _entry)| copy_command.to_string());
-        let copy_clipboard =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "copy_clipboard") {
-                Some((string, entry)) => Some(Clipboard::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for copy_clipboard: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let copy_clipboard = known_value_or_note(
+            "copy_clipboard",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "copy_clipboard"),
+            Clipboard::from_str,
+            "system or primary",
+        );
         let copy_on_select =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "copy_on_select").map(|(v, _)| v);
         let osc8_hyperlinks =
@@ -3353,7 +3549,7 @@ impl Options {
                 .map(|(v, _)| v);
         let scrollback_editor =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "scrollback_editor")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let mirror_session =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mirror_session").map(|(v, _)| v);
         let session_name = kdl_property_first_arg_as_string_or_error!(kdl_options, "session_name")
@@ -3400,16 +3596,12 @@ impl Options {
                 .map(|(key, _entry)| key.to_string());
         let web_server =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "web_server").map(|(v, _)| v);
-        let web_sharing =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "web_sharing") {
-                Some((string, entry)) => Some(WebSharing::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for web_sharing: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let web_sharing = known_value_or_note(
+            "web_sharing",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "web_sharing"),
+            WebSharing::from_str,
+            "on, off or disabled",
+        );
         let stacked_resize =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "stacked_resize").map(|(v, _)| v);
         let stacked_pane_list =
@@ -3468,10 +3660,10 @@ impl Options {
                 .map(|(web_server_port, _entry)| web_server_port as u16);
         let web_server_cert =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "web_server_cert")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let web_server_key =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "web_server_key")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let enforce_https_for_localhost =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "enforce_https_for_localhost")
                 .map(|(v, _)| v);
@@ -3516,32 +3708,30 @@ impl Options {
         let word_separators =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "word_separators")
                 .map(|(separators, _entry)| separators.to_string());
-        let nested_session_handling = match kdl_property_first_arg_as_string_or_error!(
-            kdl_options,
-            "nested_session_handling"
-        ) {
-            Some((value, entry)) => {
-                use crate::input::options::NestedSessionHandling;
-                match value.parse::<NestedSessionHandling>() {
-                    Ok(v) => Some(v),
-                    Err(e) => return Err(kdl_parsing_error!(e, entry)),
-                }
-            },
-            None => None,
-        };
-        let host_notification_protocol = match kdl_property_first_arg_as_string_or_error!(
-            kdl_options,
-            "host_notification_protocol"
-        ) {
-            Some((value, entry)) => {
-                use crate::input::options::HostNotificationProtocol;
-                match value.parse::<HostNotificationProtocol>() {
-                    Ok(v) => Some(v),
-                    Err(e) => return Err(kdl_parsing_error!(e, entry)),
-                }
-            },
-            None => None,
-        };
+        let nested_session_handling = known_value_or_note(
+            "nested_session_handling",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "nested_session_handling"),
+            |value| value.parse::<crate::input::options::NestedSessionHandling>(),
+            "ask, fullscreen, descend or never",
+        );
+        let input_while_scrolled = known_value_or_note(
+            "input_while_scrolled",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "input_while_scrolled"),
+            |value| value.parse::<crate::input::options::InputWhileScrolled>(),
+            "scroll-mode, jump or stay",
+        );
+        let command_pane_on_clean_exit = known_value_or_note(
+            "command_pane_on_clean_exit",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "command_pane_on_clean_exit"),
+            |value| value.parse::<crate::input::options::CommandPaneOnCleanExit>(),
+            "hold or shell",
+        );
+        let host_notification_protocol = known_value_or_note(
+            "host_notification_protocol",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "host_notification_protocol"),
+            |value| value.parse::<crate::input::options::HostNotificationProtocol>(),
+            "auto, osc9, osc99, bell or off",
+        );
         let dangerously_enable_paste_buffer_read = kdl_property_first_arg_as_bool_or_error!(
             kdl_options,
             "dangerously_enable_paste_buffer_read"
@@ -4031,6 +4221,90 @@ impl Options {
             None
         }
     }
+    fn snapshot_dir_to_kdl(&self) -> Option<KdlNode> {
+        self.snapshot_dir.as_ref().map(|snapshot_dir| {
+            let mut node = KdlNode::new("snapshot_dir");
+            node.push(KdlValue::String(snapshot_dir.display().to_string()));
+            node
+        })
+    }
+    fn session_snapshot_limit_to_kdl(&self) -> Option<KdlNode> {
+        self.session_snapshot_limit.map(|limit| {
+            let mut node = KdlNode::new("session_snapshot_limit");
+            node.push(KdlValue::Base10(limit as i64));
+            node
+        })
+    }
+    fn bell_clear_delay_ms_to_kdl(&self) -> Option<KdlNode> {
+        self.bell_clear_delay_ms.map(|delay| {
+            let mut node = KdlNode::new("bell_clear_delay_ms");
+            node.push(KdlValue::Base10(delay as i64));
+            node
+        })
+    }
+    fn terminal_title_template_to_kdl(&self) -> Option<KdlNode> {
+        self.terminal_title_template
+            .as_ref()
+            .map(|terminal_title_template| {
+                let mut node = KdlNode::new("terminal_title_template");
+                node.push(KdlValue::String(terminal_title_template.clone()));
+                node
+            })
+    }
+    fn session_aliases_to_kdl(&self) -> Option<KdlNode> {
+        let session_aliases = self.session_aliases.as_ref()?;
+        if session_aliases.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("session_aliases");
+        let mut aliases = KdlDocument::new();
+        for (session_name, alias) in session_aliases {
+            let mut alias_node = KdlNode::new(session_name.to_owned());
+            alias_node.push(KdlValue::String(alias.to_owned()));
+            aliases.nodes_mut().push(alias_node);
+        }
+        node.set_children(aliases);
+        Some(node)
+    }
+    /// The `resurrect_commands` key: which recorded commands a restored session offers.
+    ///
+    /// A value this build does not know is WARNED about and ignored, never an error: a config
+    /// error fails the whole file, and a later build may add a mode a shared config names before
+    /// every machine has it. Ignored means unset, which is upstream's behaviour.
+    fn resurrect_commands_from_kdl(kdl_options: &KdlDocument) -> Option<ResurrectCommands> {
+        let node = kdl_options.get("resurrect_commands")?;
+        let value = node
+            .entries()
+            .iter()
+            .next()
+            .and_then(|entry| entry.value().as_string());
+        let mode = value.and_then(ResurrectCommands::from_config);
+        if mode.is_none() {
+            note_unknown(
+                node.span().offset(),
+                format!(
+                    "resurrect_commands {:?} is not a mode this build knows, ignored (expected \"all\", \"agents\" or \"prefill\")",
+                    node.entries().iter().next().map(|entry| entry.value().to_string())
+                ),
+            );
+        }
+        mode
+    }
+    /// The `resurrect_commands` node.
+    fn resurrect_commands_to_kdl(&self) -> Option<KdlNode> {
+        let mode = self.resurrect_commands?;
+        let mut node = KdlNode::new("resurrect_commands");
+        node.push(KdlValue::String(mode.as_str().to_owned()));
+        Some(node)
+    }
+    /// The `detect_agents` node: whether panes are checked for a coding agent at all.
+    fn detect_agents_to_kdl(&self) -> Option<KdlNode> {
+        let detect_agents = self.detect_agents?;
+        let mut node = KdlNode::new("detect_agents");
+        node.push(KdlValue::Bool(detect_agents));
+        Some(node)
+    }
+
     fn mouse_mode_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
@@ -6228,13 +6502,17 @@ fn parse_bind_blocks<K: Ord + Clone + std::hash::Hash + Eq, V: Clone>(
             continue;
         }
         let mode_name = kdl_name!(mode);
-        let input_mode = InputMode::from_str(mode_name).map_err(|_| {
-            ConfigError::new_kdl_error(
-                format!("Invalid mode: '{}'", mode_name),
-                mode.name().span().offset(),
-                mode.name().span().len(),
-            )
-        })?;
+        let Ok(input_mode) = InputMode::from_str(mode_name) else {
+            // fork: a mode from a newer build: its binds have nowhere to go here
+            note_unknown(
+                mode.span().offset(),
+                format!(
+                    "unknown mode {:?} in keybinds, its binds are skipped",
+                    mode_name
+                ),
+            );
+            continue;
+        };
         if kdl_arg_is_truthy!(mode, "clear-defaults") {
             changes.clear_mode(input_mode);
         }
@@ -6265,14 +6543,20 @@ impl KeybindChanges {
             let text = key_text(key).map_err(|e| {
                 ConfigError::new_kdl_error(e, key_block.span().offset(), key_block.span().len())
             })?;
-            let key_with_modifier = KeyWithModifier::from_str(&text).map_err(|_| {
-                ConfigError::new_kdl_error(
-                    format!("Invalid key: '{}'", text),
+            // fork: a key this build cannot spell - a modifier or a key name from a newer build,
+            // or a typo - is noted and left out; the others are kept, because each key of a bind
+            // is bound on its own
+            match KeyWithModifier::from_str(&text) {
+                Ok(key_with_modifier) => keys.push(key_with_modifier),
+                Err(_) => note_unknown(
                     key_block.span().offset(),
-                    key_block.span().len(),
-                )
-            })?;
-            keys.push(key_with_modifier);
+                    format!(
+                        "unknown key {:?} in {}, ignored",
+                        text,
+                        kdl_name!(key_block)
+                    ),
+                ),
+            }
         }
         Ok(keys)
     }
@@ -6286,7 +6570,40 @@ impl KeybindChanges {
         let all_nodes = kdl_children_nodes_or_error!(block, "no keybinding block for mode");
         for key_block in all_nodes.iter().filter(|n| kdl_name!(n) == "bind") {
             let keys = KeybindChanges::keys_with_text(key_block, key_text)?;
-            let actions: Vec<Action> = actions_from_kdl!(key_block, config_options);
+            // fork: every action is parsed before any is bound, so that a malformed known action
+            // is still an error even when an unknown one sits before it. An unknown action drops
+            // the whole bind: the actions that are left would do something else.
+            let mut actions: Vec<Action> = vec![];
+            let mut unknown_action = None;
+            for kdl_action in
+                kdl_children_nodes_or_error!(key_block, "no actions found for key_block")
+            {
+                match Action::try_from((kdl_action, config_options)) {
+                    Ok(action) => actions.push(action),
+                    Err(ConfigError::UnknownName(kdl_error)) => {
+                        if unknown_action.is_none() {
+                            unknown_action = Some((kdl_action.span().offset(), kdl_error));
+                        }
+                    },
+                    Err(e) => return Err(e),
+                }
+            }
+            if let Some((offset, kdl_error)) = unknown_action {
+                let key_names: Vec<&str> = kdl_string_arguments!(key_block);
+                note_unknown(
+                    offset,
+                    format!(
+                        "{} in bind {}, the bind is skipped",
+                        kdl_error.error_message,
+                        key_names
+                            .iter()
+                            .map(|key| format!("{:?}", key))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                );
+                continue;
+            }
             for key in keys {
                 changes.bind(input_mode, key, actions.clone());
             }
@@ -6298,11 +6615,13 @@ impl KeybindChanges {
         }
         for key_block in all_nodes {
             if kdl_name!(key_block) != "bind" && kdl_name!(key_block) != "unbind" {
-                return Err(ConfigError::new_kdl_error(
-                    format!("Unknown keybind instruction: '{}'", kdl_name!(key_block)),
+                note_unknown(
                     key_block.span().offset(),
-                    key_block.span().len(),
-                ));
+                    format!(
+                        "unknown keybind instruction {:?}, ignored (expected bind or unbind)",
+                        kdl_name!(key_block)
+                    ),
+                );
             }
         }
         Ok(())
@@ -7092,13 +7411,43 @@ impl BareKey {
 
 impl Config {
     pub fn from_kdl(kdl_config: &str, base_config: Option<Config>) -> Result<Config, ConfigError> {
-        Config::from_kdl_for_layer(kdl_config, base_config, KeybindsLayer::User)
+        Config::from_kdl_named(kdl_config, base_config, None)
     }
     pub fn from_layout_kdl(
         kdl_config: &str,
         base_config: Option<Config>,
     ) -> Result<Config, ConfigError> {
-        Config::from_kdl_for_layer(kdl_config, base_config, KeybindsLayer::Layout)
+        Config::from_kdl_named_for_layer(kdl_config, base_config, None, KeybindsLayer::Layout)
+    }
+    /// [`Config::from_kdl`], naming the document in each warning about something this build did
+    /// not know and skipped (see [`unknown`]). Each one is logged and kept in
+    /// [`Config::warnings`].
+    pub fn from_kdl_named(
+        kdl_config: &str,
+        base_config: Option<Config>,
+        source_name: Option<&str>,
+    ) -> Result<Config, ConfigError> {
+        Config::from_kdl_named_for_layer(kdl_config, base_config, source_name, KeybindsLayer::User)
+    }
+    fn from_kdl_named_for_layer(
+        kdl_config: &str,
+        base_config: Option<Config>,
+        source_name: Option<&str>,
+        keybinds_layer: KeybindsLayer,
+    ) -> Result<Config, ConfigError> {
+        let (parsed, notes) = unknown::collect(|| {
+            Config::from_kdl_for_layer(kdl_config, base_config, keybinds_layer)
+        });
+        let mut config = parsed.map_err(|e| match e {
+            // a caller that did not catch an unknown name: it fails like any other config error
+            ConfigError::UnknownName(kdl_error) => ConfigError::KdlError(kdl_error),
+            e => e,
+        })?;
+        for warning in unknown::render(kdl_config, source_name, notes) {
+            log::warn!("{}", warning);
+            config.warnings.push(warning);
+        }
+        Ok(config)
     }
     fn from_kdl_for_layer(
         kdl_config: &str,
@@ -7108,6 +7457,18 @@ impl Config {
         let base_was_given = base_config.is_some();
         let mut config = base_config.unwrap_or_else(|| Config::default());
         let kdl_config: KdlDocument = kdl_config.parse()?;
+        note_unknown_top_level_nodes(&kdl_config);
+
+        if let Some((value, entry)) =
+            kdl_property_first_arg_as_string_or_error!(kdl_config, "new_pane_default")
+        {
+            use crate::input::config::NewPaneDefault;
+            match value {
+                "split" => config.new_pane_default = Some(NewPaneDefault::Split),
+                "stacked" => config.new_pane_default = Some(NewPaneDefault::Stacked),
+                _ => note_unknown_value("new_pane_default", value, entry, "split or stacked"),
+            }
+        }
 
         let previous_keybinds_dir = config.options.keybinds_dir.clone();
         let config_options = Options::from_kdl(&kdl_config)?;
@@ -7824,6 +8185,30 @@ impl UiConfig {
         base: &UiConfig,
     ) -> Result<UiConfig, ConfigError> {
         let mut ui_config = base.clone();
+        note_unknown_children(kdl_ui_config, "ui", &["pane_frames"]);
+        if let Some(pane_frames) = kdl_get_child!(kdl_ui_config, "pane_frames") {
+            note_unknown_children(
+                pane_frames,
+                "ui pane_frames",
+                &[
+                    "rounded_corners",
+                    "hide_session_name",
+                    // upstream's border styles: `border_*` and `floating_border_*`
+                    "border_style",
+                    "border_top",
+                    "border_right",
+                    "border_bottom",
+                    "border_left",
+                    "border_rounded_corners",
+                    "floating_border_style",
+                    "floating_border_top",
+                    "floating_border_right",
+                    "floating_border_bottom",
+                    "floating_border_left",
+                    "floating_border_rounded_corners",
+                ],
+            );
+        }
         if let Some(pane_frames) = kdl_get_child!(kdl_ui_config, "pane_frames") {
             let base_frames = base.pane_frames;
             let rounded_corners =
@@ -7899,6 +8284,42 @@ impl UiConfig {
     }
 }
 
+/// The components a theme with named styles may hold. One a newer build adds is warned about and
+/// left at its default.
+const THEME_COMPONENTS: &[&str] = &[
+    "text_unselected",
+    "text_selected",
+    "ribbon_unselected",
+    "ribbon_selected",
+    "ribbon_hover",
+    "table_title",
+    "table_cell_unselected",
+    "table_cell_selected",
+    "list_unselected",
+    "list_selected",
+    "frame_unselected",
+    "frame_selected",
+    "frame_highlight",
+    "exit_code_success",
+    "exit_code_error",
+    "multiplayer_user_colors",
+    "terminal_colors",
+];
+
+/// Note every child of `node` whose name is not in `known`. `context` names the block in the
+/// warning.
+pub(crate) fn note_unknown_children(node: &KdlNode, context: &str, known: &[&str]) {
+    for child in node.children().map(|c| c.nodes()).unwrap_or(&[]) {
+        let name = kdl_name!(child);
+        if !known.contains(&name) {
+            note_unknown(
+                child.span().offset(),
+                format!("unknown {} entry {:?}, ignored", context, name),
+            );
+        }
+    }
+}
+
 impl Themes {
     fn style_declaration_from_node(
         style_node: &KdlNode,
@@ -7911,6 +8332,18 @@ impl Themes {
                 let colors = kdl_children_or_error!(
                     descriptor,
                     format!("Missing colors for {}", style_descriptor)
+                );
+                note_unknown_children(
+                    descriptor,
+                    &format!("theme {:?} {}", kdl_name!(style_node), style_descriptor),
+                    &[
+                        "base",
+                        "background",
+                        "emphasis_0",
+                        "emphasis_1",
+                        "emphasis_2",
+                        "emphasis_3",
+                    ],
                 );
                 Ok(Some(StyleDeclaration {
                     base: PaletteColor::try_from(("base", colors))?,
@@ -7981,13 +8414,29 @@ impl Themes {
                 .iter()
                 .filter(|node| node.name().value() != "terminal_colors")
                 .collect();
+            let names = || declarations.iter().map(|n| n.name().value());
+            // fork: a palette theme with a color a newer build added is still a palette theme: it
+            // names no component of the newer definition, so reading it as one would lose every
+            // color.
             let looks_like_a_palette = theme_colors.nodes().is_empty()
                 || (!declarations.is_empty()
-                    && declarations
-                        .iter()
-                        .all(|n| palette_color_names.contains(n.name().value())));
+                    && (names().all(|name| palette_color_names.contains(name))
+                        || (names().any(|name| palette_color_names.contains(name))
+                            && !names().any(|name| THEME_COMPONENTS.contains(&name)))));
             let theme = if looks_like_a_palette {
                 // Older palette based theme definition
+                for color in theme_colors.nodes() {
+                    if !palette_color_names.contains(color.name().value()) {
+                        note_unknown(
+                            color.span().offset(),
+                            format!(
+                                "unknown theme {:?} color {:?}, ignored",
+                                theme_name,
+                                color.name().value()
+                            ),
+                        );
+                    }
+                }
                 let palette = Palette {
                     fg: PaletteColor::try_from(("fg", theme_colors))?,
                     bg: PaletteColor::try_from(("bg", theme_colors))?,
@@ -8022,6 +8471,11 @@ impl Themes {
                             DEFAULT_STYLES.ribbon_hover
                         },
                     );
+                note_unknown_children(
+                    theme_config,
+                    &format!("theme {:?}", theme_name),
+                    THEME_COMPONENTS,
+                );
                 let s = Styling {
                     text_unselected: Themes::style_declaration_from_node(
                         theme_config,
@@ -10690,15 +11144,18 @@ fn explicit_theme_hue_from_kdl() {
 }
 
 #[test]
-fn explicit_theme_hue_rejects_unknown_values() {
-    let fake_config = r##"
-        explicit_theme_hue "sepia"
-    "##;
-    let document: KdlDocument = fake_config.parse().unwrap();
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn explicit_theme_hue_warns_on_unknown_values() {
+    let config = Config::from_kdl("explicit_theme_hue \"sepia\"", None).unwrap();
+    assert_eq!(config.options.explicit_theme_hue, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
     assert!(
-        Options::from_kdl(&document).is_err(),
-        "only 'dark' and 'light' are accepted"
+        config.warnings[0].starts_with("line 1: ") && config.warnings[0].contains("\"sepia\""),
+        "{}",
+        config.warnings[0]
     );
+    assert!(Config::from_kdl("explicit_theme_hue 3", None).is_err());
 }
 
 #[test]
@@ -10934,6 +11391,36 @@ fn input_while_scrolled_kdl_round_trip_for_every_variant() {
 }
 
 #[test]
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn input_while_scrolled_warns_on_an_unknown_value() {
+    let config = Config::from_kdl("input_while_scrolled \"sideways\"", None).unwrap();
+    assert_eq!(config.options.input_while_scrolled, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 1: ") && config.warnings[0].contains("\"sideways\""),
+        "{}",
+        config.warnings[0]
+    );
+    assert!(Config::from_kdl("input_while_scrolled 3", None).is_err());
+}
+
+#[test]
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn command_pane_on_clean_exit_warns_on_an_unknown_value() {
+    let config = Config::from_kdl("command_pane_on_clean_exit \"close\"", None).unwrap();
+    assert_eq!(config.options.command_pane_on_clean_exit, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 1: ") && config.warnings[0].contains("\"close\""),
+        "{}",
+        config.warnings[0]
+    );
+    assert!(Config::from_kdl("command_pane_on_clean_exit 3", None).is_err());
+}
+
+#[test]
 fn host_notification_protocol_kdl_round_trip_for_every_variant() {
     use crate::input::options::HostNotificationProtocol;
     let cases = [
@@ -10967,12 +11454,19 @@ fn host_notification_protocol_kdl_round_trip_for_every_variant() {
 }
 
 #[test]
-fn an_unknown_host_notification_protocol_is_a_config_error() {
-    let fake_config = r##"
-        host_notification_protocol "carrier-pigeon"
-    "##;
-    let document: KdlDocument = fake_config.parse().unwrap();
-    assert!(Options::from_kdl(&document).is_err());
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn an_unknown_host_notification_protocol_warns_and_keeps_the_default() {
+    let config = Config::from_kdl("host_notification_protocol \"carrier-pigeon\"", None).unwrap();
+    assert_eq!(config.options.host_notification_protocol, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 1: ")
+            && config.warnings[0].contains("\"carrier-pigeon\""),
+        "{}",
+        config.warnings[0]
+    );
+    assert!(Config::from_kdl("host_notification_protocol 3", None).is_err());
 }
 
 #[test]
@@ -11892,5 +12386,398 @@ fn bell_clear_delay_config_parsing() {
 fn bell_clear_delay_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.bell_clear_delay_ms, None);
+}
+
+#[test]
+fn terminal_title_config_parsing() {
+    let config_with_terminal_title = r#"
+        terminal_title_template "{host} - {session} | {pane}"
+        session_aliases {
+            my-session "MS"
+        }
+    "#;
+    let config = Config::from_kdl(config_with_terminal_title, None).unwrap();
+    assert_eq!(
+        config.options.terminal_title_template.as_deref(),
+        Some("{host} - {session} | {pane}")
+    );
+    assert_eq!(
+        config
+            .options
+            .session_aliases
+            .as_ref()
+            .and_then(|aliases| aliases.get("my-session"))
+            .map(|alias| alias.as_str()),
+        Some("MS")
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn terminal_title_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.terminal_title_template, None);
+    assert_eq!(config.options.session_aliases, None);
+}
+
+/// `builtin_plugin_dir` was a fork key that this build no longer reads. An old config that still
+/// carries it loads, with the key reported as unknown.
+#[test]
+fn a_retired_builtin_plugin_dir_key_warns_and_loads() {
+    let config = Config::from_kdl(
+        "builtin_plugin_dir \"/tmp/plugins\"\nsimplified_ui true",
+        None,
+    )
+    .unwrap();
+    assert_eq!(config.options.simplified_ui, Some(true));
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|w| w.contains("builtin_plugin_dir")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// `report_pane_env` was a fork key that this build no longer reads. An old config that still
+/// carries it loads, with the key reported as unknown.
+#[test]
+fn a_retired_report_pane_env_key_warns_and_loads() {
+    let config = Config::from_kdl(
+        "report_pane_env \"CLAUDE_CODE_SESSION_ID\"\nsimplified_ui true",
+        None,
+    )
+    .unwrap();
+    assert_eq!(config.options.simplified_ui, Some(true));
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|w| w.contains("report_pane_env")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// No `session_service` key takes a value from a closed set, so it has no "unknown value" to fall
+/// back from: a string `pin_exe` is a path, and every other value check is a type or a range. Those
+/// are malformed known settings and still fail; the block's unknown NAMES warn, as above.
+#[test]
+fn session_service_values_are_types_and_ranges_not_named_choices() {
+    let config = Config::from_kdl(
+        "session_service {\n    pin_exe \"some-later-keyword\"\n}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        config.options.session_service.unwrap().pin_exe,
+        Some(PinnedExe::At(PathBuf::from("some-later-keyword")))
+    );
+    for malformed in [
+        "session_service {\n    restart_via_launchd 1\n}",
+        "session_service {\n    pin_exe 3\n}",
+    ] {
+        assert!(Config::from_kdl(malformed, None).is_err(), "{}", malformed);
+    }
+}
+
+/// The rollout property, at every depth this block parses: a name this build does not know costs a
+/// warning, not the config. A machine still on an older binary reads a config written for a newer
+/// one, keeps every setting it does understand, and starts.
+#[test]
+fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() {
+    let config = Config::from_kdl(
+        r#"
+        session_service {
+            managed_session true
+            watchdog_interval_secs 15
+            some_key_from_a_later_build "whatever"
+            systemd {
+                service "Nice=-5"
+                sockets "ListenStream=1234"
+            }
+            launchd {
+                keys {
+                    ProcessType "Interactive"
+                }
+                sandbox {
+                    profile "none"
+                }
+            }
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let session_service = config.options.session_service.as_ref().unwrap();
+
+    // every known entry beside the unknown ones is still read
+    assert_eq!(session_service.systemd.service, vec!["Nice=-5".to_owned()]);
+    assert_eq!(
+        session_service.launchd,
+        vec![LaunchdKey {
+            name: "ProcessType".to_owned(),
+            value: PlistValue::String("Interactive".to_owned()),
+        }]
+    );
+
+    // and each unknown one is named exactly once, in the words setup --check prints
+    assert_eq!(
+        session_service.unknown_entries.len(),
+        5,
+        "{:?}",
+        session_service.unknown_entries
+    );
+    let warnings = session_service.unknown_entries.join("\n");
+    assert!(
+        warnings.contains("some_key_from_a_later_build"),
+        "{}",
+        warnings
+    );
+    assert!(warnings.contains("sockets"), "{}", warnings);
+    assert!(warnings.contains("sandbox"), "{}", warnings);
+    // keys a later build removed are just more names this build does not know
+    assert!(warnings.contains("managed_session"), "{}", warnings);
+    assert!(warnings.contains("watchdog_interval_secs"), "{}", warnings);
+}
+
+/// A misspelled systemd section holding nothing is the case a softened error would have missed:
+/// its directives are what used to be walked, and there are none to walk.
+#[test]
+fn an_unknown_systemd_section_is_named_even_with_no_directives_in_it() {
+    let config = Config::from_kdl(
+        "session_service {
+    systemd {
+        servce
+    }
+}",
+        None,
+    )
+    .unwrap();
+    let warnings = config
+        .options
+        .session_service
+        .as_ref()
+        .unwrap()
+        .unknown_entries
+        .clone();
+    assert_eq!(warnings.len(), 1, "{:?}", warnings);
+    assert!(warnings[0].contains("servce"), "{}", warnings[0]);
+    assert!(warnings[0].contains("service"), "{}", warnings[0]);
+}
+
+/// Only the UNKNOWN-name case softened. A name this build knows, given a value it cannot mean, is
+/// still the whole config failing to parse - the operator meant that setting and is not getting it.
+#[test]
+fn a_wrong_value_for_a_known_entry_is_still_an_error() {
+    for bad in [
+        // wrong type for a known key
+        "session_service {\n    restart_via_launchd \"yes\"\n}",
+        "session_service {\n    pin_exe 3\n}",
+        // a known systemd section, a line that is not a directive
+        "session_service {\n    systemd {\n        service \"Nice\"\n    }\n}",
+        // a known systemd section, a directive the generator owns
+        "session_service {\n    systemd {\n        service \"ExecStart=/bin/true\"\n    }\n}",
+        // a known launchd block, a key the generator owns
+        "session_service {\n    launchd {\n        keys {\n            Label \"mine\"\n        }\n    }\n}",
+        // a known launchd block, a value that is neither a string nor a number
+        "session_service {\n    launchd {\n        env {\n            SSH_AUTH_SOCK true\n        }\n    }\n}",
+    ] {
+        assert!(
+            Config::from_kdl(bad, None).is_err(),
+            "should not have parsed: {}",
+            bad
+        );
+    }
+}
+
+/// An entry this build ignores is not this build's configuration, so a dump does not claim it is.
+/// The block round-trips to nothing when the unknown names were all it held.
+#[test]
+fn an_ignored_entry_is_not_written_back_out() {
+    let config = Config::from_kdl(
+        "session_service {
+    some_key_from_a_later_build true
+}",
+        None,
+    )
+    .unwrap();
+    assert!(config.options.session_service.as_ref().unwrap().is_empty());
+    let written_out = config.to_string(false);
+    assert!(
+        !written_out.contains("some_key_from_a_later_build"),
+        "{}",
+        written_out
+    );
+}
+
+/// A binary that does not know an entry of a hint ignores it and says so, rather than failing the
+/// whole config - `resume` for `resume_args` is the misspelling that reads as if it should work.
+/// The warning names the hint it was read under, because a config can carry several.
+#[test]
+fn a_hint_entry_it_does_not_know_is_ignored_and_the_hint_still_loads() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        resume_args "--continue"
+        resume "yes"
+        some_key_from_a_later_build 12
+    }
+}"#,
+        None,
+    )
+    .unwrap();
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.unknown_entries.len(),
+        2,
+        "{:?}",
+        hints.unknown_entries
+    );
+    let warning = &hints.unknown_entries[0];
+    assert!(warning.contains("\"resume\""), "{}", warning);
+    assert!(
+        warning.contains("expected match, env or resume_args"),
+        "{}",
+        warning
+    );
+    assert!(warning.contains("\"claude\""), "{}", warning);
+    // an entry this build does not know is not held to the string rule the known ones follow
+    assert!(
+        hints.unknown_entries[1].contains("some_key_from_a_later_build"),
+        "{}",
+        hints.unknown_entries[1]
+    );
+
+    // the hint beside the ignored entries is whole
+    assert_eq!(
+        hints.hints,
+        vec![ResurrectCommandHint {
+            name: "claude".to_owned(),
+            match_command: "claude".to_owned(),
+            env: "CLAUDE_CODE_SESSION_ID".to_owned(),
+            resume_args: "--continue".to_owned(),
+        }]
+    );
+
+    // and nothing of the ignored entries is written back out
+    let serialized = config.to_string(false);
+    assert!(
+        !serialized.contains("some_key_from_a_later_build"),
+        "{}",
+        serialized
+    );
+    assert!(serialized.contains("resume_args"), "{}", serialized);
+}
+
+#[cfg(test)]
+fn home_dir_for_test() -> String {
+    std::env::var("HOME").expect("HOME is set in the test environment")
+}
+
+#[test]
+fn a_path_with_nothing_to_expand_is_left_alone() {
+    // the conservative half of the promise: no `~` and no `$` means byte-identical
+    for path in [
+        "/opt/zellij/layouts",
+        "relative/layouts",
+        "/opt/weird~name/layouts",
+        "",
+    ] {
+        assert_eq!(expand_path(path), PathBuf::from(path));
+    }
+}
+
+#[test]
+fn a_tilde_and_a_home_variable_name_the_same_directory() {
+    let home = home_dir_for_test();
+    assert_eq!(expand_path("~"), PathBuf::from(&home));
+    assert_eq!(
+        expand_path("~/.config/zellij/layouts"),
+        PathBuf::from(format!("{}/.config/zellij/layouts", home))
+    );
+    assert_eq!(
+        expand_path("$HOME/.config/zellij/layouts"),
+        PathBuf::from(format!("{}/.config/zellij/layouts", home))
+    );
+    assert_eq!(
+        expand_path("${HOME}/.config/zellij/layouts"),
+        PathBuf::from(format!("{}/.config/zellij/layouts", home))
+    );
+}
+
+#[test]
+fn a_variable_that_is_not_set_leaves_the_path_as_written() {
+    // config that cannot be expanded must still be config: zellij starts and the path fails later
+    // where it is used, naming the file it could not find
+    let unexpandable = "$ZELLIJ_A_VARIABLE_NOTHING_SETS/layouts";
+    assert_eq!(expand_path(unexpandable), PathBuf::from(unexpandable));
+}
+
+#[test]
+fn path_options_are_expanded() {
+    let home = home_dir_for_test();
+    let config_str = r#"
+        default_shell "~/bin/my-shell"
+        default_cwd "$HOME/work"
+        default_layout "~/.config/zellij/layouts/my-layout.kdl"
+        layout_dir "~/.config/zellij/layouts"
+        theme_dir "${HOME}/.config/zellij/themes"
+        scrollback_editor "~/bin/my-editor"
+        snapshot_dir "~/.local/state/zellij/snapshots"
+        web_server_cert "~/.config/zellij/cert.pem"
+        web_server_key "/etc/zellij/key.pem"
+    "#;
+    let options = Config::from_kdl(config_str, None).unwrap().options;
+    assert_eq!(
+        options.default_shell,
+        Some(PathBuf::from(format!("{}/bin/my-shell", home)))
+    );
+    assert_eq!(
+        options.default_cwd,
+        Some(PathBuf::from(format!("{}/work", home)))
+    );
+    assert_eq!(
+        options.default_layout,
+        Some(PathBuf::from(format!(
+            "{}/.config/zellij/layouts/my-layout.kdl",
+            home
+        )))
+    );
+    assert_eq!(
+        options.layout_dir,
+        Some(PathBuf::from(format!("{}/.config/zellij/layouts", home)))
+    );
+    assert_eq!(
+        options.theme_dir,
+        Some(PathBuf::from(format!("{}/.config/zellij/themes", home)))
+    );
+    assert_eq!(
+        options.scrollback_editor,
+        Some(PathBuf::from(format!("{}/bin/my-editor", home)))
+    );
+    assert_eq!(
+        options.snapshot_dir,
+        Some(PathBuf::from(format!(
+            "{}/.local/state/zellij/snapshots",
+            home
+        )))
+    );
+    assert_eq!(
+        options.web_server_cert,
+        Some(PathBuf::from(format!("{}/.config/zellij/cert.pem", home)))
+    );
+    // an absolute path comes through as it was written
+    assert_eq!(
+        options.web_server_key,
+        Some(PathBuf::from("/etc/zellij/key.pem"))
+    );
 }
 

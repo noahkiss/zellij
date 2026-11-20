@@ -180,6 +180,25 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         bars_hidden_on_start,
         hidden_bars_notification,
         mode_hints_when_bars_hidden,
+        // fork options: not on the settings screen
+        plugin_watch: _,
+        expect_full_disk_access: _,
+        stale_build_notice: _,
+        snapshot_dir: _,
+        session_snapshot_limit: _,
+        bell_clear_delay_ms: _,
+        terminal_title_template: _,
+        session_aliases: _,
+        session_restart_drop_env: _,
+        session_service: _,
+        resurrect_command_hints: _,
+        resurrect_commands: _,
+        detect_agents: _,
+        pane_frame_agent_name: _,
+        session_up_resume: _,
+        default_floating_size: _,
+        input_while_scrolled: _,
+        command_pane_on_clean_exit: _,
     } = options;
     let entries = [
         (SettingKey::SimplifiedUi, display_text(simplified_ui)),
@@ -608,6 +627,10 @@ pub fn setting_values(config: &Config) -> BTreeMap<SettingKey, Option<String>> {
         terminal,
         session_suggestions: _session_suggestions_are_read_by_the_server,
         attention,
+        // fork fields: not on the settings screen
+        new_pane_default: _,
+        plugin_permissions: _,
+        warnings: _,
     } = config;
     let mut values = BTreeMap::new();
     option_values(options, &mut values);

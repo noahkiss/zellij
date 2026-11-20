@@ -527,7 +527,9 @@ fn an_outside_change_is_detected_and_overwrite_edits_the_current_file() {
 
 #[test]
 fn a_file_that_does_not_read_back_is_restored_from_the_backup() {
-    let file = "keybinds {\n    normal {\n        not_a_bind \"x\"\n    }\n}\n";
+    // fork: an unknown keybind instruction is warned about and skipped, so the file needs an
+    // error that still fails the parse: a bind with no actions
+    let file = "keybinds {\n    normal {\n        bind \"x\"\n    }\n}\n";
     let (_dir, path) = temp_config(Some(file));
     let saved = defaults();
     let runtime = reconfigure(&saved, "mouse_mode false");

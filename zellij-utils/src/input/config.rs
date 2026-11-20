@@ -38,6 +38,9 @@ type ConfigResult = Result<Config, ConfigError>;
 /// Main configuration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// CLI placement default. This field never crosses the client/server contract.
+    #[serde(skip)]
+    pub new_pane_default: Option<NewPaneDefault>,
     #[serde(with = "shared_keybinds")]
     pub keybinds: Arc<Keybinds>,
     pub options: Options,
@@ -58,6 +61,12 @@ pub struct Config {
     pub session_suggestions: SessionSuggestionsConfig,
     #[serde(default)]
     pub attention: AttentionConfig,
+    pub plugin_permissions: PluginPermissions,
+    /// What this build did not know in the config it parsed, and skipped: one line each, naming
+    /// the file, the line and the thing. `zellij setup --check` prints them. Never crosses the
+    /// client/server contract.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 mod shared_mousebinds {
@@ -176,6 +185,11 @@ pub enum ConfigError {
     KdlDeserializationError(#[from] kdl::KdlError),
     #[error("KdlDeserialization error: {0}")]
     KdlError(KdlError), // TODO: consolidate these
+    // A name or an enum value this build does not know. The parser that raises it catches it,
+    // notes it and skips the enclosing unit (see `kdl::unknown`); it is a hard error only if it
+    // reaches a caller that does not.
+    #[error("{0}")]
+    UnknownName(KdlError),
     #[error("Config error: {0}")]
     Std(#[from] Box<dyn std::error::Error>),
     // Io error with path context
@@ -198,6 +212,16 @@ pub enum ConfigError {
 impl ConfigError {
     pub fn new_kdl_error(error_message: String, offset: usize, len: usize) -> Self {
         ConfigError::KdlError(KdlError {
+            error_message,
+            src: None,
+            offset: Some(offset),
+            len: Some(len),
+            help_message: None,
+        })
+    }
+    /// A name or an enum value this build does not know: see [`ConfigError::UnknownName`].
+    pub fn new_unknown_name(error_message: String, offset: usize, len: usize) -> Self {
+        ConfigError::UnknownName(KdlError {
             error_message,
             src: None,
             offset: Some(offset),
@@ -328,7 +352,8 @@ impl Config {
                 let mut kdl_config = String::new();
                 file.read_to_string(&mut kdl_config)
                     .map_err(|e| ConfigError::IoPath(e, path.to_path_buf()))?;
-                match Config::from_kdl(&kdl_config, default_config) {
+                let source_name = path.as_path().as_os_str().to_string_lossy().to_string();
+                match Config::from_kdl_named(&kdl_config, default_config, Some(&source_name)) {
                     Ok(config) => Ok(config),
                     Err(ConfigError::KdlDeserializationError(kdl_error)) => {
                         let error_message = match kdl_error.kind {

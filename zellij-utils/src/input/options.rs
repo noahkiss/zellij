@@ -468,6 +468,24 @@ pub struct Options {
     #[serde(default)]
     pub bell_clear_delay_ms: Option<u64>,
 
+    /// The template of the terminal title (OSC 0) of the focused pane. Knows the {host},
+    /// {session} and {pane} placeholders, anything else is literal text. Placeholders that come
+    /// out empty take the literal text around them with them, so that no dangling separator is
+    /// left behind. Default is "{session} | {pane}".
+    /// config.kdl only - it is read by the server at session start, so there is nothing for a CLI
+    /// flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub terminal_title_template: Option<String>,
+
+    /// What to render instead of the session name in the {session} placeholder of
+    /// terminal_title_template, keyed by session name. Session names that are not in here render
+    /// as they are.
+    /// config.kdl only, like terminal_title_template.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_aliases: Option<BTreeMap<String, String>>,
+
     /// The size floating panes get when nothing asks for a specific one.
     /// config.kdl only - it is a nested block, which no CLI flag can express.
     #[clap(skip)]
@@ -888,6 +906,32 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or(self.scrollback_lines_to_serialize);
+        let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
+        let session_snapshot_limit = other.session_snapshot_limit.or(self.session_snapshot_limit);
+        let bell_clear_delay_ms = other.bell_clear_delay_ms.or(self.bell_clear_delay_ms);
+        let terminal_title_template = other
+            .terminal_title_template
+            .or_else(|| self.terminal_title_template.clone());
+        let session_aliases = other
+            .session_aliases
+            .or_else(|| self.session_aliases.clone());
+        let session_restart_drop_env = other
+            .session_restart_drop_env
+            .or_else(|| self.session_restart_drop_env.clone());
+        let session_service = other
+            .session_service
+            .or_else(|| self.session_service.clone());
+        let resurrect_command_hints = other
+            .resurrect_command_hints
+            .or_else(|| self.resurrect_command_hints.clone());
+        let resurrect_commands = other.resurrect_commands.or(self.resurrect_commands);
+        let detect_agents = other.detect_agents.or(self.detect_agents);
+        let pane_frame_agent_name = other.pane_frame_agent_name.or(self.pane_frame_agent_name);
+        let session_up_resume = other.session_up_resume.or(self.session_up_resume);
+        let default_floating_size = other
+            .default_floating_size
+            .clone()
+            .or_else(|| self.default_floating_size.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -1119,6 +1163,34 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or_else(|| self.scrollback_lines_to_serialize.clone());
+        let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
+        let session_snapshot_limit = other
+            .session_snapshot_limit
+            .or_else(|| self.session_snapshot_limit.clone());
+        let bell_clear_delay_ms = other.bell_clear_delay_ms.or(self.bell_clear_delay_ms);
+        let terminal_title_template = other
+            .terminal_title_template
+            .or_else(|| self.terminal_title_template.clone());
+        let session_aliases = other
+            .session_aliases
+            .or_else(|| self.session_aliases.clone());
+        let session_restart_drop_env = other
+            .session_restart_drop_env
+            .or_else(|| self.session_restart_drop_env.clone());
+        let session_service = other
+            .session_service
+            .or_else(|| self.session_service.clone());
+        let resurrect_command_hints = other
+            .resurrect_command_hints
+            .or_else(|| self.resurrect_command_hints.clone());
+        let resurrect_commands = other.resurrect_commands.or(self.resurrect_commands);
+        let detect_agents = other.detect_agents.or(self.detect_agents);
+        let pane_frame_agent_name = other.pane_frame_agent_name.or(self.pane_frame_agent_name);
+        let session_up_resume = other.session_up_resume.or(self.session_up_resume);
+        let default_floating_size = other
+            .default_floating_size
+            .clone()
+            .or_else(|| self.default_floating_size.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
