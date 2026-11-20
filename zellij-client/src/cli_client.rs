@@ -31,9 +31,15 @@ pub struct WaitReady<'a> {
     pub make_os_input: &'a dyn Fn() -> Box<dyn ClientOsApi>,
 }
 
-/// The quiet window `--wait-ready` falls back on, for a shell that writes no OSC 133 prompt
-/// marker. The same default `wait --for ready` takes.
-const READY_QUIET: Duration = Duration::from_millis(300);
+/// The quiet window `--wait-ready` falls back on, for a shell that has written no OSC 133 prompt
+/// marker yet.
+///
+/// Longer than the 300 ms `wait --for ready` takes by default. That wait follows a command, in a
+/// shell already up. This one follows a shell's start, and rc files pause there: a zsh that prints
+/// a line and then loads plugins for half a second read as quiet before its line editor was up,
+/// and the command typed next landed in the plugin load, garbled. A shell that writes prompt
+/// marks is ready at its first prompt and never waits this out.
+const READY_QUIET: Duration = Duration::from_millis(1500);
 
 /// Runs the actions one CLI invocation turned into.
 ///

@@ -733,6 +733,11 @@ error without `--wait-ready`.
   for the command to end and answer with its status in place of the report; a ready pane is one you
   type into. The refusal is in `CliAction::take_wait_ready`, not clap, because the blocking flags
   differ by verb and `run` arrives with them already folded into one condition.
+- **The quiet fallback waits 1.5 s, not 300 ms.** A new shell runs its rc files before its first
+  prompt, and one that prints a line and then pauses to load plugins looked quiet at 300 ms. The
+  command typed next landed in the plugin load. A shell that writes OSC 133 marks is ready at its
+  first prompt, so only a shell without marks pays the longer wait. `wait --for ready` keeps 300 ms:
+  it follows a command, in a shell that is already up.
 - **It is the client's to hold**: taken off the request before the action is built, so nothing about it reaches the action or the client/server contract.
 - `action --json` carries both lines: `"ready_by": "prompt"`, `"ready_ms": 252`.
 
