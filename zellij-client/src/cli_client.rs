@@ -1561,6 +1561,126 @@ fn last_reply_of(
     })
 }
 
+/// How long a session event stream waits for its `hello` before calling the server too old. A
+/// server that predates the stream ignores the subscription it does not know, and says nothing.
+const SESSION_EVENT_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How a session event stream ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionEventStreamEnd {
+    /// The reader closed the pipe: the way a watch is meant to end.
+    ReaderGone,
+    /// The session went away, or stopped answering.
+    ServerGone(String),
+    /// The server never said hello: it predates the stream.
+    NoStream(String),
+}
+
+/// Open a session event stream and hand every line to `print`, until the reader or the server
+/// goes. `print` returns false when its reader has gone.
+fn run_session_event_stream(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    print: &mut dyn FnMut(&str) -> bool,
+) -> SessionEventStreamEnd {
+    let socket = match socket_for(session_name) {
+        Ok(socket) => socket,
+        Err(message) => return SessionEventStreamEnd::ServerGone(message),
+    };
+    if let Err(e) = os_input.connect_to_server(&socket) {
+        return SessionEventStreamEnd::ServerGone(e.to_string());
+    }
+    os_input.send_to_server(ClientToServerMsg::SubscribeToSessionEvents { agents_only: false });
+    let (sender, messages) = mpsc::channel();
+    let reader = os_input.box_clone();
+    std::thread::spawn(move || {
+        while let Some((message, _)) = reader.recv_from_server() {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    let own_build_id = zellij_utils::session_lifecycle::own_executable()
+        .and_then(|identity| identity.build_id)
+        .map(|id| {
+            id.iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<String>()
+        });
+    let end = session_event_stream_loop(&messages, session_name, own_build_id, print);
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    end
+}
+
+fn session_event_stream_loop(
+    messages: &mpsc::Receiver<ServerToClientMsg>,
+    session_name: &str,
+    own_build_id: Option<String>,
+    print: &mut dyn FnMut(&str) -> bool,
+) -> SessionEventStreamEnd {
+    let started = Instant::now();
+    let mut said_hello = false;
+    let gone = || {
+        SessionEventStreamEnd::ServerGone(format!(
+            "Session '{}' went away while it was being watched.",
+            session_name
+        ))
+    };
+    loop {
+        if !said_hello && started.elapsed() >= SESSION_EVENT_HELLO_TIMEOUT {
+            return SessionEventStreamEnd::NoStream(format!(
+                "Session '{}' did not start an event stream: its server predates `zellij action \
+                 watch`. Restart the session on this build to watch it.",
+                session_name
+            ));
+        }
+        match messages.recv_timeout(Duration::from_millis(500)) {
+            Ok(ServerToClientMsg::SessionEvent { line }) => {
+                let line = if said_hello {
+                    line
+                } else {
+                    said_hello = true;
+                    zellij_utils::event_stream::with_server_build(&line, own_build_id.as_deref())
+                };
+                if !print(&line) {
+                    return SessionEventStreamEnd::ReaderGone;
+                }
+            },
+            Ok(ServerToClientMsg::Exit { .. }) => return gone(),
+            Ok(ServerToClientMsg::LogError { lines }) => {
+                return SessionEventStreamEnd::ServerGone(lines.join("\n"))
+            },
+            Ok(_) => {},
+            Err(RecvTimeoutError::Timeout) => {
+                if zellij_utils::event_stream::stdout_reader_gone() {
+                    return SessionEventStreamEnd::ReaderGone;
+                }
+            },
+            Err(RecvTimeoutError::Disconnected) => return gone(),
+        }
+    }
+}
+
+/// Print one line and flush it, so a reader sees each change as it lands. False when the reader
+/// has gone.
+fn print_stream_line(line: &str) -> bool {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{}", line).is_ok() && out.flush().is_ok()
+}
+
+/// `zellij action watch`: every line of the session's event stream, until the reader stops
+/// reading (exit 0) or the session goes (exit 2).
+pub fn start_watch_client(os_input: Box<dyn ClientOsApi>, session_name: &str) -> i32 {
+    match run_session_event_stream(os_input, session_name, &mut print_stream_line) {
+        SessionEventStreamEnd::ReaderGone => 0,
+        SessionEventStreamEnd::ServerGone(message) | SessionEventStreamEnd::NoStream(message) => {
+            eprintln!("{}", message);
+            2
+        },
+    }
+}
+
 /// What one question got, on a connection that is about to be asked another.
 ///
 /// The session answers a CLI message with its report and then, from the bottom of its route loop,

@@ -512,6 +512,8 @@ pub enum ScreenContext {
     SubscribeToPaneRenders,
     NotifyPaneClosedToSubscribers,
     PaneMirror,
+    SubscribeToSessionEvents,
+    SessionEventTick,
     // Pane-targeting CLI variants
     ScrollUpWithPaneId,
     ScrollDownWithPaneId,

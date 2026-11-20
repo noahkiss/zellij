@@ -10,7 +10,8 @@ use crate::{
         ClipboardPasteSupportMsg, ColorRegistersMsg, ConfigFileUpdatedMsg, ConnStatusMsg,
         ConnectedMsg, DesktopNotificationResponseMsg, DetachSessionMsg, EmitNestedSessionFrameMsg,
         ExitMsg, ExitReason as ProtoExitReason, FailedToStartWebServerMsg, FirstClientConnectedMsg,
-        FontFamiliesMsg, ForegroundColorMsg, ForwardQueryToHostMsg, ForwardedReplyFromHostMsg,
+        FontFamiliesMsg, ForegroundColorMsg, ForkSessionEventMsg, ForkSubscribeToSessionEventsMsg,
+        ForwardQueryToHostMsg, ForwardedReplyFromHostMsg,
         HostProgramStatus as ProtoHostProgramStatus, HostProgramStatusMsg,
         HostTerminalFocusChangedMsg, HostTerminalThemeChangedMsg,
         HostTerminalThemeIndication as ProtoHostTerminalThemeIndication, HostThemeModeMsg,
@@ -251,6 +252,11 @@ impl From<ClientToServerMsg> for ProtoClientToServerMsg {
                     history: Some(history.into()),
                 })
             },
+            ClientToServerMsg::SubscribeToSessionEvents { agents_only } => {
+                client_to_server_msg::Message::ForkSubscribeToSessionEvents(
+                    ForkSubscribeToSessionEventsMsg { agents_only },
+                )
+            },
         };
 
         ProtoClientToServerMsg {
@@ -488,6 +494,11 @@ impl TryFrom<ProtoClientToServerMsg> for ClientToServerMsg {
                     history: msg.history.map(Into::into).unwrap_or_default(),
                 })
             },
+            Some(client_to_server_msg::Message::ForkSubscribeToSessionEvents(msg)) => {
+                Ok(ClientToServerMsg::SubscribeToSessionEvents {
+                    agents_only: msg.agents_only,
+                })
+            },
             None => Err(anyhow!("Empty ClientToServerMsg message")),
         }
     }
@@ -630,6 +641,9 @@ impl From<ServerToClientMsg> for ProtoServerToClientMsg {
             },
             ServerToClientMsg::PaneMirror { payload } => {
                 server_to_client_msg::Message::PaneMirror(ServerPaneMirrorMsg { payload })
+            },
+            ServerToClientMsg::SessionEvent { line } => {
+                server_to_client_msg::Message::ForkSessionEvent(ForkSessionEventMsg { line })
             },
         };
 

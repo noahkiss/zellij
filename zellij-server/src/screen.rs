@@ -47,13 +47,10 @@ mod mirror;
 mod popups;
 
 use log::{debug, warn};
-use zellij_utils::data::{
-    BorderStyle, BorderStyleOverride, CommandOrPlugin, ContextMenuContext, ContextMenuEntry,
-    ContextMenuTarget, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
-    HiddenBars, HostTerminalThemeMode, KeyWithModifier, KeybindsVec, LayoutInfo, LayoutWithError,
-    ListPanesResponse, ListTabsResponse, NestedSessionEndReason, NestedSessionKeybinds,
-    NestedSessionKeybindsError, NestedSessionKeybindsResponse, NewPanePlacement, PaneContents,
-    PaneInfo, PaneListEntry, PaneManifest, PaneRenderReport, PaneScrollbackResponse,
+use std::sync::atomic::{AtomicBool, Ordering};
+use zellij_utils::agent_detect::{self, PaneAgent};
+use zellij_utils::event_stream::{EventStream, StreamEvent, StreamModel, StreamTab};
+
 use crate::closed_panes::{ClosedPane, ClosedPaneKind, ClosedPanes, ClosingPane};
 use zellij_utils::data::{
     BorderStyle, BorderStyleOverride, CommandOrPlugin, ContextMenuContext, ContextMenuEntry,
@@ -1201,8 +1198,16 @@ pub enum ScreenInstruction {
     ReleaseLiveViewInputWithKey(ClientId),
     ReportLiveViewCaptureChange,
     SetLiveViewReleaseKey(Option<String>),
+    /// fork addition: `zellij action watch` - start a session event stream for this client.
+    SubscribeToSessionEvents {
+        client_id: ClientId,
+        agents_only: bool,
+    },
+    /// fork addition: the event stream's own tick, while it has a subscriber.
+    SessionEventTick,
     DesktopNotificationResponse(Vec<u8>, ClientId),
     UpdateBackgroundPluginSubscriptions(PluginId, ClientId, HashSet<EventType>),
+    RemoveBackgroundPluginSubscriptions(PluginId),
     ClearHintTextCache,
     BroadcastModeUpdate(ModeInfo, Option<ClientId>), // ModeInfo, optional specific client_id (None = all clients)
     // Pane-targeting CLI variants
@@ -1714,8 +1719,15 @@ impl From<&ScreenInstruction> for ScreenContext {
             | ScreenInstruction::ReleaseLiveViewInputWithKey(..)
             | ScreenInstruction::ReportLiveViewCaptureChange
             | ScreenInstruction::SetLiveViewReleaseKey(..) => ScreenContext::PaneMirror,
+            ScreenInstruction::SubscribeToSessionEvents { .. } => {
+                ScreenContext::SubscribeToSessionEvents
+            },
+            ScreenInstruction::SessionEventTick => ScreenContext::SessionEventTick,
             ScreenInstruction::UpdateBackgroundPluginSubscriptions(..) => {
                 ScreenContext::UpdateBackgroundPluginSubscriptions
+            },
+            ScreenInstruction::RemoveBackgroundPluginSubscriptions(..) => {
+                ScreenContext::RemoveBackgroundPluginSubscriptions
             },
             ScreenInstruction::ClearHintTextCache => ScreenContext::ClearHintTextCache,
             ScreenInstruction::BroadcastModeUpdate(..) => ScreenContext::BroadcastModeUpdate,
@@ -2636,6 +2648,7 @@ impl Screen {
             web_server_ip,
             web_server_port,
             render_blocker: RenderBlocker::new(100),
+            last_reported_tab_structure: None,
             watcher_clients: HashMap::new(),
             followed_client_id: None,
             watcher_followed_content: None,
@@ -2645,6 +2658,10 @@ impl Screen {
             pane_mirrors: Default::default(),
             mirror_connector: Arc::new(zellij_utils::pane_mirror::LocalSocketConnector),
             live_views: Default::default(),
+            session_event_streams: HashMap::new(),
+            session_event_epoch: zellij_utils::event_stream::new_epoch(),
+            session_event_last_look: None,
+            session_event_ticker: None,
             background_plugin_subscriptions: HashMap::new(),
             last_reported_plugin_tab_indices: HashMap::new(),
             pending_session_card: None,
@@ -6135,6 +6152,16 @@ impl Screen {
 
             // Subscriber delivery — gated behind is_empty() for zero overhead
             if !self.pane_render_subscribers.is_empty() {
+                self.deliver_to_pane_subscribers(Some(&pane_render_report));
+            }
+
+            let _ = self
+                .bus
+                .senders
+                .send_to_plugin(PluginInstruction::PaneRenderReport(pane_render_report));
+
+            non_watcher_output_was_dirty = output.is_dirty();
+
             if !bells.panes_to_flash.is_empty() {
                 let _ = self
                     .bus
@@ -7350,11 +7377,14 @@ impl Screen {
         self.client_display_slots.borrow_mut().remove(&client_id);
         self.release_structured_render_state(client_id);
         self.pane_render_subscribers.remove(&client_id);
-        self.background_plugin_subscriptions
-            .retain(|(_plugin_id, c_id), _subscriptions| c_id != &client_id);
+        // fork: a background plugin's subscription outlives the client it was loaded with - that
+        // id only addresses the instance, and a detached session is where it is needed most. It
+        // goes when the plugin does (`RemoveBackgroundPluginSubscriptions`)
         self.last_forwarded_osc7.remove(&client_id);
+        self.drop_session_event_stream(client_id);
         self.client_host_focused.remove(&client_id);
         self.client_notification_protocols.remove(&client_id);
+        self.client_progress.remove(&client_id);
         self.client_host_terminal_env.remove(&client_id);
         self.revert_fit_disabled_without_reference_client()
             .with_context(err_context)?;
@@ -11263,16 +11293,25 @@ impl Screen {
                     ansi,
                 },
             );
+        } else {
+            // a subscribe that named no live pane replaces whatever this client was subscribed
+            // to before, rather than leaving the server and the consumer disagreeing about it
+            self.pane_render_subscribers.remove(&subscriber_client_id);
         }
     }
-    fn deliver_to_pane_subscribers_from_report(&mut self, report: &PaneRenderReport) {
-        let Some(pane_map) = report.all_pane_contents.values().next() else {
-            return;
-        };
-        let ansi_pane_map = report.all_pane_contents_with_ansi.values().next();
-        self.deliver_subscriber_updates_from_map(pane_map, ansi_pane_map);
-    }
-    fn deliver_to_pane_subscribers_directly(&mut self) {
+    /// Build one contents map for every subscribed pane and deliver from it.
+    ///
+    /// The render report only carries the panes a client is looking at: `Tab::render` returns early
+    /// for a tab no client is on, and floating panes are rendered only while they are visible. So a
+    /// subscriber that named a pane elsewhere would be served from the report while nobody was
+    /// attached and go silent the moment somebody was. Whatever the report is missing is queried
+    /// from its tab here, which is what the detached path always did for every pane — `report` is
+    /// simply `None` there.
+    fn deliver_to_pane_subscribers(&mut self, report: Option<&PaneRenderReport>) {
+        let reported = report.and_then(|r| r.all_pane_contents.values().next());
+        let reported_with_ansi = report.and_then(|r| r.all_pane_contents_with_ansi.values().next());
+        let has_ansi_subscribers = self.pane_render_subscribers.values().any(|s| s.ansi);
+
         // Collect unique pane IDs across all subscribers
         let all_subscribed_ids: HashSet<zellij_utils::data::PaneId> = self
             .pane_render_subscribers
@@ -11280,19 +11319,45 @@ impl Screen {
             .flat_map(|sub| sub.pane_ids.iter().copied())
             .collect();
 
-        let has_ansi_subscribers = self.pane_render_subscribers.values().any(|s| s.ansi);
+        // a plugin pane keeps a grid per client, so it is read the way the initial delivery reads
+        // it - through a regular client - rather than through the None a terminal pane wants
+        let regular_client_id = self
+            .connected_clients
+            .borrow()
+            .keys()
+            .find(|id| !self.watcher_clients.contains_key(id))
+            .copied();
 
-        // Query pane contents directly from tabs
         let mut pane_map: HashMap<zellij_utils::data::PaneId, PaneContents> = HashMap::new();
         let mut ansi_pane_map: HashMap<zellij_utils::data::PaneId, PaneContents> = HashMap::new();
         for pane_id in &all_subscribed_ids {
+            if let Some(contents) = reported.and_then(|m| m.get(pane_id)) {
+                pane_map.insert(*pane_id, contents.clone());
+            }
+            if let Some(contents) = reported_with_ansi.and_then(|m| m.get(pane_id)) {
+                ansi_pane_map.insert(*pane_id, contents.clone());
+            }
+            let needs_plain = !pane_map.contains_key(pane_id);
+            let needs_ansi = has_ansi_subscribers && !ansi_pane_map.contains_key(pane_id);
+            if !needs_plain && !needs_ansi {
+                continue;
+            }
+
             let server_pane_id: PaneId = (*pane_id).into();
+            let query_client_id = match server_pane_id {
+                PaneId::Plugin(_) => regular_client_id,
+                PaneId::Terminal(_) => None,
+            };
             for tab in self.tabs.values() {
                 if let Some(pane) = tab.get_pane_with_id(server_pane_id) {
-                    pane_map.insert(*pane_id, pane.pane_contents(None, false, None));
-                    if has_ansi_subscribers {
-                        ansi_pane_map
-                            .insert(*pane_id, pane.pane_contents_with_ansi(None, false, None));
+                    if needs_plain {
+                        pane_map.insert(*pane_id, pane.pane_contents(query_client_id, false, None));
+                    }
+                    if needs_ansi {
+                        ansi_pane_map.insert(
+                            *pane_id,
+                            pane.pane_contents_with_ansi(query_client_id, false, None),
+                        );
                     }
                     break;
                 }
@@ -11378,6 +11443,9 @@ impl Screen {
                 pane_id, viewport, ..
             } = msg
             {
+                if busy_updates.contains(&(subscriber_id, pane_id)) {
+                    continue;
+                }
                 if let Some(subscription) = self.pane_render_subscribers.get_mut(&subscriber_id) {
                     subscription.previous_viewports.insert(pane_id, viewport);
                 }
@@ -11388,6 +11456,130 @@ impl Screen {
             self.pane_render_subscribers.remove(&id);
         }
     }
+    /// What a session event stream compares: the tabs, and the pane list `list-panes` answers
+    /// with.
+    fn session_event_model(&self) -> StreamModel {
+        let mut tabs: Vec<&Tab> = self.tabs.values().collect();
+        tabs.sort_by_key(|tab| tab.position);
+        let tabs = tabs
+            .into_iter()
+            .map(|tab| StreamTab {
+                tab_id: tab.id,
+                name: tab.name.clone(),
+            })
+            .collect();
+        let panes = self.collect_pane_list(false).unwrap_or_default();
+        StreamModel::new(tabs, panes)
+    }
+    /// `zellij action watch`: the first lines of a new stream, and the stream kept for later.
+    fn subscribe_to_session_events(&mut self, client_id: ClientId, agents_only: bool) {
+        let server_build_id = zellij_utils::session_lifecycle::own_executable()
+            .and_then(|identity| identity.build_id)
+            .map(|id| id.iter().map(|byte| format!("{:02x}", byte)).collect());
+        let hello = StreamEvent::Hello {
+            server_version: zellij_utils::consts::VERSION.to_owned(),
+            server_build_id,
+            session: self.session_name.clone(),
+        };
+        let model = self.session_event_model();
+        let (stream, lines) = EventStream::start(
+            &self.session_event_epoch,
+            hello,
+            &model,
+            agents_only,
+            zellij_utils::event_stream::now_ms(),
+        );
+        if !self.send_session_event_lines(client_id, lines) {
+            return;
+        }
+        self.session_event_streams.insert(client_id, stream);
+        self.session_event_last_look = Some(Instant::now());
+        self.start_session_event_ticker();
+    }
+    /// Look at the session for every stream, and send each the lines its difference is worth.
+    ///
+    /// `now` is false on the render path, which can run many times a second under output: there a
+    /// look is skipped if the last one was under 100ms ago, and the tick picks it up instead.
+    fn look_for_session_events(&mut self, now: bool) {
+        if self.session_event_streams.is_empty() {
+            return;
+        }
+        if !now
+            && self
+                .session_event_last_look
+                .map_or(false, |at| at.elapsed() < Duration::from_millis(100))
+        {
+            return;
+        }
+        self.session_event_last_look = Some(Instant::now());
+        let model = self.session_event_model();
+        let now_ms = zellij_utils::event_stream::now_ms();
+        let mut outgoing = Vec::new();
+        for (client_id, stream) in self.session_event_streams.iter_mut() {
+            let lines = stream.advance(&model, now_ms);
+            if !lines.is_empty() {
+                outgoing.push((*client_id, lines));
+            }
+        }
+        for (client_id, lines) in outgoing {
+            if !self.send_session_event_lines(client_id, lines) {
+                self.drop_session_event_stream(client_id);
+            }
+        }
+    }
+    /// Send lines to a stream's client, in order. False when the client is gone.
+    ///
+    /// A client that is behind has its lines buffered, never dropped: a stream that skipped a line
+    /// would break the promise that `seq` has no gaps.
+    fn send_session_event_lines(&self, client_id: ClientId, lines: Vec<String>) -> bool {
+        let Some(os_input) = &self.bus.os_input else {
+            return true;
+        };
+        for line in lines {
+            if os_input
+                .send_to_client(client_id, ServerToClientMsg::SessionEvent { line })
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+    fn drop_session_event_stream(&mut self, client_id: ClientId) {
+        self.session_event_streams.remove(&client_id);
+        if self.session_event_streams.is_empty() {
+            if let Some(running) = self.session_event_ticker.take() {
+                running.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+    /// The tick that makes a look happen when nothing else does: the trailing `pane_output` line
+    /// of a pane that went quiet, and a change the render path's rate limit put off. It runs only
+    /// while a stream does.
+    fn start_session_event_ticker(&mut self) {
+        if self.session_event_ticker.is_some() {
+            return;
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        self.session_event_ticker = Some(running.clone());
+        let senders = self.bus.senders.clone();
+        let _ = std::thread::Builder::new()
+            .name("session_event_tick".to_owned())
+            .spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if senders
+                        .send_to_screen(ScreenInstruction::SessionEventTick)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+    }
     fn notify_pane_closed_to_subscribers(&mut self, pane_id: zellij_utils::data::PaneId) {
         self.notify_mirrors_pane_closed(pane_id.into());
         if let zellij_utils::data::PaneId::Plugin(plugin_pane_id) = pane_id {
@@ -11397,6 +11589,9 @@ impl Screen {
 
         for (subscriber_id, subscription) in &mut self.pane_render_subscribers {
             if subscription.pane_ids.remove(&pane_id) {
+                // a terminal id can be reused once the pane holding it is gone, and a stale
+                // viewport under a reused id would silence the first update the new pane sends
+                subscription.previous_viewports.remove(&pane_id);
                 if let Some(os_input) = &self.bus.os_input {
                     let _ = os_input.send_to_client(
                         *subscriber_id,
@@ -11793,6 +11988,7 @@ pub(crate) fn screen_thread_main(
                 // that a 100ms timeout has been reached (more info in the RenderBlocker comment)
                 if screen.render_blocker.can_render() {
                     screen.render_to_clients()?;
+                    screen.look_for_session_events(false);
                 } else {
                     screen.render(None)?;
                 }
@@ -16906,6 +17102,15 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::SetLiveViewReleaseKey(release_key) => {
                 screen.set_live_view_release_key(release_key);
+            },
+            ScreenInstruction::SubscribeToSessionEvents {
+                client_id,
+                agents_only,
+            } => {
+                screen.subscribe_to_session_events(client_id, agents_only);
+            },
+            ScreenInstruction::SessionEventTick => {
+                screen.look_for_session_events(true);
             },
             ScreenInstruction::UpdateBackgroundPluginSubscriptions(
                 plugin_id,

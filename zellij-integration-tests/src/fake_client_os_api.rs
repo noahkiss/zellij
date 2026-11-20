@@ -56,6 +56,7 @@ fn server_message_name(msg: &ServerToClientMsg) -> String {
         ServerToClientMsg::HostTerminalThemeChanged { .. } => "HostTerminalThemeChanged",
         ServerToClientMsg::PaneMirror { .. } => "PaneMirror",
         ServerToClientMsg::PasteFromClipboard { .. } => "PasteFromClipboard",
+        ServerToClientMsg::SessionEvent { .. } => "SessionEvent",
     }
     .to_string()
 }

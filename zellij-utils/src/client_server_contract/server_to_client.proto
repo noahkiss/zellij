@@ -192,6 +192,11 @@ message MobileRenderPrefsMsg {
   bool active_pane_is_fullscreen = 3;
 }
 
+// fork addition: one JSON object, written by the server, carrying seq, epoch and ts.
+message ForkSessionEventMsg {
+  string line = 1;
+}
+
 message MobileStateMsg {
   string session_name = 1;
   uint64 now_secs = 2;

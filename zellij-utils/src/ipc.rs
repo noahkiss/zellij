@@ -292,6 +292,11 @@ pub enum ClientToServerMsg {
     AdoptSessionHistory {
         history: crate::session_history::SessionHistory,
     },
+    /// fork addition: `zellij action watch`. The server answers with `SessionEvent` lines on this
+    /// connection until it goes away. `agents_only` is what an older client's `list-agents --watch` asks for.
+    SubscribeToSessionEvents {
+        agents_only: bool,
+    },
 }
 
 // Types of messages sent from the server to the client
@@ -374,6 +379,10 @@ pub enum ServerToClientMsg {
     },
     PaneMirror {
         payload: Vec<u8>,
+    },
+    /// fork addition: one line of `zellij action watch`, a JSON object the server wrote.
+    SessionEvent {
+        line: String,
     },
 }
 
