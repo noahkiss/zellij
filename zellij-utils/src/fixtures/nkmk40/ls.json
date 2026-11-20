@@ -1,0 +1,12 @@
+[
+  {
+    "name": "zj40",
+    "created_seconds_ago": 0,
+    "is_current": false,
+    "is_dead": false,
+    "server_exe": "/home/user/.local/share/zellij/bin/zellij",
+    "server_build_id": "5a0f404aef9dd48527ef9366e2733d29675adf49",
+    "server_build": "same",
+    "server_version": "0.45.1-nkmk.40"
+  }
+]

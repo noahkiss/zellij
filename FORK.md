@@ -4894,9 +4894,11 @@ long-lived command the server writes to as things change, one JSON object per li
   the fields of its `list-panes --json` row under the same names - `title`, `program_title`,
   `pane_cwd`, `pane_command`, `terminal_command`, `command_state`, `last_command_exit_code`, and
   the `OSC 7501` keys `state`, `state_kind`, `state_app`, `state_title`, `state_msg`,
-  `state_progress`, `state_at`. A key is absent, or null, exactly when the `list-panes` row has
-  it absent or null. The line carries every field, not only the one that moved. It is written
-  when any of those fields, or `tab_id`, changes. A new `state_at` alone is not a change, as on an
+  `state_progress`, `state_at`, and upstream's `attention` object, nested under `attention`
+  exactly as on a `list-tree` row and always whole. A key is absent, or null, exactly when the
+  `list-panes` row has it absent or null. The line carries every field, not only the one that
+  moved. It is written when any of those fields, or `tab_id`, changes; a change in `attention`
+  alone (its `status`, or `seen` flipping) is one. A new `state_at` alone is not a change, as on an
   `agent` line, and neither is a renamed handle. `input_since_prompt`, `input_since_state` and
   `prefilled_command` are not carried: typing flips them. **A pane moved to another tab** is a
   `pane_changed` with the new `tab_id`. **At most one line per pane per second**, like
@@ -4911,6 +4913,8 @@ long-lived command the server writes to as things change, one JSON object per li
 - **Order inside one change**: a tab opens before its panes, a pane opens before its agent, an
   agent's `gone` comes before its pane closes, a pane closes before its tab. `pane_changed` and
   then `pane_output` lines come last.
+- **Watching is not looking.** Neither a `watch` client nor a one-shot `zellij action` call is a
+  viewer: upstream's `attention.seen` flips only for an attached terminal client showing the pane.
 - **Exit 0** when the reader closes the pipe, noticed even on a quiet session (the client asks its
   stdout every half second). **Exit 2** when the session goes away. **Exit 2 at once**, within five
   seconds and with the reason on stderr, against a server that predates the command.
@@ -6779,9 +6783,17 @@ knows the answer and is already telling us.
 - `input_since_prompt` is `true` when input was typed after the shell's last prompt marker, so a
   `prompt` is the one from before that input (from nkmk.33). It is absent otherwise. See [`--for
   ready` after typing a command](#--for-ready-after-typing-a-command-the-prompt-must-be-fresh).
-- **Both keys are absent for a shell that emits no markers, and for a plugin pane.** Absent means
-  "this pane cannot answer", which is a different thing from `prompt`. A consumer that must work
-  against a bare `sh` still has `last_output_at` and the process columns.
+- **A shell that emits no markers gets `command_state` from upstream's foreground-process
+  tracker** (`command_state_detail.reports_markers` is `false` there): `running` while a
+  foreground program runs, `done` once the shell is back. The tracker cannot see a prompt without
+  markers, so it never says `prompt`, and before the first command the key is absent.
+  `last_command_exit_code` stays absent: the tracker has no exit code to give. A command pane
+  without markers reads `running` until its command exits, then `done`. A pane whose shell writes
+  markers is answered by its markers alone, as before. `wait --for ready` reads only the markers'
+  word, so a program that never ends still falls back to quiet.
+- **Both keys are absent for a plugin pane**, and `command_state` is absent for a shell without
+  markers that has run nothing yet. Absent means "this pane cannot answer", which is a different
+  thing from `prompt`.
 - The state is read from the last marker in the grid, walking back from the newest row, so it costs
   a short scan per pane on a command that already builds every pane's info.
 - **`command_state` stays a string.** Upstream v0.46.0 has its own `PaneInfo.command_state`, a

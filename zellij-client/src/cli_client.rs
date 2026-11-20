@@ -1489,7 +1489,9 @@ fn pane_look(
             (PaneState::Exited(entry.pane_info.exit_status), None)
         },
         Some(entry) => {
-            let command_state = match entry.command_state {
+            // the markers' word only: a `running` filled from the foreground process would hold
+            // a wait on a pane whose program never ends, where the quiet fallback answers
+            let command_state = match entry.command_state_from_markers() {
                 Some(PaneCommandState::Prompt) if entry.input_since_prompt => {
                     Some(PaneCommandState::Running)
                 },
@@ -4074,6 +4076,41 @@ mod tests {
         assert_eq!(
             pane_look(&panes, PaneId::Terminal(9)).unwrap(),
             (PaneState::Gone, None)
+        );
+    }
+
+    /// A shell without OSC 133 has its `command_state` filled from the foreground-process tracker.
+    /// That `running` is not the shell's word, and a wait on a pane whose program never ends would
+    /// never fall back to quiet if it were taken as one.
+    #[test]
+    fn a_ready_wait_ignores_a_command_state_filled_from_the_foreground_process() {
+        use zellij_utils::attention::{CommandPhase, CommandState};
+        let mut entries: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (1, false, false, None),
+            (2, false, false, None),
+        ]))
+        .unwrap();
+        entries[0].command_state = Some(PaneCommandState::Running);
+        entries[0].pane_info.command_state = CommandState {
+            phase: CommandPhase::Running,
+            reports_markers: false,
+            ..Default::default()
+        };
+        // the same string from a shell that writes markers is the shell's word
+        entries[1].command_state = Some(PaneCommandState::Running);
+        entries[1].pane_info.command_state = CommandState {
+            phase: CommandPhase::Running,
+            reports_markers: true,
+            ..Default::default()
+        };
+        let panes = serde_json::to_string(&entries).unwrap();
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(1)).unwrap(),
+            (PaneState::Running, None)
+        );
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(2)).unwrap(),
+            (PaneState::Running, Some(PaneCommandState::Running))
         );
     }
 

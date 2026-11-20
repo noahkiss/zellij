@@ -310,3 +310,15 @@ tab_renamed.seq number
 tab_renamed.tab_id number
 tab_renamed.ts number
 
+# ls.json
+$ array
+$[] object
+$[].created_seconds_ago number
+$[].is_current bool
+$[].is_dead bool
+$[].name string
+$[].server_build string
+$[].server_build_id string
+$[].server_exe string
+$[].server_version string
+

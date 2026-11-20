@@ -15,6 +15,9 @@ were opened, renamed and closed, a tab was renamed, the stand-in agent reported 
 and its pane was closed. Paths, the host name and the user name were replaced with placeholders;
 every other value is as written.
 
+`ls.json` came later, from the same released binary in a scratch session of its own, so the 0.46
+capture in `../046/` has an `ls --json` to compare against.
+
 | File | What it holds |
 |---|---|
 | `expected-keys.txt` | Every key path in each fixture with the JSON types seen there. `[]` is any array element; `watch.jsonl` is keyed by `event`. |

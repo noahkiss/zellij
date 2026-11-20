@@ -7958,6 +7958,14 @@ impl Screen {
                     })
                     .unwrap_or((None, None, false))
             };
+            // fork: a shell that writes no OSC 133 markers still gets a word, from upstream's
+            // foreground-process tracker: `running` or `done`, never an exit code. A shell that
+            // does write markers keeps the markers' answer, absent included
+            let command_state = if command_state.is_none() && !pane_info.is_plugin {
+                zellij_utils::data::PaneCommandState::from_tracker(&pane_info.command_state)
+            } else {
+                command_state
+            };
             let program_status = if pane_info.is_plugin {
                 None
             } else {

@@ -1,0 +1,17 @@
+[
+  {
+    "name": "zjf",
+    "created_seconds_ago": 21,
+    "is_current": false,
+    "is_dead": false,
+    "connected_clients": 0,
+    "web_client_count": 0,
+    "web_clients_allowed": false,
+    "tab_count": 2,
+    "pane_count": 15,
+    "server_exe": "/usr/local/bin/zellij",
+    "server_build_id": "010249a40577e7f4274774df3152236f7969eb9c",
+    "server_build": "same",
+    "server_version": "0.46.0"
+  }
+]

@@ -16,8 +16,8 @@
 //! and one `tab_opened` line per tab, then `synced`. After that every line is a change.
 //!
 //! The snapshot carries ids only. What a pane says about itself - its titles, cwd, command and
-//! state - is a `pane_changed` line, written for every pane opened after `synced` and whenever
-//! one of those fields changes, at most once a second per pane.
+//! state, and upstream's `attention` object - is a `pane_changed` line, written for every pane
+//! opened after `synced` and whenever one of those fields changes, at most once a second per pane.
 //!
 //! Nothing here asks the operating system anything: the server hands in the model and the clock.
 
@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::agent_detect::{agents_from_pane_list, watched_part};
+use crate::attention::PaneAttention;
 use crate::data::{AgentListEntry, PaneCommandState, PaneListEntry, PaneProgramStatus};
 
 /// The shortest gap between two `pane_output` lines for one pane, in milliseconds.
@@ -52,6 +53,9 @@ pub struct PaneDetails {
     pub last_command_exit_code: Option<i32>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<PaneProgramStatus>,
+    /// fork: upstream's attention for the pane, the whole object, nested under `attention` exactly
+    /// as on a `list-tree` row. Written on every `pane_changed` line, never in part.
+    pub attention: PaneAttention,
 }
 
 impl PaneDetails {
@@ -66,6 +70,7 @@ impl PaneDetails {
             command_state: entry.command_state,
             last_command_exit_code: entry.last_command_exit_code,
             program_status: entry.program_status.clone(),
+            attention: info.attention.clone(),
         }
     }
 
@@ -888,6 +893,46 @@ mod tests {
         assert!(stream.advance(&look(&entry), 1_000_000).is_empty());
         entry.pane_info.title = "again".into();
         assert_eq!(expect_change(&entry, &mut stream)["handle"], "c-d");
+    }
+
+    #[test]
+    fn pane_changed_carries_the_whole_attention_object_and_attention_alone_is_a_change() {
+        use crate::attention::{AttentionSource, AttentionStatus, PaneAttention};
+        let mut entry = pane(1, "a-b", 0, None);
+        let look = |entry: &PaneListEntry| StreamModel::new(vec![tab(0, "t")], vec![entry.clone()]);
+        let (mut stream, _) = EventStream::start("ep", hello(), &look(&entry), false, 0);
+        // a title change carries the attention too, default and all, nested as on `list-tree`
+        entry.pane_info.title = "renamed".into();
+        let lines = stream.advance(&look(&entry), 1000);
+        let line = parse(&lines).remove(0);
+        let row = serde_json::to_value(&entry).unwrap();
+        assert_eq!(line["attention"], row["attention"]);
+        assert_eq!(line["attention"]["status"], "Idle");
+        assert_eq!(line["attention"]["seen"], false);
+        // only the attention moved: still a line, with every key of the object
+        entry.pane_info.attention = PaneAttention {
+            status: AttentionStatus::Done,
+            source: Some(AttentionSource::ForegroundProcess),
+            text: "finished".into(),
+            since_ms: 1500,
+            changed_ms: 1500,
+            ..Default::default()
+        };
+        let lines = stream.advance(&look(&entry), 2000);
+        assert_eq!(events(&lines), vec!["pane_changed"]);
+        let line = parse(&lines).remove(0);
+        let row = serde_json::to_value(&entry).unwrap();
+        assert_eq!(line["attention"], row["attention"]);
+        assert_eq!(line["attention"]["status"], "Done");
+        assert_eq!(
+            line["attention"].as_object().unwrap().len(),
+            row["attention"].as_object().unwrap().len()
+        );
+        // seen flipping is a change on its own
+        entry.pane_info.attention.seen = true;
+        let lines = stream.advance(&look(&entry), 3000);
+        assert_eq!(parse(&lines)[0]["attention"]["seen"], true);
+        assert!(stream.advance(&look(&entry), 9000).is_empty());
     }
 
     #[test]

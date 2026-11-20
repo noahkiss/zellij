@@ -3759,6 +3759,110 @@ pub enum PaneCommandState {
     Done,
 }
 
+impl PaneCommandState {
+    /// fork: the string for a pane whose shell writes no OSC 133 markers, from upstream's
+    /// foreground-process tracker. A foreground program is `running`; back at the shell is `done`.
+    /// The tracker cannot see a prompt without markers, so it never answers `prompt` here, and
+    /// nothing before the first command: `None`. Also `None` for a pane that reports markers, whose
+    /// string comes from the markers alone.
+    pub fn from_tracker(state: &crate::attention::CommandState) -> Option<Self> {
+        use crate::attention::CommandPhase;
+        if state.reports_markers {
+            return None;
+        }
+        match state.phase {
+            CommandPhase::Running => Some(PaneCommandState::Running),
+            CommandPhase::Finished => Some(PaneCommandState::Done),
+            CommandPhase::AtPrompt | CommandPhase::Typing => Some(PaneCommandState::Prompt),
+            CommandPhase::Unknown => None,
+        }
+    }
+}
+
+impl PaneListEntry {
+    /// fork: `command_state` when it comes from the pane's own OSC 133 markers, and `None` when it
+    /// was filled from the foreground-process tracker ([`PaneCommandState::from_tracker`]). A
+    /// reader that needs the shell's exact word - "a prompt is drawn", or "a command is between its
+    /// markers" - reads this; a reader that wants the best answer reads `command_state`. A row from
+    /// a build without the tracker carries no detail, and its string is the markers'.
+    pub fn command_state_from_markers(&self) -> Option<PaneCommandState> {
+        if PaneCommandState::from_tracker(&self.pane_info.command_state).is_some() {
+            None
+        } else {
+            self.command_state
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_state_fill_tests {
+    use super::*;
+    use crate::attention::{CommandPhase, CommandState};
+
+    fn tracker(phase: CommandPhase, reports_markers: bool) -> CommandState {
+        CommandState {
+            phase,
+            reports_markers,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_shell_without_markers_reads_running_or_done_from_the_tracker() {
+        assert_eq!(
+            PaneCommandState::from_tracker(&tracker(CommandPhase::Running, false)),
+            Some(PaneCommandState::Running)
+        );
+        assert_eq!(
+            PaneCommandState::from_tracker(&tracker(CommandPhase::Finished, false)),
+            Some(PaneCommandState::Done)
+        );
+        // nothing has run yet: no word, as before
+        assert_eq!(
+            PaneCommandState::from_tracker(&tracker(CommandPhase::Unknown, false)),
+            None
+        );
+        // a shell that writes markers is answered by its markers alone
+        for phase in [
+            CommandPhase::Running,
+            CommandPhase::Finished,
+            CommandPhase::AtPrompt,
+            CommandPhase::Unknown,
+        ] {
+            assert_eq!(PaneCommandState::from_tracker(&tracker(phase, true)), None);
+        }
+    }
+
+    #[test]
+    fn the_markers_word_is_told_apart_from_the_filled_one() {
+        let mut row = PaneListEntry {
+            pane_info: PaneInfo::default(),
+            tab_position: 0,
+            tab_name: String::new(),
+            agent: None,
+            command_state: Some(PaneCommandState::Done),
+            last_command_exit_code: None,
+            input_since_prompt: false,
+            input_since_state: false,
+            prefilled_command: None,
+            queued_messages: 0,
+            program_status: None,
+        };
+        // a row from a build without the tracker: the string is the markers'
+        assert_eq!(
+            row.command_state_from_markers(),
+            Some(PaneCommandState::Done)
+        );
+        row.pane_info.command_state = tracker(CommandPhase::Finished, false);
+        assert_eq!(row.command_state_from_markers(), None);
+        row.pane_info.command_state = tracker(CommandPhase::Finished, true);
+        assert_eq!(
+            row.command_state_from_markers(),
+            Some(PaneCommandState::Done)
+        );
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PaneListEntry {
     #[serde(flatten)]
@@ -3778,9 +3882,10 @@ pub struct PaneListEntry {
     pub agent: Option<PaneAgent>,
     /// What the pane's shell says it is doing, from its OSC 133 markers.
     ///
-    /// Absent for a plugin pane, and for a terminal pane whose shell emits no markers - which is
-    /// the honest answer rather than a guess. Like `agent`, it lives on this CLI-only row rather
-    /// than on `PaneInfo`, whose readers would each cost a protobuf tag.
+    /// For a shell that emits no markers, upstream's foreground-process tracker fills it:
+    /// `running` or `done`, never `prompt` ([`PaneCommandState::from_tracker`]). Absent for a
+    /// plugin pane, and for a marker-less shell that has run nothing yet. Like `agent`, it lives on
+    /// this CLI-only row rather than on `PaneInfo`, whose readers would each cost a protobuf tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_state: Option<PaneCommandState>,
     /// The exit code the last command reported, when `command_state` is `done` and the shell put

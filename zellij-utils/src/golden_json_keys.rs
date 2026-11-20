@@ -25,6 +25,17 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("fixtures/nkmk40/list-agents.json"),
     ),
     ("watch.jsonl", include_str!("fixtures/nkmk40/watch.jsonl")),
+    ("ls.json", include_str!("fixtures/nkmk40/ls.json")),
+];
+
+/// The same verbs captured from this build (`fixtures/046/README.md`).
+const FIXTURES_046: &[(&str, &str)] = &[
+    (
+        "list-tree.json",
+        include_str!("fixtures/046/list-tree.json"),
+    ),
+    ("watch.jsonl", include_str!("fixtures/046/watch.jsonl")),
+    ("ls.json", include_str!("fixtures/046/ls.json")),
 ];
 
 const EXPECTED_KEYS: &str = include_str!("fixtures/nkmk40/expected-keys.txt");
@@ -217,4 +228,95 @@ fn a_list_panes_row_writes_one_command_state_and_it_is_a_string() {
         }
         assert!(raw.contains("\"command_state_detail\":{"), "{}", raw);
     }
+}
+
+/// A checked-in key file read back: section name to key path to the JSON types seen there.
+fn read_key_file(text: &str) -> BTreeMap<String, BTreeMap<String, BTreeSet<String>>> {
+    let mut sections: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    let mut current = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if let Some(name) = line.strip_prefix("# ") {
+            current = Some(name.to_owned());
+            sections.entry(name.to_owned()).or_default();
+            continue;
+        }
+        let (Some(section), Some((path, types))) = (current.as_ref(), line.rsplit_once(' ')) else {
+            continue;
+        };
+        sections.entry(section.clone()).or_default().insert(
+            path.to_owned(),
+            types.split('|').map(str::to_owned).collect(),
+        );
+    }
+    sections
+}
+
+/// What this build writes, captured from a running server, against what nkmk.40 wrote: every
+/// nkmk.40 key path is still written, and none is retyped. A path seen only as `null` on one side
+/// is not a retype, since one capture cannot hold every value a key takes.
+///
+/// The one exemption is the `list-panes` keys `not-in-this-build.txt` records as removed after
+/// nkmk.40. A `list-tree` row is a `list-panes` row, so they are missing there too, and the
+/// row-type test above already holds them to that list.
+#[test]
+fn the_046_capture_writes_every_nkmk40_key() {
+    let expected = read_key_file(EXPECTED_KEYS);
+    let removed: BTreeSet<String> = read_key_file(NOT_IN_THIS_BUILD)
+        .get("list-panes.json")
+        .map(|keys| {
+            keys.keys()
+                .filter_map(|path| path.strip_prefix("$[]"))
+                .map(|rest| format!("$[].panes[]{}", rest))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut problems = Vec::new();
+    for (name, text) in FIXTURES_046 {
+        let ours = fixture_key_set(name, text);
+        let theirs = expected
+            .get(*name)
+            .unwrap_or_else(|| panic!("nkmk.40 recorded no {}", name));
+        for (path, their_types) in theirs {
+            if *name == "list-tree.json" && removed.contains(path) {
+                continue;
+            }
+            let Some(our_types) = ours.get(path) else {
+                problems.push(format!("{}: {} is not written", name, path));
+                continue;
+            };
+            let their_values: BTreeSet<&str> = their_types
+                .iter()
+                .map(String::as_str)
+                .filter(|t| *t != "null")
+                .collect();
+            let our_values: BTreeSet<&str> =
+                our_types.iter().copied().filter(|t| *t != "null").collect();
+            if !their_values.is_empty()
+                && !our_values.is_empty()
+                && their_values.is_disjoint(&our_values)
+            {
+                problems.push(format!(
+                    "{}: {} was {:?}, is {:?}",
+                    name, path, their_types, our_types
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// `pane_changed` carries upstream's `attention` object nested exactly as a `list-tree` row does.
+#[test]
+fn the_046_watch_nests_attention_as_list_tree_does() {
+    let tree = key_set(FIXTURES_046[0].1);
+    let watch = jsonl_key_set(FIXTURES_046[1].1);
+    let under = |keys: &KeySet, prefix: &str| -> BTreeSet<String> {
+        keys.keys()
+            .filter_map(|path| path.strip_prefix(prefix))
+            .map(str::to_owned)
+            .collect()
+    };
+    let in_tree = under(&tree, "$[].panes[].attention");
+    assert!(in_tree.contains(".status"), "{:?}", in_tree);
+    assert_eq!(in_tree, under(&watch, "pane_changed.attention"));
 }
