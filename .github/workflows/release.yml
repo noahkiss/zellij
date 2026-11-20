@@ -225,8 +225,15 @@ jobs:
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/zellij"
           codesign --force --options runtime --timestamp --identifier "$SIGNING_ID" \
+            --entitlements assets/macos/zellij.entitlements \
             --keychain "$SIGNING_KEYCHAIN" --sign "$SIGNING_IDENTITY" "$bin"
           codesign --verify --strict --verbose=2 "$bin"
+
+          # the microphone needs both: the embedded Info.plist (src/build.rs) and the entitlement
+          otool -s __TEXT __info_plist "$bin" | grep -q 'Contents of (__TEXT,__info_plist)' \
+            || { echo "::error::the binary carries no embedded Info.plist"; exit 1; }
+          codesign -d --entitlements - "$bin" 2>/dev/null | grep -q 'com.apple.security.device.audio-input' \
+            || { echo "::error::the signature lacks the audio-input entitlement"; exit 1; }
 
           info="$(codesign -dv --verbose=4 "$bin" 2>&1)"
           printf '%s\n' "$info"
