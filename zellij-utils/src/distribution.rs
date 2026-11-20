@@ -228,6 +228,11 @@ pub const ZELLIJ_BUILTIN_PLUGIN_NAMES: &[&str] = &[
     "layout-manager",
     "prompt",
     "context-menu",
+    // Fork-added bars and prompt: sources in `default-plugins/`, built by xtask, embedded in the
+    // binary and version-locked to it, like the upstream built-ins
+    "slim-tab-bar",
+    "slim-keybinds",
+    "confirm-close-tab",
 ];
 
 // Plugins are taken from:
@@ -274,6 +279,9 @@ fn zellij_builtin_plugins() -> Vec<DistributionPlugin> {
         builtin_plugin!("layout-manager"),
         builtin_plugin!("prompt"),
         builtin_plugin!("context-menu"),
+        builtin_plugin!("slim-tab-bar"),
+        builtin_plugin!("slim-keybinds"),
+        builtin_plugin!("confirm-close-tab"),
     ]
 }
 

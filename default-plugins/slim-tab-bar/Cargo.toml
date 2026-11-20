@@ -1,0 +1,18 @@
+[package]
+name = "slim-tab-bar"
+version = "0.2.0"
+authors = ["Noah Kiss"]
+description = "Minimal single-line tab bar that inherits the active theme"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Visible width of a label: raw ANSI means we do the measuring, and chars().count()
+# is wrong for CJK and combining marks. Same crate zellij's own bars use.
+unicode-width = { workspace = true }
+# Clock. WASI exposes a UTC wall clock but no timezone, so chrono-tz carries the IANA
+# database in the binary and does the conversion — real local time, correct across DST,
+# and NO extra permission. Same pair zjstatus uses for its datetime widget.
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+zellij-tile = { path = "../../zellij-tile" }

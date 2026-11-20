@@ -96,6 +96,21 @@ fn workspace_members() -> &'static Vec<WorkspaceMember> {
                 extra_artifacts: &[],
             },
             WorkspaceMember {
+                crate_name: "default-plugins/slim-tab-bar",
+                build: true,
+                extra_artifacts: &[],
+            },
+            WorkspaceMember {
+                crate_name: "default-plugins/slim-keybinds",
+                build: true,
+                extra_artifacts: &[],
+            },
+            WorkspaceMember {
+                crate_name: "default-plugins/confirm-close-tab",
+                build: true,
+                extra_artifacts: &[],
+            },
+            WorkspaceMember {
                 crate_name: "zellij-utils",
                 build: false,
                 extra_artifacts: &[],

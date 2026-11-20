@@ -258,3 +258,15 @@ pub enum PluginsConfigError {
     #[error("Could not find plugin at the path: '{0:?}'")]
     InvalidPluginLocation(PathBuf),
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod builtin_names_test {
+    use super::*;
+
+    #[test]
+    fn the_bundled_bars_are_builtin_names() {
+        assert!(distribution::is_builtin_plugin_name("slim-tab-bar"));
+        assert!(distribution::is_builtin_plugin_name("slim-keybinds"));
+        assert!(distribution::is_builtin_plugin_name("confirm-close-tab"));
+    }
+}
