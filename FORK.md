@@ -9187,7 +9187,9 @@ when that cannot mix with a person's typing, and otherwise holds it.
   instructions carry one static sentence that says so; the tool names no follow-up. **`zellij action message-status [<id>]`** prints the held records, then
   the settled ones. `--reply-to <id>` alone looks up that message's sender in this session and
   sends there; a sender on another machine is refused with the command to run (the MCP tool
-  routes it).
+  routes it). "This session" is `--session`, or the replying pane's own `ZELLIJ_SESSION_NAME`,
+  never the one session that happens to be running: ids repeat from session to session, so an
+  id missing there is a miss (exit 2), not a match in another session.
 - **The listings** show held messages: `list-panes --json` rows gain `queued_messages`, and
   `list-agents --json` rows gain `queued`, each only when there are some. The pane frame shows
   nothing: the frame is drawn from state the screen does not push for this, and the listing is
@@ -9198,7 +9200,8 @@ when that cannot mix with a person's typing, and otherwise holds it.
 `boxa/work/develop` - and the tool runs `send-message` on that machine over ssh, so the message is
 held there. With no session named, every session there is searched. The sender is this server's own
 pane (`host/session/handle` and the agent's name). `reply_to` alone looks the message up in this
-session and routes the reply to its sender's host. A machine whose zellij has no `send-message`
+session - the server's own pane's, else the one it was started for, never another - and routes
+the reply to its sender's host. With no session of its own it refuses (`reason: miss`). A machine whose zellij has no `send-message`
 is refused (`reason: remote_too_old`) rather than typed into: the unguarded paste is the failure
 this exists to stop. The server instructions and `how_to_message` name `zellij_send` as the way to
 message an agent; `message_to` stays in the flat `list-agents` rows as the harness's own route.

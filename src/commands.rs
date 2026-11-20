@@ -747,6 +747,21 @@ pub(crate) fn send_action_to_session(
         let exit_status = send_message(&cli_action, own.as_deref(), &names, output_json);
         process::exit(exit_status);
     }
+    // a reply looks its message up only in the session the replying pane is in: `--session`, or
+    // the pane's own ZELLIJ_SESSION_NAME. Never the one session that happens to be running, which
+    // the choice below would fall back to: ids repeat from session to session
+    if let zellij_utils::cli::CliAction::SendMessage {
+        reply_to: Some(_),
+        to: None,
+        ..
+    } = &cli_action
+    {
+        let own = requested_session_name
+            .clone()
+            .or_else(|| envs::get_session_name().ok());
+        let exit_status = send_message(&cli_action, own.as_deref(), &[], output_json);
+        process::exit(exit_status);
+    }
     if let zellij_utils::cli::CliAction::ListAgents {
         json,
         all_sessions: true,

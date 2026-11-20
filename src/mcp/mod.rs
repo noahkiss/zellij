@@ -209,15 +209,13 @@ impl ZellijMcp {
         ) {
             (Some(to), _) if !to.is_empty() => to.to_owned(),
             (_, Some(id)) => {
-                let mut argv = Vec::new();
-                if let Some(session) = &ambient {
-                    argv.extend(["-s".to_owned(), session.clone()]);
-                }
-                argv.extend(
-                    ["action", "message-status", id, "--json"]
-                        .iter()
-                        .map(|word| word.to_string()),
-                );
+                // the caller's session: the pane this server runs in, then the one it was started
+                // for; never a default picked from the sessions that happen to be running
+                let caller = invoke::ambient_session().or_else(|| ambient.clone());
+                let argv = match reply_lookup_argv(id, caller.as_deref()) {
+                    Ok(argv) => argv,
+                    Err(message) => return failed(message, json!({"reason": "miss"})),
+                };
                 let record = match invoke::run_on(&remote::Target::Local, &argv).await {
                     Ok(outcome) if !outcome.is_error() => {
                         serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(
@@ -233,8 +231,9 @@ impl ZellijMcp {
                 else {
                     return failed(
                         format!(
-                            "No message '{}' was delivered in this session, so there is no sender to reply to. Pass `to` instead.",
-                            id
+                            "No message '{}' was delivered in this session ({}), so there is no sender to reply to. Pass `to` instead.",
+                            id,
+                            caller.as_deref().unwrap_or_default()
                         ),
                         json!({"reason": "miss"}),
                     );
@@ -1117,9 +1116,38 @@ pub fn start(session: Option<String>, config_path: Option<PathBuf>) -> i32 {
     })
 }
 
+/// `zellij_send reply_to`: the command that looks message `id` up, in `caller_session` only - the
+/// session of the pane this server runs in, from its own environment. Ids repeat from session to
+/// session, so the lookup never falls back to another one; with no session of its own, a reply
+/// cannot be resolved here at all.
+fn reply_lookup_argv(id: &str, caller_session: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(session) = caller_session else {
+        return Err(format!(
+            "reply_to={} is looked up in the session of the pane this server runs in, and it runs \
+             in none (no ZELLIJ_SESSION_NAME). Pass `to` instead.",
+            id
+        ));
+    };
+    Ok(["-s", session, "action", "message-status", id, "--json"]
+        .iter()
+        .map(|word| word.to_string())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_is_looked_up_in_the_callers_session_only() {
+        assert_eq!(
+            reply_lookup_argv("3", Some("alpha")).unwrap(),
+            ["-s", "alpha", "action", "message-status", "3", "--json"]
+        );
+        // no session of its own: no lookup at all, rather than whichever session answers
+        let miss = reply_lookup_argv("3", None).unwrap_err();
+        assert!(miss.contains("Pass `to` instead"), "{}", miss);
+    }
 
     #[test]
     fn dynamic_agents_surfaces_are_advertised_without_tools() {

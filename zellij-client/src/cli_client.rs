@@ -3386,6 +3386,41 @@ pub struct SendMessageRequest {
     pub default_harness: Option<String>,
 }
 
+/// fork addition: where a `--reply-to <id>` goes: the sender of message `id`, looked up only in
+/// `own_session`, the session the replying pane is in. Ids are small numbers that repeat from
+/// session to session, so a miss there is a miss, never a match somewhere else. `lookup` asks one
+/// session for one message. Returns the sender's handle and the one session to find it in.
+pub fn reply_target(
+    id: &str,
+    own_session: Option<&str>,
+    lookup: impl Fn(&str, &str) -> Result<Option<zellij_utils::agent_mail::MessageRecord>, String>,
+) -> Result<(String, Vec<String>), String> {
+    use zellij_utils::agent_mail::Address;
+    let Some(own) = own_session else {
+        return Err(
+            "--reply-to looks the message up in the session that delivered it: run it \
+                    inside that session, or pass --session."
+                .to_owned(),
+        );
+    };
+    let Some(record) = lookup(own, id)? else {
+        return Err(format!("No message '{}' in session '{}'.", id, own));
+    };
+    let Some(address) = Address::parse(&record.from) else {
+        return Err(format!(
+            "Message {} carries no address to reply to: '{}'.",
+            id, record.from
+        ));
+    };
+    if !address.host.is_empty() && !is_this_host(&address.host) {
+        return Err(format!(
+            "Message {} came from {}, which is another machine. Reply with zellij_send reply_to={}, or on that machine: zellij --session {} action send-message --to {} -- <text>",
+            id, address.host, id, address.session, address.handle
+        ));
+    }
+    Ok((address.handle, vec![address.session]))
+}
+
 /// fork addition: `zellij action send-message`.
 ///
 /// Resolves the target against the agents of `sessions` (or, for a reply, against the session the
@@ -3400,7 +3435,6 @@ pub fn start_send_message_client(
     sessions: &[String],
     request: SendMessageRequest,
 ) -> i32 {
-    use zellij_utils::agent_mail::Address;
     let text = if request.text == "-" {
         let mut text = String::new();
         if let Err(e) = io::Read::read_to_string(&mut io::stdin(), &mut text) {
@@ -3418,38 +3452,17 @@ pub fn start_send_message_client(
     let (target, scope): (String, Vec<String>) = match (&request.reply_to, &request.to) {
         (_, Some(to)) => (to.clone(), sessions.to_vec()),
         (Some(id), None) => {
-            let Some(own) = own_session else {
-                eprintln!(
-                    "--reply-to looks the message up in the session that delivered it: run it inside that session, or pass --session."
-                );
-                return 2;
+            let lookup = |session: &str, id: &str| {
+                message_records(make_os_input(), session, Some(id))
+                    .map(|mut records| (!records.is_empty()).then(|| records.remove(0)))
             };
-            let record = match message_records(make_os_input(), own, Some(id)) {
-                Ok(mut records) if !records.is_empty() => records.remove(0),
-                Ok(_) => {
-                    eprintln!("No message '{}' in session '{}'.", id, own);
-                    return 2;
-                },
+            match reply_target(id, own_session, lookup) {
+                Ok(target) => target,
                 Err(message) => {
                     eprintln!("{}", message);
                     return 2;
                 },
-            };
-            let Some(address) = Address::parse(&record.from) else {
-                eprintln!(
-                    "Message {} carries no address to reply to: '{}'.",
-                    id, record.from
-                );
-                return 2;
-            };
-            if !address.host.is_empty() && !is_this_host(&address.host) {
-                eprintln!(
-                    "Message {} came from {}, which is another machine. Reply with zellij_send reply_to={}, or on that machine: zellij --session {} action send-message --to {} -- <text>",
-                    id, address.host, id, address.session, address.handle
-                );
-                return 2;
             }
-            (address.handle, vec![address.session])
         },
         (None, None) => {
             eprintln!("Pass --to <agent> or --reply-to <message id>.");
@@ -3869,6 +3882,46 @@ fn is_this_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use zellij_utils::data::{NewPanePlacement, UnblockCondition};
+
+    /// Two sessions both hold a message 3, from different senders. A reply resolves in the
+    /// replying pane's own session only, and a miss there is a miss.
+    #[test]
+    fn a_reply_resolves_its_id_only_in_the_replying_session() {
+        use zellij_utils::agent_mail::MessageRecord;
+        let record = |session: &str, from: &str| -> MessageRecord {
+            serde_json::from_value(serde_json::json!({
+                "id": "3",
+                "status": "delivered",
+                "pane_id": "terminal_1",
+                "handle": "quiet-heron",
+                "session": session,
+                "from": from,
+                "queued_at": 0,
+                "expires_at": 0,
+            }))
+            .unwrap()
+        };
+        let lookup = |session: &str, id: &str| -> Result<Option<MessageRecord>, String> {
+            Ok(match (session, id) {
+                ("alpha", "3") => Some(record("alpha", "alpha/brisk-heron")),
+                ("beta", "3") => Some(record("beta", "beta/sunny-otter")),
+                ("gamma", _) => None,
+                _ => None,
+            })
+        };
+        assert_eq!(
+            reply_target("3", Some("alpha"), lookup),
+            Ok(("brisk-heron".to_owned(), vec!["alpha".to_owned()]))
+        );
+        assert_eq!(
+            reply_target("3", Some("beta"), lookup),
+            Ok(("sunny-otter".to_owned(), vec!["beta".to_owned()]))
+        );
+        let miss = reply_target("3", Some("gamma"), lookup).unwrap_err();
+        assert_eq!(miss, "No message '3' in session 'gamma'.");
+        let nowhere = reply_target("3", None, lookup).unwrap_err();
+        assert!(nowhere.contains("pass --session"), "{}", nowhere);
+    }
 
     #[test]
     fn whoami_names_the_caller_and_excludes_it_from_other_agents() {
