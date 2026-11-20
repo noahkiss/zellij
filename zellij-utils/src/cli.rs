@@ -1470,8 +1470,22 @@ pub enum SessionLifecycleCli {
 
         /// Restart even when an agent in the session is working. Without it, a working agent
         /// makes the command refuse with exit code 4
-        #[clap(long)]
+        #[clap(long, conflicts_with("when_idle"))]
         force: bool,
+
+        /// Wait until no agent in the session is working, then restart. Gives up at the deadline
+        /// with exit code 4 and changes nothing
+        #[clap(long)]
+        when_idle: bool,
+
+        /// How long --when-idle waits, e.g. 30m or 2h (default 1h)
+        #[clap(long, value_name = "DURATION", requires("when_idle"))]
+        deadline: Option<String>,
+
+        /// Say whether a restart is needed, whether an agent would stop it, and whether the build
+        /// that would serve the session passes its pre-flight. Changes nothing
+        #[clap(short('n'), long)]
+        dry_run: bool,
     },
 
     /// Install the init-system unit that keeps the session up, and load it. systemd on Linux,

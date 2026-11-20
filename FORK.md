@@ -80,6 +80,10 @@ release-note caches with an upstream build of the same version.
 features OFF on an upgrade, silently. Ask the binary what it has instead:
 [`zellij setup --check --json`](#zellij-setup---check---json).
 
+**The version bump also sets `SERVER_UNCHANGED.declared_for`** to the new version, and says whether
+the release changed the server. A unit test fails until it does. See
+[whether a restart is needed](#session-restart---when-idle-a-pre-flight-and-whether-a-restart-is-needed).
+
 ## The CLI output convention
 
 Every command the fork touches answers in one of three shapes, so that reading one command teaches
@@ -1503,7 +1507,7 @@ The same preflight is made by `--in-tab` and by `--near`, and `zellij run`, `zel
 ```
 zellij session up      [NAME] [--fresh | --restore [ID]]
 zellij session down    [NAME] [--wait-timeout SECS] [--force]
-zellij session restart [NAME] [--fresh | --restore ID] [--force]
+zellij session restart [NAME] [--fresh | --restore ID] [--force | --when-idle [--deadline DUR]] [--dry-run]
 ```
 
 `up` is idempotent, creates the session detached, and then **asserts its own post-condition**:
@@ -5746,6 +5750,75 @@ The flag is new on two existing commands, and `state_working` is a new key. Neit
 `Action`, a protobuf tag or a client/server message.
 
 Capabilities: `session-agent-guard`, `program-status-working-count`.
+
+### `session restart --when-idle`, a pre-flight, and whether a restart is needed
+
+```
+zellij session restart [NAME] --when-idle [--deadline 1h]
+zellij session restart [NAME] --dry-run
+```
+
+Three additions that make an upgrade cheaper to take. None is an `Action`, a protobuf tag or a
+client/server message.
+
+**`--when-idle` waits instead of refusing.** The agent guard above exits 4 the moment an agent is
+working, and a restart can stay owed for hours behind an agent that is never idle when somebody
+looks. `--when-idle` asks the session for its agents every 5 seconds, with the same busy rule, and
+restarts the first time none is working. It prints the working agents once, and again when they
+change.
+
+- **Deadline.** `--deadline` takes `30s`, `30m`, `2h` (the `prompt --timeout` syntax). Without it the
+  wait is 1 hour. At the deadline it prints the guard's refusal, writes it to `restart.log`, and
+  exits 4. Nothing was torn down.
+- **The wait holds no lock.** It runs before the restart daemonizes and before it takes the up lock,
+  so the watchdog's tick is never held up by it.
+- **A missed answer.** A session that never answers goes ahead after a second try, as a plain
+  restart does: a wedged server is what a restart is for. A session that stops answering after it
+  reported a working agent is waited on, to the deadline. Many polls give many chances to miss one,
+  and going ahead on a miss would cut off the agent just seen.
+- `--when-idle` conflicts with `--force`, and `--deadline` requires `--when-idle`.
+
+**The pre-flight.** Before anything is torn down, `restart` runs each build that may serve the
+restarted session with `--version` and `setup --check` (with this command's `--config` and
+`--config-dir`), 20 seconds each. A build that fails either, or hangs, refuses the restart with exit
+2, the reason on stderr and in `restart.log`, and the old server left running:
+
+```
+session restart: refusing - the build that would serve 'work' failed its pre-flight:
+  /usr/local/bin/zellij: `setup --check` failed: exit status: 1 (× Failed to parse Zellij configuration)
+Nothing was torn down.
+```
+
+The builds checked are this binary, and the installed launcher's binary when it is a different file
+and not the pin. With `pin_exe` the pin itself is not checked: `up` refreshes it from this binary
+after the teardown, so this binary is what the pin will hold. A failure that appears only in the
+copy (a signature the copy does not carry on macOS) is outside the pre-flight.
+
+**Whether a restart is needed.** Most releases change the server; some change only the CLI, a
+plugin or the MCP server, and a restart onto them cuts every pane for nothing. A release states it
+in `SERVER_UNCHANGED` (`zellij-utils/src/session_lifecycle.rs`): the version it was declared for,
+and the earlier versions whose server is the same. `session status` and `session restart --dry-run`
+print a `restart` line from it and the running server's version (the one `ls --json` reports as
+`server_version`):
+
+| Running server | `restart` line |
+|---|---|
+| this build | `not needed - the session already runs this build` |
+| version unknown | `needed` |
+| a version in `same_server_as` | `not needed` |
+| any other version | `needed` |
+| `declared_for` is not this build's version | `needed`: the statement belongs to another release |
+
+So a release that forgets the const fails closed, and a unit test fails on the version bump until
+`declared_for` names the new version. The release that cuts a version sets `declared_for` to it;
+it lists earlier versions only when nothing a server runs has changed since them, and it empties
+the list when the server changed. Versions are compared by equality, never by order.
+
+**`--dry-run`** changes nothing: no daemonize, no lock, no pin refresh. It prints the `restart`
+line, the agents a restart would refuse on, and each build's pre-flight. Exit 0 when a restart would
+go ahead, 4 when an agent would stop it, 2 when a build fails its pre-flight.
+
+Capability: `session-restart-when-idle`.
 
 ### A pin the launcher does not run is inert everywhere, not only in the message
 

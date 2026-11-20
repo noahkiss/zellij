@@ -90,6 +90,8 @@ pub const CAPABILITIES: &[&str] = &[
     "program-status-working-count",
     // session down|restart refuse with exit 4 while an agent is working; --force overrides
     "session-agent-guard",
+    // session restart --when-idle/--deadline/--dry-run, the pre-flight, and the `restart` line
+    "session-restart-when-idle",
     // action send-message / message-status, zellij_send: guarded, queued agent messages
     "agent-send-message",
 ];

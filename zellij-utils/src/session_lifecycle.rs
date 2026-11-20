@@ -1464,6 +1464,159 @@ pub fn compare_builds(
     }
 }
 
+/// A release's statement that its server is the same as an earlier release's.
+///
+/// Most releases change the server, but not all: a release that changes only the CLI, a plugin
+/// or the MCP server can serve a session that an earlier release started, and a restart onto it
+/// cuts every pane for nothing. The release says so here, by version string, and `session status`
+/// and `session restart --dry-run` read it.
+///
+/// The statement counts only for the release it names. A release that bumps the version and does
+/// not touch this const leaves `declared_for` naming the release before it, so the statement is
+/// ignored and every restart reads as needed. Forgetting fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerUnchanged {
+    /// The version this statement was written for. It must equal this build's `VERSION`.
+    pub declared_for: &'static str,
+    /// Versions whose server is the same as this one's. Empty when this release changed the server.
+    pub same_server_as: &'static [&'static str],
+}
+
+/// This release's statement. Each release sets `declared_for` to its own version. A release that
+/// changes nothing a server runs lists the earlier versions it serves the same as (carrying the
+/// previous list forward); a release that changes the server empties the list.
+pub const SERVER_UNCHANGED: ServerUnchanged = ServerUnchanged {
+    declared_for: "0.46.0",
+    same_server_as: &[],
+};
+
+/// Whether moving a running session onto this build needs a restart, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartNeed {
+    Needed(String),
+    NotNeeded(String),
+}
+
+/// Decide [`RestartNeed`] for a session whose server runs `running` (its version, when known)
+/// against a build of version `ours` that carries `mark`. `build` is how the running server's
+/// executable compares with this one. Anything not known reads as needed.
+pub fn restart_need(
+    ours: &str,
+    mark: &ServerUnchanged,
+    running: Option<&str>,
+    build: BuildMatch,
+) -> RestartNeed {
+    if build == BuildMatch::Same {
+        return RestartNeed::NotNeeded("the session already runs this build".to_owned());
+    }
+    let Some(running) = running else {
+        return RestartNeed::Needed("the running server's version is not known".to_owned());
+    };
+    if mark.declared_for != ours {
+        return RestartNeed::Needed(format!(
+            "the server runs {} and this build ({}) does not say its server is unchanged",
+            running, ours
+        ));
+    }
+    if mark.same_server_as.contains(&running) {
+        return RestartNeed::NotNeeded(format!(
+            "the server runs {}, and {} declares the same server",
+            running, ours
+        ));
+    }
+    RestartNeed::Needed(format!(
+        "the server runs {}, and {} changed the server",
+        running, ours
+    ))
+}
+
+#[cfg(test)]
+mod restart_need_tests {
+    use super::*;
+
+    const MARK: ServerUnchanged = ServerUnchanged {
+        declared_for: "0.46.0-nkmk.2",
+        same_server_as: &["0.46.0-nkmk.1"],
+    };
+
+    fn needed(need: RestartNeed) -> bool {
+        matches!(need, RestartNeed::Needed(_))
+    }
+
+    #[test]
+    fn a_listed_version_needs_no_restart() {
+        let need = restart_need(
+            "0.46.0-nkmk.2",
+            &MARK,
+            Some("0.46.0-nkmk.1"),
+            BuildMatch::Different,
+        );
+        assert!(!needed(need));
+    }
+
+    #[test]
+    fn an_unlisted_version_needs_one() {
+        let need = restart_need(
+            "0.46.0-nkmk.2",
+            &MARK,
+            Some("0.46.0-nkmk.0"),
+            BuildMatch::Different,
+        );
+        assert!(needed(need));
+    }
+
+    #[test]
+    fn a_mark_left_over_from_the_previous_release_is_ignored() {
+        // the release after MARK's bumped the version and forgot the const
+        let need = restart_need(
+            "0.46.0-nkmk.3",
+            &MARK,
+            Some("0.46.0-nkmk.1"),
+            BuildMatch::Different,
+        );
+        assert!(needed(need));
+    }
+
+    #[test]
+    fn an_unknown_server_version_needs_one() {
+        assert!(needed(restart_need(
+            "0.46.0-nkmk.2",
+            &MARK,
+            None,
+            BuildMatch::Unknown
+        )));
+        assert!(needed(restart_need(
+            "0.46.0-nkmk.2",
+            &MARK,
+            None,
+            BuildMatch::Different
+        )));
+    }
+
+    #[test]
+    fn the_same_build_needs_none_and_the_same_version_of_another_build_does() {
+        assert!(!needed(restart_need(
+            "0.46.0-nkmk.2",
+            &MARK,
+            None,
+            BuildMatch::Same
+        )));
+        // a second build of one version is a different program until shown otherwise
+        let need = restart_need(
+            "0.46.0-nkmk.2",
+            &MARK,
+            Some("0.46.0-nkmk.2"),
+            BuildMatch::Different,
+        );
+        assert!(needed(need));
+    }
+
+    #[test]
+    fn this_release_declares_its_own_version() {
+        assert_eq!(SERVER_UNCHANGED.declared_for, crate::consts::VERSION);
+    }
+}
+
 /// The executable a running process started from.
 ///
 /// `/proc/<pid>/exe` is the whole answer on Linux: it is the kernel's own reference to the file,

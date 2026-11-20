@@ -1148,6 +1148,22 @@ fn server_identity_fields(name: &str, is_dead: bool) -> ServerIdentityFields {
     }
 }
 
+/// The running server's version and whether it is this build, for a session that is live.
+///
+/// The same two answers `ls --json` gives as `server_version` and `server_build`, and from the same
+/// place, so `session status` and `session restart --dry-run` cannot disagree with it.
+pub fn running_server_identity(
+    name: &str,
+) -> (Option<String>, crate::session_lifecycle::BuildMatch) {
+    let fields = server_identity_fields(name, false);
+    let build = match fields.server_build.as_deref() {
+        Some("same") => crate::session_lifecycle::BuildMatch::Same,
+        Some("different") => crate::session_lifecycle::BuildMatch::Different,
+        _ => crate::session_lifecycle::BuildMatch::Unknown,
+    };
+    (fields.server_version, build)
+}
+
 /// The version of the server with `pid`, from what `server_identity_fields` knows about it.
 fn server_version(
     verdict: crate::session_lifecycle::BuildMatch,

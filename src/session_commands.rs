@@ -80,15 +80,33 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             restore,
             wait_timeout,
             force,
+            when_idle,
+            deadline,
+            dry_run,
         } => {
             let name = resolve_session_name(session_name, &opts, true);
+            if dry_run {
+                process::exit(restart_dry_run(&name, force, &opts));
+            }
             refuse_a_scratch_pin(&opts);
-            refuse_if_agents_are_working(
-                "restart",
-                &name,
-                force,
-                Some(&zellij_utils::consts::ZELLIJ_STATE_DIR.join("restart.log")),
-            );
+            let log_file = zellij_utils::consts::ZELLIJ_STATE_DIR.join("restart.log");
+            if when_idle {
+                let deadline = match deadline
+                    .as_deref()
+                    .map(zellij_utils::prompt::parse_duration)
+                {
+                    None => WHEN_IDLE_DEFAULT_DEADLINE,
+                    Some(Ok(deadline)) => deadline,
+                    Some(Err(reason)) => {
+                        eprintln!("session restart: --deadline: {}", reason);
+                        process::exit(2);
+                    },
+                };
+                wait_until_no_agent_is_working(&name, deadline, &log_file);
+            } else {
+                refuse_if_agents_are_working("restart", &name, force, Some(&log_file));
+            }
+            refuse_a_build_that_fails_its_preflight(&name, &opts, Some(&log_file));
             restart(
                 &name,
                 restart_restore_target(fresh, restore),
@@ -819,7 +837,14 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
         &status,
         extras.as_ref(),
         pinned.as_deref(),
-    );
+    )
+    .and_then(|code| {
+        // informational: a restart that is needed is not a fault in the install
+        if let Some(line) = restart_need_line(name) {
+            writeln!(stdout, "{}", line)?;
+        }
+        Ok(code)
+    });
     report_exit_code("session status", report)
 }
 
@@ -1434,6 +1459,12 @@ fn refuse_if_agents_are_working(verb: &str, name: &str, force: bool, log_file: O
         TeardownGuard::Refuse(busy) => busy,
     };
     let text = busy_refusal_text(verb, name, &busy);
+    refuse_with(name, &text, log_file, AGENTS_BUSY_EXIT_CODE);
+}
+
+/// Print a restart's refusal, write it to the restart log when there is one, keep a pane that
+/// would close on exit open, and exit `code`.
+fn refuse_with(name: &str, text: &str, log_file: Option<&Path>, code: i32) -> ! {
     eprint!("{}", text);
     if let Some(log_file) = log_file {
         if let Some(dir) = log_file.parent() {
@@ -1442,10 +1473,346 @@ fn refuse_if_agents_are_working(verb: &str, name: &str, force: bool, log_file: O
         if log_file.exists() {
             let _ = std::fs::rename(log_file, log_file.with_extension("log.1"));
         }
-        let _ = std::fs::write(log_file, &text);
+        let _ = std::fs::write(log_file, text);
     }
     hold_a_pane_that_would_close(name);
-    process::exit(AGENTS_BUSY_EXIT_CODE);
+    process::exit(code);
+}
+
+/// How long `session restart --when-idle` waits when no `--deadline` is given.
+const WHEN_IDLE_DEFAULT_DEADLINE: Duration = Duration::from_secs(60 * 60);
+/// How often `--when-idle` asks the session for its agents.
+const WHEN_IDLE_POLL: Duration = Duration::from_secs(5);
+
+/// One answer to "which agents in this session are working".
+enum AgentPoll {
+    /// No server serves the name, so there is nothing to wait for.
+    NotRunning,
+    /// The session did not answer.
+    NoAnswer(String),
+    Agents(Vec<AgentListEntry>),
+}
+
+fn poll_agents(name: &str) -> AgentPoll {
+    let running = zellij_utils::sessions::get_sessions()
+        .map(|sessions| sessions.iter().any(|(session, _)| session == name))
+        .unwrap_or(false);
+    if !running {
+        return AgentPoll::NotRunning;
+    }
+    let make_os_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
+        match zellij_client::os_input_output::get_cli_client_os_input() {
+            Ok(os_input) => Box::new(os_input),
+            Err(e) => {
+                eprintln!("session restart: could not open a client: {}", e);
+                process::exit(1);
+            },
+        }
+    };
+    match zellij_client::cli_client::agents_before_teardown(&make_os_input, name) {
+        Ok(agents) => AgentPoll::Agents(agents),
+        Err(e) => AgentPoll::NoAnswer(e),
+    }
+}
+
+/// What `--when-idle` does after one poll.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleStep {
+    Proceed,
+    Wait,
+}
+
+/// The rule behind `--when-idle`, apart from the machine. `seen_busy` says whether an earlier poll
+/// found a working agent. A session that never answered goes ahead, as a plain restart does: a
+/// wedged server is what a restart is for. One that stops answering after it reported a working
+/// agent is waited on, because going ahead on one missed answer would cut off the agent it saw.
+fn idle_step(poll: &AgentPoll, seen_busy: bool, missed_before: bool) -> IdleStep {
+    match poll {
+        AgentPoll::NotRunning => IdleStep::Proceed,
+        AgentPoll::Agents(agents) => match teardown_guard(agents, false) {
+            TeardownGuard::Proceed => IdleStep::Proceed,
+            TeardownGuard::Refuse(_) => IdleStep::Wait,
+        },
+        AgentPoll::NoAnswer(_) if seen_busy => IdleStep::Wait,
+        // two misses in a row before any answer: the same rule as `refuse_if_agents_are_working`
+        AgentPoll::NoAnswer(_) if missed_before => IdleStep::Proceed,
+        AgentPoll::NoAnswer(_) => IdleStep::Wait,
+    }
+}
+
+/// Block until no agent in `name` is working, or exit [`AGENTS_BUSY_EXIT_CODE`] at the deadline
+/// having changed nothing. Runs before the restart daemonizes and before it takes the up lock, so a
+/// watchdog tick is never held up by the wait.
+fn wait_until_no_agent_is_working(name: &str, deadline: Duration, log_file: &Path) {
+    let started = Instant::now();
+    let mut seen_busy = false;
+    let mut missed_before = false;
+    let mut last_text = String::new();
+    loop {
+        let poll = poll_agents(name);
+        match idle_step(&poll, seen_busy, missed_before) {
+            IdleStep::Proceed => {
+                if let AgentPoll::NoAnswer(e) = &poll {
+                    eprintln!(
+                        "warning: could not ask '{}' which agents are working ({}); going ahead.",
+                        name, e
+                    );
+                } else if seen_busy {
+                    eprintln!(
+                        "session restart: no agent in '{}' is working after {}s; restarting.",
+                        name,
+                        started.elapsed().as_secs()
+                    );
+                }
+                return;
+            },
+            IdleStep::Wait => {},
+        }
+        match &poll {
+            AgentPoll::Agents(agents) => {
+                seen_busy = true;
+                missed_before = false;
+                if let TeardownGuard::Refuse(busy) = teardown_guard(agents, false) {
+                    let text = busy_refusal_text("restart", name, &busy);
+                    if text != last_text {
+                        let first_line = text.lines().next().unwrap_or_default();
+                        eprintln!(
+                            "{}",
+                            first_line.replacen(
+                                "refusing",
+                                &format!("waiting up to {}s", deadline.as_secs()),
+                                1
+                            )
+                        );
+                        for line in text.lines().skip(1).filter(|l| l.starts_with("  ")) {
+                            eprintln!("{}", line);
+                        }
+                    }
+                    last_text = text;
+                }
+            },
+            AgentPoll::NoAnswer(_) => missed_before = true,
+            AgentPoll::NotRunning => {},
+        }
+        if started.elapsed() >= deadline {
+            let mut text = if last_text.is_empty() {
+                format!(
+                    "session restart: refusing - '{}' did not answer which agents are working.\n\
+                     Nothing was torn down.\n",
+                    name
+                )
+            } else {
+                last_text.clone()
+            };
+            text.insert_str(
+                0,
+                &format!(
+                    "session restart: the --when-idle deadline of {}s passed.\n",
+                    deadline.as_secs()
+                ),
+            );
+            refuse_with(name, &text, Some(log_file), AGENTS_BUSY_EXIT_CODE);
+        }
+        std::thread::sleep(WHEN_IDLE_POLL.min(deadline.saturating_sub(started.elapsed())));
+    }
+}
+
+/// The binaries that may serve `name` once a restart brings it back.
+///
+/// This binary, because `up` serves the session from it or refreshes the pin from it. And the
+/// installed launcher's binary when it is some other file and not the pin: on a handover the
+/// launcher's job creates the session, and it runs what its unit names.
+fn builds_that_may_serve(name: &str, opts: &CliArgs) -> Vec<PathBuf> {
+    let mut builds = Vec::new();
+    match zellij_utils::session_lifecycle::own_exe_for_spawn() {
+        Ok(own) => builds.push(own),
+        Err(_) => {},
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(installed) = session_service::installed_session_exe(name) {
+        let installed = PathBuf::from(installed);
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or(path.to_path_buf());
+        let pinned = configured_pinned_exe(configured_extras(opts).as_ref());
+        let known = builds
+            .iter()
+            .chain(pinned.iter())
+            .any(|build| canonical(build) == canonical(&installed));
+        if !known {
+            builds.push(installed);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = (name, opts);
+    builds
+}
+
+/// How long one pre-flight command may take before the build counts as failing it.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run `exe` with `args`, and say why it failed, if it did. A build that hangs fails.
+fn preflight_run(exe: &Path, args: &[std::ffi::OsString]) -> Result<String, String> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run it: {}", e))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= PREFLIGHT_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer in {}s", PREFLIGHT_TIMEOUT.as_secs()));
+            },
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("could not wait for it: {}", e)),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("could not read its output: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output")
+        .to_owned();
+    Err(format!("{} ({})", output.status, detail))
+}
+
+/// Pre-flight one build: it starts and names itself, and it parses this config.
+fn preflight(exe: &Path, opts: &CliArgs) -> Result<(), String> {
+    let version = preflight_run(exe, &["--version".into()])
+        .map_err(|why| format!("`--version` failed: {}", why))?;
+    if !version.starts_with("zellij ") {
+        return Err(format!(
+            "`--version` printed {:?}, not a zellij version",
+            version.trim()
+        ));
+    }
+    let mut check: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(config) = &opts.config {
+        check.extend(["--config".into(), config.clone().into_os_string()]);
+    }
+    if let Some(config_dir) = &opts.config_dir {
+        check.extend(["--config-dir".into(), config_dir.clone().into_os_string()]);
+    }
+    check.extend(["setup".into(), "--check".into()]);
+    preflight_run(exe, &check).map_err(|why| format!("`setup --check` failed: {}", why))?;
+    Ok(())
+}
+
+/// Each build that may serve `name`, with its pre-flight result.
+fn preflight_builds(name: &str, opts: &CliArgs) -> Vec<(PathBuf, Result<(), String>)> {
+    builds_that_may_serve(name, opts)
+        .into_iter()
+        .map(|exe| {
+            let result = preflight(&exe, opts);
+            (exe, result)
+        })
+        .collect()
+}
+
+/// Exit 2, having torn nothing down, when a build that would serve the restarted session cannot
+/// start or cannot read the config. Asked before the restart daemonizes, so the caller sees it.
+fn refuse_a_build_that_fails_its_preflight(name: &str, opts: &CliArgs, log_file: Option<&Path>) {
+    let failed: Vec<_> = preflight_builds(name, opts)
+        .into_iter()
+        .filter_map(|(exe, result)| result.err().map(|why| (exe, why)))
+        .collect();
+    if failed.is_empty() {
+        return;
+    }
+    let mut text = format!(
+        "session restart: refusing - the build that would serve '{}' failed its pre-flight:\n",
+        name
+    );
+    for (exe, why) in &failed {
+        text.push_str(&format!("  {}: {}\n", exe.display(), why));
+    }
+    text.push_str("Nothing was torn down.\n");
+    refuse_with(name, &text, log_file, 2);
+}
+
+/// The `restart` line: whether moving `name` onto this build needs a restart. `None` when no
+/// server serves the name.
+fn restart_need_line(name: &str) -> Option<String> {
+    use zellij_utils::session_lifecycle::{restart_need, RestartNeed, SERVER_UNCHANGED};
+    let running = zellij_utils::sessions::get_sessions()
+        .map(|sessions| sessions.iter().any(|(session, _)| session == name))
+        .unwrap_or(false);
+    if !running {
+        return None;
+    }
+    let (version, build) = zellij_utils::sessions::running_server_identity(name);
+    Some(
+        match restart_need(
+            zellij_utils::consts::VERSION,
+            &SERVER_UNCHANGED,
+            version.as_deref(),
+            build,
+        ) {
+            RestartNeed::Needed(why) => format!("{:9} needed - {}", "restart", why),
+            RestartNeed::NotNeeded(why) => format!("{:9} not needed - {}", "restart", why),
+        },
+    )
+}
+
+/// `session restart --dry-run`: what a restart would find, with nothing changed. Exit 0 when a
+/// restart would go ahead, 4 when an agent would stop it, 2 when a build fails its pre-flight.
+fn restart_dry_run(name: &str, force: bool, opts: &CliArgs) -> i32 {
+    println!("session   {}", name);
+    match restart_need_line(name) {
+        Some(line) => println!("{}", line),
+        None => println!(
+            "{:9} not running - a restart would only bring it up",
+            "restart"
+        ),
+    }
+    let mut code = 0;
+    match poll_agents(name) {
+        AgentPoll::NotRunning => {},
+        AgentPoll::NoAnswer(e) => {
+            println!("{:9} no answer ({}); a restart would go ahead", "agents", e)
+        },
+        AgentPoll::Agents(agents) => match teardown_guard(&agents, force) {
+            TeardownGuard::Proceed => println!("{:9} none working", "agents"),
+            TeardownGuard::Refuse(busy) => {
+                code = AGENTS_BUSY_EXIT_CODE;
+                println!(
+                    "{:9} {} working - a restart would refuse",
+                    "agents",
+                    busy.len()
+                );
+                for (agent, reason) in busy {
+                    println!(
+                        "          tab {:?}  {}  {}  {}",
+                        agent.tab_name, agent.handle, agent.agent.kind, reason
+                    );
+                }
+            },
+        },
+    }
+    for (exe, result) in preflight_builds(name, opts) {
+        match result {
+            Ok(()) => println!("{:9} ok - {}", "preflight", exe.display()),
+            Err(why) => {
+                code = 2;
+                println!("{:9} FAILED - {}: {}", "preflight", exe.display(), why);
+            },
+        }
+    }
+    code
 }
 
 /// Keep the refusal on screen when it was typed in, or launched into, the session it refused.
@@ -2846,6 +3213,50 @@ mod tests {
             }
         }
         serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn when_idle_waits_on_a_working_agent_and_goes_on_once_none_is() {
+        let busy = AgentPoll::Agents(vec![agent("busy-fox", Some("working"), 1)]);
+        let idle = AgentPoll::Agents(vec![agent("busy-fox", Some("done"), 0)]);
+        let background = AgentPoll::Agents(vec![agent("busy-fox", Some("done"), 2)]);
+        assert_eq!(idle_step(&busy, false, false), IdleStep::Wait);
+        assert_eq!(idle_step(&background, true, false), IdleStep::Wait);
+        assert_eq!(idle_step(&idle, true, false), IdleStep::Proceed);
+        assert_eq!(
+            idle_step(&AgentPoll::Agents(vec![]), false, false),
+            IdleStep::Proceed
+        );
+        assert_eq!(
+            idle_step(&AgentPoll::NotRunning, true, false),
+            IdleStep::Proceed
+        );
+    }
+
+    #[test]
+    fn when_idle_never_goes_ahead_on_a_missed_answer_after_seeing_a_working_agent() {
+        let miss = AgentPoll::NoAnswer("timed out".to_owned());
+        // the session went quiet after it reported a working agent: keep waiting, every time
+        assert_eq!(idle_step(&miss, true, false), IdleStep::Wait);
+        assert_eq!(idle_step(&miss, true, true), IdleStep::Wait);
+        // a session that never answered: one retry, then ahead, as a plain restart does
+        assert_eq!(idle_step(&miss, false, false), IdleStep::Wait);
+        assert_eq!(idle_step(&miss, false, true), IdleStep::Proceed);
+    }
+
+    #[test]
+    fn the_preflight_fails_a_build_that_exits_non_zero_or_is_not_zellij() {
+        let opts = CliArgs::default();
+        let fails = preflight(Path::new("/bin/false"), &opts).unwrap_err();
+        assert!(fails.starts_with("`--version` failed"), "{}", fails);
+        let not_zellij = preflight(Path::new("/bin/echo"), &opts).unwrap_err();
+        assert!(
+            not_zellij.contains("not a zellij version"),
+            "{}",
+            not_zellij
+        );
+        let missing = preflight(Path::new("/nonexistent/zellij"), &opts).unwrap_err();
+        assert!(missing.contains("could not run it"), "{}", missing);
     }
 
     #[test]
