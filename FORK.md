@@ -373,7 +373,7 @@ of what moved to get there.
 | `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
-| `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id. A pane no tab took is not reported at all: [the miss says so and exits 2](#a-pane-is-reported-only-once-a-tab-has-taken-it) |
+| `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id. A pane no tab took is not reported at all: [the miss says so and exits 2](#a-pane-is-reported-only-once-a-tab-has-taken-it). A `new-pane` or `new-tab` `--cwd` that names no directory (joined to the caller's own directory, as the action joins it) exits 2 with `--cwd <path> is not a directory. Nothing was created.`, checked by the client before the action is sent; it used to open the pane in the session's own cwd and exit 0 |
 | `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0: the plugin's pane is built after the action is answered, so there is no id to report |
 | `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |

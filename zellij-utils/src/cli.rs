@@ -3698,6 +3698,18 @@ impl CliAction {
             *no_focus = true;
         }
     }
+
+    /// fork addition: the `--cwd` of `new-pane` or `new-tab`, joined to `current_dir` the way the
+    /// action joins it, when it names no directory. The session would start the pane in its own
+    /// cwd instead and say nothing, so the caller refuses it before anything is made.
+    pub fn missing_cwd(&self, current_dir: &std::path::Path) -> Option<PathBuf> {
+        let cwd = match self {
+            CliAction::NewPane { cwd, .. } | CliAction::NewTab { cwd, .. } => cwd.as_ref()?,
+            _ => return None,
+        };
+        let resolved = current_dir.join(cwd);
+        (!resolved.is_dir()).then_some(resolved)
+    }
 }
 
 /// Whether a new pane or tab leaves every client's focus where it is.
@@ -4172,6 +4184,34 @@ mod tests {
             Some(Command::Action { action, .. }) => *action,
             other => panic!("Expected Action, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn a_cwd_that_names_no_directory_is_found_before_anything_is_made() {
+        let here = std::env::temp_dir();
+        let missing = here.join("zellij-cwd-test-no-such-dir");
+        assert!(!missing.exists());
+        for verb in ["new-pane", "new-tab"] {
+            // absolute, and relative to the caller's directory, as the action joins it
+            let absolute = parse_action(&[verb, "--cwd", missing.to_str().unwrap()]);
+            assert_eq!(absolute.missing_cwd(&here), Some(missing.clone()), "{verb}");
+            let relative = parse_action(&[verb, "--cwd", "zellij-cwd-test-no-such-dir"]);
+            assert_eq!(relative.missing_cwd(&here), Some(missing.clone()), "{verb}");
+            // a directory that exists, `.`, and no --cwd at all pass
+            for ok in [vec![verb, "--cwd", "."], vec![verb]] {
+                assert_eq!(parse_action(&ok).missing_cwd(&here), None, "{ok:?}");
+            }
+            let absolute_ok = parse_action(&[verb, "--cwd", here.to_str().unwrap()]);
+            assert_eq!(absolute_ok.missing_cwd(&missing), None, "{verb}");
+        }
+        // a file is not a directory
+        let file = here.join(format!("zellij-cwd-test-file-{}", std::process::id()));
+        std::fs::write(&file, b"").unwrap();
+        let named_file = parse_action(&["new-tab", "--cwd", file.to_str().unwrap()]);
+        assert_eq!(named_file.missing_cwd(&here), Some(file.clone()));
+        let _ = std::fs::remove_file(&file);
+        // other verbs carry no --cwd to check
+        assert_eq!(parse_action(&["go-to-tab", "1"]).missing_cwd(&here), None);
     }
 
     /// `--version` and `-V` share one string in clap, so rendering it once covers both.

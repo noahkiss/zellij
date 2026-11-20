@@ -1339,6 +1339,17 @@ fn attach_with_cli_client(
             std::process::exit(2);
         },
     };
+    // a `--cwd` that names no directory would open the pane in the session's own cwd, silently:
+    // a miss, refused before anything is made
+    if let Some(missing) =
+        cli_action.missing_cwd(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    {
+        eprintln!(
+            "--cwd {} is not a directory. Nothing was created.",
+            missing.display()
+        );
+        std::process::exit(2);
+    }
     // `--near` names the pane the new one opens beside. It is resolved here, like every other pane
     // target, and travels as the pane this command came from - the channel `--near-current-pane`
     // reads out of the environment
