@@ -673,8 +673,14 @@ fn output_schema() -> JsonObject {
         "reason".to_owned(),
         json!({
             "type": "string",
-            "enum": ["miss", "error", "bad_arguments", "not_run"],
-            "description": "Present only on a failed call, saying which kind it was.",
+            "enum": [
+                "miss", "error", "bad_arguments", "not_run", "remote_too_old",
+                // zellij_send: why the receiving session holds or refused the message
+                "working", "blocked", "draft", "typing", "starting",
+                "not_agent", "no_state", "pane_gone",
+            ],
+            "description": "On a failed call, which kind it was. On zellij_send, why the \
+                            message is held or was refused.",
         }),
     );
     let mut schema = Map::new();
@@ -870,6 +876,29 @@ pub fn param_description(param: &ParamSpec) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_reason_a_held_message_reports_fits_the_output_schema() {
+        use zellij_utils::agent_mail::Reason;
+        let schema = super::output_schema();
+        let allowed = schema["properties"]["reason"]["enum"].as_array().unwrap();
+        for reason in [
+            Reason::Working,
+            Reason::Blocked,
+            Reason::Draft,
+            Reason::Typing,
+            Reason::Starting,
+            Reason::NotAgent,
+            Reason::NoState,
+            Reason::PaneGone,
+        ] {
+            assert!(
+                allowed.iter().any(|v| v == reason.as_str()),
+                "{} is missing from the reason enum",
+                reason.as_str()
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
