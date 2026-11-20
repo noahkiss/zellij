@@ -3761,6 +3761,62 @@ pub enum PaneCommandState {
     Done,
 }
 
+/// What a program in a pane last reported about itself with the Program Status Protocol, `OSC
+/// 7501`: one record, the most urgent the pane holds.
+///
+/// A program sends `ESC ] 7501 ; state=working:app=claude-code ST`, and the pane keeps it until
+/// the program replaces or clears it, or the shell draws a new prompt. Claude Code and pi send it
+/// once the terminal answers their `OSC 7501 ; ?` query, which zellij does for every pane.
+///
+/// CLI-only, like the rest of [`PaneListEntry`]: no protobuf tag, no plugin API. The keys carry a
+/// `state` prefix because the row they are flattened onto already has a `title`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneProgramStatus {
+    /// `idle`, `working`, `done`, `blocked` or `error`.
+    pub state: String,
+    /// Why a `blocked` program is waiting: `permission`, `question` or `auth`.
+    #[serde(
+        rename = "state_kind",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kind: Option<String>,
+    /// The program's stable name, `claude-code`, `pi`, `codex`.
+    #[serde(rename = "state_app", default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// A short label for the task, decoded.
+    #[serde(
+        rename = "state_title",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub title: Option<String>,
+    /// One human-readable line, decoded: the question a blocked program asks, the error a failed
+    /// one hit.
+    #[serde(rename = "state_msg", default, skip_serializing_if = "Option::is_none")]
+    pub msg: Option<String>,
+    /// 0-100 for a `working` or `blocked` program that reported one. Absent means indeterminate.
+    #[serde(
+        rename = "state_progress",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub progress: Option<u8>,
+    /// When the record was last reported, in milliseconds since the Unix epoch - the unit of
+    /// `last_output_at`.
+    #[serde(rename = "state_at", default)]
+    pub at: u64,
+    /// How many of the pane's records say `working`, the one above included. Claude Code reports
+    /// each background subagent as a record of its own, so a count above zero under a `done` or
+    /// `idle` state is work still running after the turn ended. Absent when zero.
+    #[serde(
+        rename = "state_working",
+        default,
+        skip_serializing_if = "is_zero_count"
+    )]
+    pub working: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ClientInfo {
     pub client_id: ClientId,

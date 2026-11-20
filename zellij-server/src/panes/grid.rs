@@ -6728,6 +6728,9 @@ impl Handler for Grid {
                 self.reset_terminal_state();
                 self.grapheme_mode = self.grapheme_mode_by_default;
                 self.shell_reports.reset();
+                // fork addition: a full reset (RIS) removes every OSC 7501 record; a soft one
+                // does not, which is why this is here and not in `reset_terminal_state`
+                self.program_status.clear("");
             },
             (b'H', None) => {
                 self.set_horizontal_tabstop();
