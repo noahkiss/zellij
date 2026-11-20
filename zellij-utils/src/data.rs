@@ -3773,8 +3773,9 @@ impl PaneCommandState {
         match state.phase {
             CommandPhase::Running => Some(PaneCommandState::Running),
             CommandPhase::Finished => Some(PaneCommandState::Done),
-            CommandPhase::AtPrompt | CommandPhase::Typing => Some(PaneCommandState::Prompt),
-            CommandPhase::Unknown => None,
+            // upstream sets these two only from the markers, which returned above; and without
+            // markers there is no prompt to see
+            CommandPhase::AtPrompt | CommandPhase::Typing | CommandPhase::Unknown => None,
         }
     }
 }
@@ -3786,7 +3787,10 @@ impl PaneListEntry {
     /// markers" - reads this; a reader that wants the best answer reads `command_state`. A row from
     /// a build without the tracker carries no detail, and its string is the markers'.
     pub fn command_state_from_markers(&self) -> Option<PaneCommandState> {
-        if PaneCommandState::from_tracker(&self.pane_info.command_state).is_some() {
+        // the tracker had a word of its own and the shell wrote no markers: whatever the row says
+        // is not the markers'
+        let detail = &self.pane_info.command_state;
+        if !detail.reports_markers && detail.phase != crate::attention::CommandPhase::Unknown {
             None
         } else {
             self.command_state
@@ -3817,11 +3821,14 @@ mod command_state_fill_tests {
             PaneCommandState::from_tracker(&tracker(CommandPhase::Finished, false)),
             Some(PaneCommandState::Done)
         );
-        // nothing has run yet: no word, as before
-        assert_eq!(
-            PaneCommandState::from_tracker(&tracker(CommandPhase::Unknown, false)),
-            None
-        );
+        // nothing has run yet: no word, as before; and never `prompt`, which takes markers
+        for phase in [
+            CommandPhase::Unknown,
+            CommandPhase::AtPrompt,
+            CommandPhase::Typing,
+        ] {
+            assert_eq!(PaneCommandState::from_tracker(&tracker(phase, false)), None);
+        }
         // a shell that writes markers is answered by its markers alone
         for phase in [
             CommandPhase::Running,
@@ -3854,6 +3861,9 @@ mod command_state_fill_tests {
             Some(PaneCommandState::Done)
         );
         row.pane_info.command_state = tracker(CommandPhase::Finished, false);
+        assert_eq!(row.command_state_from_markers(), None);
+        // a prompt the tracker saw without markers is not the markers' word either
+        row.pane_info.command_state = tracker(CommandPhase::AtPrompt, false);
         assert_eq!(row.command_state_from_markers(), None);
         row.pane_info.command_state = tracker(CommandPhase::Finished, true);
         assert_eq!(
