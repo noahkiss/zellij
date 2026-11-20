@@ -598,6 +598,13 @@ context_menu {
 //
 // osc8_hyperlinks false
 
+// How long a pane that rang the bell has to stay focused before its [!] notification clears,
+// in milliseconds
+// The dwell restarts if the pane rings again while it is focused
+// Default: 0 (the notification clears the moment the pane is focused)
+//
+// bell_clear_delay_ms 1000
+
 // Watch the .wasm file of every loaded plugin and reload the plugin when the file changes
 // Written for plugin development: rebuild the plugin and the running pane picks it up, with no
 // session restart and no re-adding the pane

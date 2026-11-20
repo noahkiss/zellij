@@ -828,6 +828,7 @@ impl Action {
                     PaneFrameStyle::Full => "full",
                     PaneFrameStyle::Titles => "titles",
                     PaneFrameStyle::None => "none",
+                    PaneFrameStyle::TopOnly => "top_only",
                 };
                 node.push(style);
                 Some(node)
@@ -4092,12 +4093,13 @@ impl Options {
     }
     fn pane_frame_style_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             " ",
             "// Set the pane frame style when pane_frames is enabled",
             "// Options:",
             "//   - full",
             "//   - titles (default)",
+            "//   - top_only (titles on a horizontal rule, no separators between panes)",
             "// ",
         );
 
@@ -4106,6 +4108,7 @@ impl Options {
                 PaneFrameStyle::Full => "full",
                 PaneFrameStyle::Titles => "titles",
                 PaneFrameStyle::None => "none",
+                PaneFrameStyle::TopOnly => "top_only",
             }
         };
 
@@ -9134,6 +9137,11 @@ fn serialize_and_deserialize_session_info_with_data() {
             attention: Default::default(),
             command_state: Default::default(),
             program_status: Default::default(),
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
+            uuid: String::new(),
         },
     ];
     let mut panes = HashMap::new();
@@ -11770,3 +11778,20 @@ fn the_default_config_offers_to_hide_and_show_bars_in_the_right_click_menu() {
         &ContextMenuAction::Action(Action::ShowBars)
     ));
 }
+#[test]
+fn bell_clear_delay_config_parsing() {
+    let config = Config::from_kdl("bell_clear_delay_ms 1000", None).unwrap();
+    assert_eq!(config.options.bell_clear_delay_ms, Some(1000));
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn bell_clear_delay_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.bell_clear_delay_ms, None);
+}
+

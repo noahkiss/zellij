@@ -112,6 +112,7 @@ pub enum BackgroundJob {
     },
     AttentionIdleCheck(PaneId, u64),
     ReportHostProgramStatus(Option<zellij_utils::attention::HostProgramStatus>),
+    ClearPaneBellAfterDwell(PaneId, u64), // u64 - the dwell in milliseconds
     Exit,
 }
 
@@ -964,6 +965,16 @@ pub(crate) fn background_jobs_main(
                                 ScreenInstruction::ClearPaneFrameColorOverride(pane_ids_clone),
                             );
                         }
+                    }
+                });
+            },
+            BackgroundJob::ClearPaneBellAfterDwell(pane_id, delay_ms) => {
+                runtime.spawn({
+                    let senders = bus.senders.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let _ =
+                            senders.send_to_screen(ScreenInstruction::ClearBellAfterDwell(pane_id));
                     }
                 });
             },

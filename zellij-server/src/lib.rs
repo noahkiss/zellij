@@ -3779,10 +3779,13 @@ pub fn start_server_impl(
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let (to_server, server_receiver): ChannelWithContext<ServerInstruction> = channels::bounded(50);
-    let to_server = SenderWithContext::new(to_server);
-    let session_data: Arc<RwLock<Option<SessionMetaData>>> = Arc::new(RwLock::new(None));
-    let session_state = Arc::new(RwLock::new(SessionState::new()));
+    // Settle macOS's file-access decisions about THIS executable, so the upgrade that lost the
+    // grants is what asks for them back. A launcher-created session has no terminal emulator to
+    // inherit grants from, and they are keyed to the executable's versioned path, so each upgrade
+    // starts with none. Returns at once - it must never block startup on a consent dialog.
+    // No-op off macOS.
+    zellij_utils::session_lifecycle::probe_protected_locations();
+
 
     if install_panic_hook {
         std::panic::set_hook({

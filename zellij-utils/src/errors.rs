@@ -799,6 +799,7 @@ pub enum BackgroundJobContext {
     PeerAttention,
     AttentionIdleCheck,
     ReportHostProgramStatus,
+    ClearPaneBellAfterDwell,
     Exit,
 }
 

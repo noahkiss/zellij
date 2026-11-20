@@ -87,8 +87,9 @@ use zellij_utils::{
 };
 
 use crate::background_jobs::BackgroundJob;
+use crate::bell_dwell::BellDwellTracker;
 use crate::notifications::NotificationProtocol;
-use crate::os_input_output::ResizeCache;
+use crate::os_input_output::{ResizeCache, SendToClientError};
 use crate::pane_groups::PaneGroups;
 use crate::panes::alacritty_functions::xparse_color;
 use crate::panes::grid::{namespace_notification_id, Osc99PayloadType, PendingNotification};
@@ -96,6 +97,7 @@ use crate::panes::nested_session_modal::GuestModalShortcuts;
 use crate::panes::terminal_character::AnsiCode;
 use crate::panes::terminal_pane::{BRACKETED_PASTE_BEGIN, BRACKETED_PASTE_END};
 use crate::session_layout_metadata::{PaneLayoutMetadata, SessionLayoutMetadata};
+use zellij_utils::data::SessionWarning;
 
 use crate::{
     nested_guest::NestedGuestTracker,
@@ -892,6 +894,7 @@ pub enum ScreenInstruction {
         mouse_hover_effects: bool,
         mouse_hover_tips: bool,
         visual_bell: bool,
+        bell_clear_delay_ms: u64,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
         context_menu_enabled: bool,
@@ -900,6 +903,9 @@ pub enum ScreenInstruction {
         host_notification_protocol: HostNotificationProtocol,
         nested_session_handling: NestedSessionHandling,
         dangerously_enable_paste_buffer_read: bool,
+        default_floating_size: Option<DefaultFloatingSize>,
+        input_while_scrolled: InputWhileScrolled,
+        command_pane_on_clean_exit: CommandPaneOnCleanExit,
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
@@ -2633,10 +2639,20 @@ impl Screen {
             pane_output_activity: HashMap::new(),
             pane_ids_never_created: BTreeSet::new(),
             pane_not_created_reasons: HashMap::new(),
+            pane_process_info: HashMap::new(),
+            pending_prefills: HashMap::new(),
+            closed_panes: ClosedPanes::default(),
+            agent_mail: Default::default(),
+            agent_mail_ticking: Default::default(),
+            agent_mail_quiet_ms: zellij_utils::agent_mail::QUIET_MS,
+            pending_reopen_handles: HashMap::new(),
+            reopen_in_new_tab: HashMap::new(),
+            detect_agents: DETECT_AGENTS_DEFAULT,
             mobile_web_prefs: HashMap::new(),
             client_host_focused: HashMap::new(),
             hidden_plugins: HashSet::new(),
             client_notification_protocols: HashMap::new(),
+            client_progress: HashMap::new(),
             host_notification_protocol: HostNotificationProtocol::default(),
             client_host_terminal_env: HashMap::new(),
             last_forwarded_osc7: HashMap::new(),
@@ -2647,6 +2663,11 @@ impl Screen {
             last_session_history_infos: HashMap::new(),
             remote_actions: crate::session_link::RemoteActions::default(),
             pending_session_card_away_since: HashMap::new(),
+            bell_dwell: {
+                let mut bell_dwell = BellDwellTracker::default();
+                bell_dwell.set_delay_ms(bell_clear_delay_ms);
+                bell_dwell
+            },
         }
     }
 
@@ -6555,25 +6576,7 @@ impl Screen {
                     .map(|pane_id| (tab.id, pane_id))
             });
         if let Some((tab_id, focused_pane_id)) = tab_id_and_pane_id {
-            if let Some(tab) = self.tabs.get_mut(&tab_id) {
-                if tab.panes_with_pending_bell.contains(&focused_pane_id) {
-                    let tab_had_bell = tab.tab_has_pending_bell;
-                    tab.clear_bell_notification_for_pane(focused_pane_id);
-                    let tab_bell_now_cleared = tab_had_bell && !tab.tab_has_pending_bell;
-                    let _ =
-                        self.bus
-                            .senders
-                            .send_to_background_jobs(BackgroundJob::StopFlashPaneBell(vec![
-                                focused_pane_id,
-                            ]));
-                    if tab_bell_now_cleared {
-                        let _ = self
-                            .bus
-                            .senders
-                            .send_to_background_jobs(BackgroundJob::StopFlashTabBell(tab_id));
-                    }
-                }
-            }
+            self.clear_bell_on_focus(tab_id, focused_pane_id, client_id);
         }
     }
 
@@ -6581,21 +6584,73 @@ impl Screen {
     pub fn clear_bell_for_pane_id(&mut self, pane_id: PaneId, client_id: ClientId) {
         let tab_id: Option<usize> = self.get_active_tab_mut(client_id).ok().map(|tab| tab.id);
         if let Some(tab_id) = tab_id {
-            if let Some(tab) = self.tabs.get_mut(&tab_id) {
-                if tab.panes_with_pending_bell.contains(&pane_id) {
-                    let tab_had_bell = tab.tab_has_pending_bell;
-                    tab.clear_bell_notification_for_pane(pane_id);
-                    let tab_bell_now_cleared = tab_had_bell && !tab.tab_has_pending_bell;
+            self.clear_bell_on_focus(tab_id, pane_id, client_id);
+        }
+    }
+
+    /// The bell of a pane the client just focused: cleared right away, or - when
+    /// `bell_clear_delay_ms` is set - left alone until the pane has been focused for the
+    /// configured dwell.
+    fn clear_bell_on_focus(&mut self, tab_id: usize, pane_id: PaneId, client_id: ClientId) {
+        if !self.bell_dwell.is_delayed() {
+            self.clear_pane_bell(tab_id, pane_id);
+            return;
+        }
+        self.bell_dwell
+            .record_focus(client_id, pane_id, Instant::now());
+        let has_pending_bell = self
+            .tabs
+            .get(&tab_id)
+            .map_or(false, |tab| tab.panes_with_pending_bell.contains(&pane_id));
+        if has_pending_bell {
+            self.schedule_bell_clear(pane_id);
+        }
+    }
+
+    /// Asks for a `ClearBellAfterDwell` one dwell from now. The decision is taken when it
+    /// arrives, so a job that is overtaken by a refocus or a new ring is a no-op.
+    fn schedule_bell_clear(&self, pane_id: PaneId) {
+        let _ = self
+            .bus
+            .senders
+            .send_to_background_jobs(BackgroundJob::ClearPaneBellAfterDwell(
+                pane_id,
+                self.bell_dwell.delay_ms(),
+            ));
+    }
+
+    /// A scheduled clear came due: clear the bell only if the pane has really dwelled focused.
+    pub fn clear_bell_after_dwell(&mut self, pane_id: PaneId) {
+        if !self.bell_dwell.may_clear(pane_id, Instant::now()) {
+            return;
+        }
+        let tab_id = self
+            .tabs
+            .values()
+            .find(|tab| tab.panes_with_pending_bell.contains(&pane_id))
+            .map(|tab| tab.id);
+        if let Some(tab_id) = tab_id {
+            self.clear_pane_bell(tab_id, pane_id);
+        }
+    }
+
+    /// Clears the pending bell of a pane and stops the flashing that goes with it.
+    fn clear_pane_bell(&mut self, tab_id: usize, pane_id: PaneId) {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            if tab.panes_with_pending_bell.contains(&pane_id) {
+                let tab_had_bell = tab.tab_has_pending_bell;
+                tab.clear_bell_notification_for_pane(pane_id);
+                let tab_bell_now_cleared = tab_had_bell && !tab.tab_has_pending_bell;
+                self.bell_dwell.forget_pane(pane_id);
+                let _ = self
+                    .bus
+                    .senders
+                    .send_to_background_jobs(BackgroundJob::StopFlashPaneBell(vec![pane_id]));
+                if tab_bell_now_cleared {
                     let _ = self
                         .bus
                         .senders
-                        .send_to_background_jobs(BackgroundJob::StopFlashPaneBell(vec![pane_id]));
-                    if tab_bell_now_cleared {
-                        let _ = self
-                            .bus
-                            .senders
-                            .send_to_background_jobs(BackgroundJob::StopFlashTabBell(tab_id));
-                    }
+                        .send_to_background_jobs(BackgroundJob::StopFlashTabBell(tab_id));
                 }
             }
         }
@@ -9850,6 +9905,7 @@ impl Screen {
         mouse_hover_effects: bool,
         mouse_hover_tips: bool,
         visual_bell: bool,
+        bell_clear_delay_ms: u64,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
         osc133_command_selection: bool,
@@ -9857,6 +9913,9 @@ impl Screen {
         host_notification_protocol: HostNotificationProtocol,
         nested_session_handling: NestedSessionHandling,
         dangerously_enable_paste_buffer_read: bool,
+        default_floating_size: Option<DefaultFloatingSize>,
+        input_while_scrolled: InputWhileScrolled,
+        command_pane_on_clean_exit: CommandPaneOnCleanExit,
         client_id: ClientId,
     ) -> Result<()> {
         let should_support_arrow_fonts = !simplified_ui;
@@ -11327,6 +11386,7 @@ pub(crate) fn screen_thread_main(
     let mouse_hover_effects = config_options.mouse_hover_effects.unwrap_or(true);
     let mouse_hover_tips = config_options.mouse_hover_tips.unwrap_or(true);
     let visual_bell = config_options.visual_bell.unwrap_or(true);
+    let bell_clear_delay_ms = config_options.bell_clear_delay_ms.unwrap_or(0);
     let focus_follows_mouse = config_options.focus_follows_mouse.unwrap_or(false);
     let mouse_click_through = config_options.mouse_click_through.unwrap_or(false);
     let nested_session_handling = config_options.nested_session_handling.unwrap_or_default();
@@ -15285,6 +15345,7 @@ pub(crate) fn screen_thread_main(
                 mouse_hover_effects,
                 mouse_hover_tips,
                 visual_bell,
+                bell_clear_delay_ms,
                 focus_follows_mouse,
                 mouse_click_through,
                 context_menu_enabled,
@@ -15293,6 +15354,9 @@ pub(crate) fn screen_thread_main(
                 host_notification_protocol,
                 nested_session_handling,
                 dangerously_enable_paste_buffer_read,
+                default_floating_size,
+                input_while_scrolled,
+                command_pane_on_clean_exit,
             } => {
                 screen.update_context_menu_enabled(context_menu_enabled);
                 screen.host_theme_dark_styling = host_theme_dark;
@@ -15322,6 +15386,7 @@ pub(crate) fn screen_thread_main(
                         mouse_hover_effects,
                         mouse_hover_tips,
                         visual_bell,
+                        bell_clear_delay_ms,
                         focus_follows_mouse,
                         mouse_click_through,
                         osc133_command_selection,
@@ -15329,6 +15394,9 @@ pub(crate) fn screen_thread_main(
                         host_notification_protocol,
                         nested_session_handling,
                         dangerously_enable_paste_buffer_read,
+                        default_floating_size,
+                        input_while_scrolled,
+                        command_pane_on_clean_exit,
                         client_id,
                     )
                     .non_fatal();

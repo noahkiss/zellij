@@ -167,6 +167,11 @@ pub enum PaneFrameStyle {
     Full,
     Titles,
     None,
+    // fork addition: `titles` with a horizontal rule behind the title and no
+    // box-drawing separators between panes
+    #[serde(rename = "top_only")]
+    #[value(name = "top_only")]
+    TopOnly,
 }
 
 impl Default for PaneFrameStyle {
@@ -181,7 +186,13 @@ impl PaneFrameStyle {
     }
 
     pub fn draws_titles(&self) -> bool {
-        matches!(self, PaneFrameStyle::Titles)
+        matches!(self, PaneFrameStyle::Titles | PaneFrameStyle::TopOnly)
+    }
+
+    /// Fork addition: `top_only` is `titles` with a rule behind the title and
+    /// no separators between panes.
+    pub fn is_top_only(&self) -> bool {
+        matches!(self, PaneFrameStyle::TopOnly)
     }
 
     pub fn from_options(options: &Options) -> Self {
@@ -190,6 +201,7 @@ impl PaneFrameStyle {
         }
         match options.pane_frame_style {
             Some(PaneFrameStyle::Full) => PaneFrameStyle::Full,
+            Some(PaneFrameStyle::TopOnly) => PaneFrameStyle::TopOnly,
             _ => PaneFrameStyle::Titles,
         }
     }
@@ -202,8 +214,9 @@ impl FromStr for PaneFrameStyle {
             "full" => Ok(PaneFrameStyle::Full),
             "titles" => Ok(PaneFrameStyle::Titles),
             "none" => Ok(PaneFrameStyle::None),
+            "top_only" => Ok(PaneFrameStyle::TopOnly),
             e => Err(format!(
-                "Unknown pane frame style: '{}' (expected 'full', 'titles' or 'none')",
+                "Unknown pane frame style: '{}' (expected 'full', 'titles', 'none' or 'top_only')",
                 e
             )
             .into()),
@@ -413,6 +426,14 @@ pub struct Options {
     #[clap(long, value_parser)]
     #[serde(default)]
     pub scrollback_lines_to_serialize: Option<usize>,
+
+    /// How long a pane that rang the bell has to stay focused before its notification is
+    /// cleared, in milliseconds. Default is 0 - the notification clears the moment the pane is
+    /// focused.
+    /// config.kdl only - it is read by the server, so there is nothing for a CLI flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub bell_clear_delay_ms: Option<u64>,
 
     /// The size floating panes get when nothing asks for a specific one.
     /// config.kdl only - it is a nested block, which no CLI flag can express.
