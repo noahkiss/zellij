@@ -494,6 +494,8 @@ message SendMessageAction {
   optional string reply_to = 5;
   uint64 expire_s = 6;
   optional string from_tab = 7;
+  // the person whose own words the message relays; absent for an agent's own message
+  optional string from_person = 8;
 }
 message MessageStatusAction {
   optional string id = 1;

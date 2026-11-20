@@ -25284,6 +25284,7 @@ fn send(screen: &mut Screen, text: &str) -> zellij_utils::agent_mail::MessageRec
         Some("builder".to_owned()),
         Some("develop".to_owned()),
         None,
+        None,
         60,
     )
 }
@@ -25318,8 +25319,10 @@ fn a_message_to_an_idle_agent_goes_in_as_one_paste_and_a_held_enter() {
         sent,
         vec![
             format!(
-                "w:\x1b[200~[message {} from builder (tab develop, boxa); not from the person. \
-                 Reply: zellij_send reply_to={}, or to=boxa/work/brisk-heron]\nRun the tests.\x1b[201~",
+                "w:\x1b[200~<cross-session-message from=\"zellij:boxa/work/brisk-heron\" \
+                 from-name=\"builder\" from-tab=\"develop\" message=\"{}\" \
+                 reply=\"zellij_send reply_to={}\" reply-to=\"boxa/work/brisk-heron\">\n\
+                 Run the tests.\n</cross-session-message>\x1b[201~",
                 record.id, record.id
             ),
             "at:\r".to_owned(),
@@ -25376,7 +25379,8 @@ fn a_message_against_a_persons_draft_is_held_and_the_draft_left_alone() {
     let sent = pty_writes(&writes);
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(
-        sent[0].starts_with("w:\x1b[200~[message ") && sent[0].ends_with("Run the tests.\x1b[201~")
+        sent[0].starts_with("w:\x1b[200~<cross-session-message ")
+            && sent[0].ends_with("</cross-session-message>\x1b[201~")
     );
     assert_eq!(sent[1], "at:\r");
     assert_eq!(
@@ -25431,7 +25435,8 @@ fn a_working_or_blocked_agent_holds_and_a_shell_or_no_wait_refuses() {
     agent_reports(&mut screen, "blocked");
     assert_eq!(send(&mut screen, "b").reason, Some(Reason::Blocked));
     // expire_s 0: deliver now or not at all
-    let now_only = screen.send_agent_message(1, "c".into(), "x/y/z".into(), None, None, None, 0);
+    let now_only =
+        screen.send_agent_message(1, "c".into(), "x/y/z".into(), None, None, None, None, 0);
     assert_eq!(now_only.status, Status::Refused);
     assert_eq!(now_only.reason, Some(Reason::Blocked));
     assert!(pty_writes(&writes).is_empty());
@@ -25494,7 +25499,15 @@ fn any_new_agent_is_held_as_starting_until_it_reports_then_gets_the_message() {
             Status::Delivered,
             "{kind}"
         );
-        assert_eq!(pty_writes(&writes).len(), 2, "{kind}");
+        let sent = pty_writes(&writes);
+        assert_eq!(sent.len(), 2, "{kind}");
+        // claude gets its cross-session wrapper; every other kind the envelope line first
+        let opening = if kind == "claude" {
+            "w:\x1b[200~<cross-session-message from="
+        } else {
+            "w:\x1b[200~[message "
+        };
+        assert!(sent[0].starts_with(opening), "{kind}: {}", sent[0]);
     }
 }
 

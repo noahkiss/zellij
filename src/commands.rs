@@ -744,7 +744,13 @@ pub(crate) fn send_action_to_session(
         let own = requested_session_name
             .clone()
             .or_else(|| envs::get_session_name().ok());
-        let exit_status = send_message(&cli_action, own.as_deref(), &names, output_json);
+        let exit_status = send_message(
+            &cli_action,
+            own.as_deref(),
+            &names,
+            config.as_ref(),
+            output_json,
+        );
         process::exit(exit_status);
     }
     // a reply looks its message up only in the session the replying pane is in: `--session`, or
@@ -759,7 +765,13 @@ pub(crate) fn send_action_to_session(
         let own = requested_session_name
             .clone()
             .or_else(|| envs::get_session_name().ok());
-        let exit_status = send_message(&cli_action, own.as_deref(), &[], output_json);
+        let exit_status = send_message(
+            &cli_action,
+            own.as_deref(),
+            &[],
+            config.as_ref(),
+            output_json,
+        );
         process::exit(exit_status);
     }
     if let zellij_utils::cli::CliAction::ListAgents {
@@ -1265,6 +1277,7 @@ fn attach_with_cli_client(
             &cli_action,
             Some(session_name),
             &[session_name.to_owned()],
+            config.as_ref(),
             output_json,
         );
         std::process::exit(exit_status);
@@ -1937,6 +1950,7 @@ fn send_message(
     cli_action: &zellij_utils::cli::CliAction,
     own_session: Option<&str>,
     sessions: &[String],
+    config: Option<&Config>,
     output_json: bool,
 ) -> i32 {
     let zellij_utils::cli::CliAction::SendMessage {
@@ -1948,6 +1962,7 @@ fn send_message(
         from,
         from_name,
         from_tab,
+        from_person,
         json,
         ..
     } = cli_action
@@ -1971,6 +1986,9 @@ fn send_message(
             from: from.clone(),
             from_name: from_name.clone(),
             from_tab: from_tab.clone(),
+            from_person: from_person.then(|| {
+                person_name(config.and_then(|config| config.options.person_name.as_deref()))
+            }),
             json: *json || output_json,
             default_harness: CONFIG_PATH
                 .get()
@@ -1979,6 +1997,15 @@ fn send_message(
                 .and_then(default_harness),
         },
     )
+}
+
+/// The name `send-message --from-person` gives the person: the config's `person_name`, or `user`.
+fn person_name(configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("user")
+        .to_owned()
 }
 
 /// The config's `default_harness "<name>"`: the coding agent `send-message` starts in a target tab
@@ -2014,5 +2041,17 @@ mod default_harness_tests {
         assert_eq!(default_harness_in("default_harness \"\"\n"), None);
         assert_eq!(default_harness_in("default_harness 3\n"), None);
         assert_eq!(default_harness_in("default_harness {\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod person_name_tests {
+    use super::person_name;
+
+    #[test]
+    fn the_person_is_the_configured_name_or_user() {
+        assert_eq!(person_name(Some("Sam")), "Sam");
+        assert_eq!(person_name(Some("  ")), "user");
+        assert_eq!(person_name(None), "user");
     }
 }

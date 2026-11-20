@@ -903,6 +903,13 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub command_pane_on_clean_exit: Option<CommandPaneOnCleanExit>,
+
+    /// The name of the person at this machine's keyboard. `send-message --from-person` puts it in
+    /// the message, to say the text is that person's own words, relayed by the sending agent.
+    /// Unset, such a message names `user`
+    #[clap(skip)]
+    #[serde(default)]
+    pub person_name: Option<String>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1155,6 +1162,7 @@ impl Options {
         let command_pane_on_clean_exit = other
             .command_pane_on_clean_exit
             .or(self.command_pane_on_clean_exit);
+        let person_name = other.person_name.or_else(|| self.person_name.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1251,6 +1259,7 @@ impl Options {
             mode_hints_when_bars_hidden,
             input_while_scrolled,
             command_pane_on_clean_exit,
+            person_name,
         }
     }
 
@@ -1441,6 +1450,7 @@ impl Options {
         let command_pane_on_clean_exit = other
             .command_pane_on_clean_exit
             .or(self.command_pane_on_clean_exit);
+        let person_name = other.person_name.or_else(|| self.person_name.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1537,6 +1547,7 @@ impl Options {
             mode_hints_when_bars_hidden,
             input_while_scrolled,
             command_pane_on_clean_exit,
+            person_name,
         }
     }
 

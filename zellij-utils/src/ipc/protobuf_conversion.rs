@@ -1320,6 +1320,8 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             default_floating_size: None,
             input_while_scrolled: None,
             command_pane_on_clean_exit: None,
+            // read by the sending CLI from its own config; the server never needs it
+            person_name: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,
@@ -2585,6 +2587,7 @@ impl From<crate::input::actions::Action>
                 from,
                 from_name,
                 from_tab,
+                from_person,
                 reply_to,
                 expire_s,
             } => ActionType::SendMessage(SendMessageAction {
@@ -2595,6 +2598,7 @@ impl From<crate::input::actions::Action>
                 reply_to,
                 expire_s,
                 from_tab,
+                from_person,
             }),
             crate::input::actions::Action::MessageStatus { id } => {
                 ActionType::MessageStatus(MessageStatusAction { id })
@@ -3738,6 +3742,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 from: a.from,
                 from_name: a.from_name,
                 from_tab: a.from_tab,
+                from_person: a.from_person,
                 reply_to: a.reply_to,
                 expire_s: a.expire_s,
             }),

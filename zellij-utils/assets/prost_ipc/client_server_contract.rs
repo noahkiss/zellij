@@ -912,6 +912,9 @@ pub struct SendMessageAction {
     pub expire_s: u64,
     #[prost(string, optional, tag="7")]
     pub from_tab: ::core::option::Option<::prost::alloc::string::String>,
+    /// the person whose own words the message relays; absent for an agent's own message
+    #[prost(string, optional, tag="8")]
+    pub from_person: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

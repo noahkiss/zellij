@@ -3567,6 +3567,7 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "pane_frame_agent_name",
     "pane_frame_style",
     "pane_frames",
+    "person_name",
     "plugin_watch",
     "post_command_discovery_hook",
     "resurrect_command_hints",
@@ -3960,6 +3961,9 @@ impl Options {
             |value| value.parse::<crate::input::options::CommandPaneOnCleanExit>(),
             "hold or shell",
         );
+        let person_name = kdl_property_first_arg_as_string_or_error!(kdl_options, "person_name")
+            .map(|(name, _entry)| name.trim().to_string())
+            .filter(|name| !name.is_empty());
         let host_notification_protocol = known_value_or_note(
             "host_notification_protocol",
             kdl_property_first_arg_as_string_or_error!(kdl_options, "host_notification_protocol"),
@@ -4103,6 +4107,7 @@ impl Options {
             mode_hints_when_bars_hidden,
             input_while_scrolled,
             command_pane_on_clean_exit,
+            person_name,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -6612,6 +6617,22 @@ impl Options {
             None
         }
     }
+    /// Written only when set: the key is read by the sending CLI, not by the session, and a
+    /// commented default would name a person.
+    fn person_name_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        let name = self.person_name.as_ref()?;
+        let mut node = KdlNode::new("person_name");
+        node.push(name.to_owned());
+        if add_comments {
+            node.set_leading(format!(
+                "{}\n{}\n{}\n",
+                " ",
+                "// The person at this keyboard, named in a message `send-message --from-person`",
+                "// relays from them. Unset, such a message names \"user\"",
+            ));
+        }
+        Some(node)
+    }
     fn host_notification_protocol_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         use crate::input::options::HostNotificationProtocol;
         let comment_text = format!(
@@ -7124,6 +7145,9 @@ impl Options {
             self.command_pane_on_clean_exit_to_kdl(add_comments)
         {
             nodes.push(command_pane_on_clean_exit);
+        }
+        if let Some(person_name) = self.person_name_to_kdl(add_comments) {
+            nodes.push(person_name);
         }
         if let Some(host_notification_protocol) =
             self.host_notification_protocol_to_kdl(add_comments)
@@ -12414,6 +12438,23 @@ fn command_pane_on_clean_exit_warns_on_an_unknown_value() {
         config.warnings[0]
     );
     assert!(Config::from_kdl("command_pane_on_clean_exit 3", None).is_err());
+}
+
+#[test]
+fn person_name_is_read_written_back_and_blank_reads_as_unset() {
+    let config = Config::from_kdl("person_name \"Sam\"", None).unwrap();
+    assert_eq!(config.options.person_name.as_deref(), Some("Sam"));
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    let written = config
+        .options
+        .to_kdl(false)
+        .iter()
+        .map(|node| node.to_string())
+        .collect::<String>();
+    assert!(written.contains("person_name \"Sam\""), "{written}");
+    let blank = Config::from_kdl("person_name \"  \"", None).unwrap();
+    assert_eq!(blank.options.person_name, None);
+    assert!(Config::from_kdl("person_name 3", None).is_err());
 }
 
 #[test]

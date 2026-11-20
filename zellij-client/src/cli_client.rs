@@ -3381,6 +3381,8 @@ pub struct SendMessageRequest {
     pub from: Option<String>,
     pub from_name: Option<String>,
     pub from_tab: Option<String>,
+    /// The person whose own words the message relays, by name; `None` for the agent's own.
+    pub from_person: Option<String>,
     pub json: bool,
     /// The config's `default_harness`: started in a target tab or pane that runs no agent.
     pub default_harness: Option<String>,
@@ -3754,6 +3756,7 @@ fn deliver_message(
         from,
         from_name: request.from_name.clone().or(own_name),
         from_tab: request.from_tab.clone().or(own_tab),
+        from_person: request.from_person.clone(),
         reply_to: request.reply_to.clone(),
         expire_s: request.expire_s,
     };
