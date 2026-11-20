@@ -543,4 +543,7 @@ impl ZellijPlugin for SlimKeybinds {
     }
 }
 
+// Not in a test build: the macro exports a C-ABI `pipe`, which on macOS shadows libc's `pipe(2)`
+// and breaks `Command::output` in the tests.
+#[cfg(not(test))]
 register_plugin!(SlimKeybinds);
