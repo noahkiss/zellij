@@ -1,0 +1,28 @@
+[
+  {
+    "self": false,
+    "handle": "lush-horizon",
+    "pane_id": 2,
+    "tab_id": 1,
+    "tab_position": 1,
+    "tab_name": "agents",
+    "title": "agent",
+    "kind": "claude",
+    "name": null,
+    "agent_id": "golden-session-1",
+    "source": "command",
+    "session_source": "osc",
+    "command": "/opt/stand-in/bin/claude",
+    "cwd": "/home/user/scratch",
+    "pid": 936060,
+    "last_output_at": 1795129373104,
+    "state": "blocked",
+    "state_kind": "permission",
+    "state_app": "claude-code",
+    "state_title": "golden task",
+    "state_msg": "Allow Bash: cargo test?",
+    "state_progress": 40,
+    "state_at": 1795129373104,
+    "state_working": 1
+  }
+]

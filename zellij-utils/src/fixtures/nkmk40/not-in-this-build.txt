@@ -1,0 +1,13 @@
+# list-panes.json
+$[].exclude_from_sync bool
+$[].focused_by_client_ids array
+$[].has_explicit_title bool
+$[].is_alternate_screen bool
+$[].is_borderless bool
+$[].is_pinned bool
+$[].logical_position number
+$[].scrollback_length number
+$[].scrollback_position number
+
+# list-agents.json
+

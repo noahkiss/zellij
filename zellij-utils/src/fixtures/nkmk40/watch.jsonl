@@ -1,0 +1,56 @@
+{"event":"hello","server_version":"0.45.1-nkmk.40","server_build_id":"5a0f404aef9dd48527ef9366e2733d29675adf49","session":"golden","seq":0,"epoch":"ad8a99436452f5dc","ts":1795129388823,"server_build":"same"}
+{"event":"agent","self":false,"handle":"lush-horizon","pane_id":2,"tab_id":1,"tab_position":1,"tab_name":"agents","title":"agent","kind":"claude","name":null,"agent_id":"golden-session-1","source":"command","session_source":"osc","command":"/opt/stand-in/bin/claude","cwd":"/home/user/scratch","pid":936060,"last_output_at":1795129373104,"state":"blocked","state_kind":"permission","state_app":"claude-code","state_title":"golden task","state_msg":"Allow Bash: cargo test?","state_progress":40,"state_at":1795129373104,"state_working":1,"seq":1,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"plugin_0","handle":"gooey-lagoon","tab_id":0,"seq":2,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"plugin_3","handle":"casual-charm","tab_id":0,"seq":3,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_0","handle":"light-guitar","tab_id":0,"seq":4,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_3","handle":"careful-glen","tab_id":0,"seq":5,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_4","handle":"retro-marmot","tab_id":0,"seq":6,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_5","handle":"roomy-gibbon","tab_id":0,"seq":7,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_8","handle":"willing-deer","tab_id":0,"seq":8,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_1","handle":"cunning-oven","tab_id":1,"seq":9,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_2","handle":"lush-horizon","tab_id":1,"seq":10,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_6","handle":"misty-jaguar","tab_id":1,"seq":11,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_opened","pane_id":"terminal_7","handle":"glowing-crow","tab_id":1,"seq":12,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"tab_opened","tab_id":0,"seq":13,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"tab_opened","tab_id":1,"seq":14,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"synced","seq":15,"epoch":"ad8a99436452f5dc","ts":1795129388823}
+{"event":"pane_changed","pane_id":"terminal_3","handle":"careful-glen","tab_id":0,"title":"renamed-marks","program_title":null,"pane_cwd":"/home/user/scratch","pane_command":"bash --norc --noprofile -i","terminal_command":"bash --norc --noprofile -i","command_state":"prompt","state":"done","state_app":"pi","state_at":1795129380316,"seq":16,"epoch":"ad8a99436452f5dc","ts":1795129390818}
+{"event":"pane_output","pane_id":"terminal_3","handle":"careful-glen","last_output_at":1795129390857,"seq":17,"epoch":"ad8a99436452f5dc","ts":1795129390858}
+{"event":"pane_opened","pane_id":"terminal_9","handle":"steady-moose","tab_id":1,"seq":18,"epoch":"ad8a99436452f5dc","ts":1795129390897}
+{"event":"pane_changed","pane_id":"terminal_9","handle":"steady-moose","tab_id":1,"title":"bash --norc --noprofile -i","program_title":null,"terminal_command":"bash --norc --noprofile -i","seq":19,"epoch":"ad8a99436452f5dc","ts":1795129390897}
+{"event":"pane_output","pane_id":"terminal_1","handle":"cunning-oven","last_output_at":1795129390913,"seq":20,"epoch":"ad8a99436452f5dc","ts":1795129390926}
+{"event":"pane_output","pane_id":"terminal_6","handle":"misty-jaguar","last_output_at":1795129390898,"seq":21,"epoch":"ad8a99436452f5dc","ts":1795129390926}
+{"event":"pane_output","pane_id":"terminal_9","handle":"steady-moose","last_output_at":1795129390898,"seq":22,"epoch":"ad8a99436452f5dc","ts":1795129390926}
+{"event":"pane_closed","pane_id":"terminal_8","handle":"willing-deer","seq":23,"epoch":"ad8a99436452f5dc","ts":1795129390939}
+{"event":"pane_changed","pane_id":"terminal_4","handle":"retro-marmot","tab_id":0,"title":"done3","program_title":null,"pane_cwd":"/home/user/scratch","pane_command":"bash --norc --noprofile -i","terminal_command":"bash --norc --noprofile -i","command_state":"prompt","seq":24,"epoch":"ad8a99436452f5dc","ts":1795129390939}
+{"event":"pane_output","pane_id":"terminal_4","handle":"retro-marmot","last_output_at":1795129390939,"seq":25,"epoch":"ad8a99436452f5dc","ts":1795129390939}
+{"event":"pane_changed","pane_id":"terminal_5","handle":"roomy-gibbon","tab_id":0,"title":"running","program_title":null,"pane_cwd":"/home/user/scratch","pane_command":"bash --norc --noprofile -i","terminal_command":"bash --norc --noprofile -i","command_state":"prompt","seq":26,"epoch":"ad8a99436452f5dc","ts":1795129390964}
+{"event":"pane_output","pane_id":"terminal_5","handle":"roomy-gibbon","last_output_at":1795129390939,"seq":27,"epoch":"ad8a99436452f5dc","ts":1795129390964}
+{"event":"tab_renamed","tab_id":1,"name":"agents2","seq":28,"epoch":"ad8a99436452f5dc","ts":1795129390977}
+{"event":"agent","self":false,"handle":"lush-horizon","pane_id":2,"tab_id":1,"tab_position":1,"tab_name":"agents2","title":"agent","kind":"claude","name":null,"agent_id":"golden-session-1","source":"command","session_source":"osc","command":"/opt/stand-in/bin/claude","cwd":"/home/user/scratch","pid":936060,"last_output_at":1795129391120,"state":"done","state_app":"claude-code","state_msg":"finished","state_at":1795129391120,"seq":29,"epoch":"ad8a99436452f5dc","ts":1795129391326}
+{"event":"pane_changed","pane_id":"terminal_2","handle":"lush-horizon","tab_id":1,"title":"agent","program_title":null,"pane_cwd":"/home/user/scratch","pane_command":"/bin/sh /opt/stand-in/bin/claude","terminal_command":"/opt/stand-in/bin/claude","state":"done","state_app":"claude-code","state_msg":"finished","state_at":1795129391120,"seq":30,"epoch":"ad8a99436452f5dc","ts":1795129391326}
+{"event":"pane_output","pane_id":"terminal_2","handle":"lush-horizon","last_output_at":1795129391120,"seq":31,"epoch":"ad8a99436452f5dc","ts":1795129391326}
+{"event":"pane_changed","pane_id":"terminal_3","handle":"careful-glen","tab_id":0,"title":"renamed-marks","program_title":null,"pane_cwd":"/home/user/scratch","pane_command":"bash --norc --noprofile -i","terminal_command":"bash --norc --noprofile -i","command_state":"prompt","state":"error","state_app":"pi","state_msg":"oops","state_at":1795129390860,"seq":32,"epoch":"ad8a99436452f5dc","ts":1795129391826}
+{"event":"pane_changed","pane_id":"terminal_9","handle":"steady-moose","tab_id":1,"title":"bash --norc --noprofile -i","program_title":null,"pane_cwd":"/home/user/scratch","pane_command":"bash --norc --noprofile -i","terminal_command":"bash --norc --noprofile -i","seq":33,"epoch":"ad8a99436452f5dc","ts":1795129392076}
+{"event":"pane_output","pane_id":"terminal_3","handle":"careful-glen","last_output_at":1795129390939,"seq":34,"epoch":"ad8a99436452f5dc","ts":1795129392076}
+{"event":"pane_exited","pane_id":"terminal_2","handle":"lush-horizon","exit_status":0,"seq":35,"epoch":"ad8a99436452f5dc","ts":1795129393123}
+{"event":"pane_changed","pane_id":"terminal_2","handle":"lush-horizon","tab_id":1,"title":"agent","program_title":null,"pane_cwd":"/home/user/scratch","terminal_command":"/opt/stand-in/bin/claude","state":"done","state_app":"claude-code","state_msg":"finished","state_at":1795129391120,"seq":36,"epoch":"ad8a99436452f5dc","ts":1795129394006}
+{"event":"hello","server_version":"0.45.1-nkmk.40","server_build_id":"5a0f404aef9dd48527ef9366e2733d29675adf49","session":"golden","seq":0,"epoch":"ad8a99436452f5dc","ts":1795129408107,"server_build":"same"}
+{"event":"agent","self":false,"handle":"lush-horizon","pane_id":2,"tab_id":1,"tab_position":1,"tab_name":"agents2","title":"agent","kind":"claude","name":null,"agent_id":"golden-session-1","source":"command","session_source":"osc","command":"/opt/stand-in/bin/claude","cwd":"/home/user/scratch","last_output_at":1795129391120,"state":"done","state_app":"claude-code","state_msg":"finished","state_at":1795129391120,"seq":1,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"plugin_0","handle":"gooey-lagoon","tab_id":0,"seq":2,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"plugin_3","handle":"casual-charm","tab_id":0,"seq":3,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_0","handle":"light-guitar","tab_id":0,"seq":4,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_3","handle":"careful-glen","tab_id":0,"seq":5,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_4","handle":"retro-marmot","tab_id":0,"seq":6,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_5","handle":"roomy-gibbon","tab_id":0,"seq":7,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_1","handle":"cunning-oven","tab_id":1,"seq":8,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_2","handle":"lush-horizon","tab_id":1,"seq":9,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_6","handle":"misty-jaguar","tab_id":1,"seq":10,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_7","handle":"glowing-crow","tab_id":1,"seq":11,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"pane_opened","pane_id":"terminal_9","handle":"steady-moose","tab_id":1,"seq":12,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"tab_opened","tab_id":0,"seq":13,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"tab_opened","tab_id":1,"seq":14,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"synced","seq":15,"epoch":"ad8a99436452f5dc","ts":1795129408107}
+{"event":"gone","pane_id":2,"handle":"lush-horizon","seq":16,"epoch":"ad8a99436452f5dc","ts":1795129410110}
+{"event":"pane_closed","pane_id":"terminal_2","handle":"lush-horizon","seq":17,"epoch":"ad8a99436452f5dc","ts":1795129410110}
+{"event":"pane_output","pane_id":"terminal_9","handle":"steady-moose","last_output_at":1795129410111,"seq":18,"epoch":"ad8a99436452f5dc","ts":1795129410358}

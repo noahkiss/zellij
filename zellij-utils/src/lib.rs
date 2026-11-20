@@ -33,6 +33,10 @@ pub mod setup;
 pub mod shared;
 pub mod structured_render;
 
+// golden JSON key sets from a released build, for the tests
+#[cfg(test)]
+mod golden_json_keys;
+
 // The following modules can't be used when targeting wasm
 #[cfg(not(target_family = "wasm"))]
 pub mod app_control;
