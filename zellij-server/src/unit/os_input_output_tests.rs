@@ -409,3 +409,18 @@ fn the_pane_environment_is_added_to_and_removed_from_the_child_environment() {
     assert!(output.contains(expected), "got: '{}'", output);
     assert!(std::env::var("ZELLIJ_PANE_ENV_TEST").is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn the_newest_child_of_a_shell_is_the_one_recorded() {
+    // a shell that ran two things keeps the second one: the first has been exited by the time the
+    // second is on screen
+    assert_eq!(newest_child(&[(100, 10), (200, 20)]), Some(200));
+    assert_eq!(newest_child(&[(200, 20), (100, 10)]), Some(200));
+    // sysinfo reports whole seconds, so two children of the same second tie - the higher pid is
+    // the later of the two often enough to beat picking arbitrarily
+    assert_eq!(newest_child(&[(100, 10), (99, 10)]), Some(100));
+    // an idle shell has no children, and records nothing
+    assert_eq!(newest_child(&[]), None);
+}
+

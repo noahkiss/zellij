@@ -1011,6 +1011,45 @@ pub enum Sessions {
     #[clap(subcommand)]
     Snapshot(SnapshotCli),
 
+    /// Create, tear down and restart a named session, asserting the result
+    #[clap(subcommand)]
+    Session(SessionLifecycleCli),
+
+    /// Stop every session's server, keeping the sessions resurrectable
+    ///
+    /// Attempts every session and exits non-zero if any server did not go.
+    #[clap(visible_alias = "ka")]
+    KillAllSessions {
+        /// Automatic yes to prompts
+        #[clap(short, long, value_parser)]
+        yes: bool,
+        /// Return as soon as each kill has been acknowledged, without waiting for servers to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for each server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
+    },
+
+    /// Delete every session's saved state, so none of them can be resurrected
+    ///
+    /// Attempts every session and exits non-zero if any of them did not go.
+    #[clap(visible_alias = "da")]
+    DeleteAllSessions {
+        /// Automatic yes to prompts
+        #[clap(short, long, value_parser)]
+        yes: bool,
+        /// Kill the sessions if they're running before deleting them
+        #[clap(short, long)]
+        force: bool,
+        /// Return as soon as each kill has been acknowledged, without waiting for servers to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for each server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
+    },
+
     /// Run a command in a new pane
     ///
     /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
@@ -1325,6 +1364,167 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// forever, which only a plugin that received the message can end
         #[clap(long, value_parser, default_value = "30", display_order(5))]
         timeout: u64,
+    },
+}
+
+/// The lifecycle of one named session: create it, remove it, replace it.
+///
+/// Each of these states a post-condition and checks it, rather than reporting what it asked for.
+/// The session name defaults to the `session_name` config option where one is set, so a machine
+/// that runs a single named session can say `zellij session up` and mean it.
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
+pub enum SessionLifecycleCli {
+    /// Create the session in the background if it is not already up, then assert that it is
+    Up {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Build the session from a NAMED archived snapshot. Takes a snapshot id (a unique prefix
+        /// is enough) and defaults to the newest snapshot for this session name. Without it the
+        /// session still comes back with the shape it had - see --fresh for the layout
+        #[clap(
+            long,
+            value_name = "ID",
+            value_parser,
+            num_args(0..=1),
+            require_equals(false),
+            default_missing_value("latest")
+        )]
+        restore: Option<String>,
+
+        /// Build the session from the default layout, discarding the shape it had. This is how a
+        /// layout edit is applied, and the only way past the resume that is otherwise the default
+        #[clap(long, conflicts_with("restore"))]
+        fresh: bool,
+    },
+
+    /// Remove the session, archiving a snapshot of its shape first, then assert that it is gone
+    Down {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
+
+        /// Remove the session even when an agent in it is working. Without it, a working agent
+        /// makes the command refuse with exit code 4
+        #[clap(long)]
+        force: bool,
+    },
+
+    /// Take the session down and bring it back, from inside it or from anywhere else
+    Restart {
+        /// Name of the session, defaults to the current session, then to the `session_name`
+        /// config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Come back from the default layout instead of from the pre-restart shape. This is how a
+        /// layout edit is applied
+        #[clap(long, conflicts_with("restore"))]
+        fresh: bool,
+
+        /// Come back from a specific snapshot rather than the one the teardown archives
+        #[clap(long, value_name = "ID", value_parser)]
+        restore: Option<String>,
+
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
+
+        /// Restart even when an agent in the session is working. Without it, a working agent
+        /// makes the command refuse with exit code 4
+        #[clap(long)]
+        force: bool,
+    },
+
+    /// Install the init-system unit that keeps the session up, and load it. systemd on Linux,
+    /// launchd on macOS, both in the user's own domain. Running it again over an unchanged
+    /// install changes nothing and says so
+    Enable {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// The binary path the unit should run. Defaults to the stable name on PATH that leads to
+        /// this binary, which is what survives an upgrade
+        #[clap(long, value_name = "PATH", value_parser)]
+        exe: Option<PathBuf>,
+
+        /// Install even when another job already runs `session up` for this session. Two
+        /// launchers race at login and one of them ends up failed, so this is refused by default
+        #[clap(long)]
+        force: bool,
+
+        /// Print the unit, where it would go, and the binary, pin and PATH decisions, and change
+        /// nothing: no file is written, no job is loaded and the pin is not refreshed
+        #[clap(short('n'), long)]
+        dry_run: bool,
+    },
+
+    /// Unload the init-system unit and remove it. Removing the file without unloading the job
+    /// first is the mistake this exists to prevent
+    Disable {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+    },
+
+    /// Report the unit: whether the file is installed, whether the init system has loaded it, and
+    /// whether the session is actually running. The three come apart, and which one is missing is
+    /// the diagnosis
+    Status {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// The binary path to compare the installed unit against, as `enable` takes it
+        #[clap(long, value_name = "PATH", value_parser)]
+        exe: Option<PathBuf>,
+    },
+
+    /// Check everything that has to hold for this session to come up and stay up, fix what a
+    /// program is allowed to fix, and name what only a person can. Reports in three sections -
+    /// what changed, what was already correct, and what needs you - and exits non-zero only when
+    /// something is waiting on you
+    Doctor {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Report every finding and change nothing. Each fix says what it would have done
+        #[clap(short('n'), long)]
+        dry_run: bool,
+
+        /// Whether to repair what can be repaired. `--dry-run` implies `--no-fix`
+        #[clap(long, overrides_with("no_fix"))]
+        fix: bool,
+
+        /// Only report; make no change
+        #[clap(long)]
+        no_fix: bool,
+
+        /// Whether a release build may replace a signed pinned copy. The default. macOS only, and
+        /// nothing on any other platform
+        #[clap(long, overrides_with("no_sign"))]
+        sign: bool,
+
+        /// Leave a signed pinned copy exactly as it is, even for a release build
+        #[clap(long)]
+        no_sign: bool,
+
+        /// Say that Full Disk Access, Accessibility and Screen Recording were granted again for
+        /// the pinned copy's current signature, so doctor stops reporting the re-grant as owed.
+        /// macOS only
+        #[clap(long)]
+        regranted: bool,
+
+        /// The binary path to compare the installed unit against, as `status` takes it
+        #[clap(long, value_name = "PATH", value_parser)]
+        exe: Option<PathBuf>,
     },
 }
 

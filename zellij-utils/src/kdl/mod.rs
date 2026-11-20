@@ -3339,6 +3339,154 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
     }
 }
 
+/// `pin_exe`, which is a switch that may also be a path.
+///
+/// `pin_exe true` asks for the platform's canonical location and is what almost everyone wants -
+/// the path is zellij's business, and naming it in every config would be a path to keep in step
+/// with every machine. `pin_exe "<path>"` is for an install this cannot guess at, a hand-written
+/// launcher above all: the launcher names a path, and the pin has to be that one or the two
+/// disagree. `pin_exe false` is the default written out, and reads as off.
+fn pin_exe_from_kdl(kdl_pin_exe: &KdlNode) -> Result<Option<PinnedExe>, ConfigError> {
+    if let Some(path) = kdl_first_entry_as_string!(kdl_pin_exe) {
+        return Ok(Some(PinnedExe::At(expand_path(path))));
+    }
+    if let Some(on) = kdl_first_entry_as_bool!(kdl_pin_exe) {
+        return Ok(on.then_some(PinnedExe::Canonical));
+    }
+    Err(ConfigError::new_kdl_error(
+        "pin_exe takes true, false, or the path to pin the binary at".to_owned(),
+        kdl_pin_exe.span().offset(),
+        kdl_pin_exe.span().len(),
+    ))
+}
+
+/// The node name that marks one element of a plist array.
+///
+/// A KDL node must be named and an array element has no name, so one is reserved. `-` is the
+/// spelling every list in every configuration language the reader has seen already uses, and it is
+/// not a plausible plist key.
+const PLIST_ARRAY_ELEMENT: &str = "-";
+
+/// One launchd key's value, as KDL spells it.
+///
+/// A scalar is the node's first argument. A container is the node's CHILDREN, and which container
+/// it is follows from what those children are called: every child named `-` is an array, anything
+/// else is a dictionary. Nothing else has to be declared, and the two cannot be confused - a
+/// dictionary key called `-` is not a thing anyone writes.
+///
+/// ```kdl
+/// keys {
+///     ProcessType "Interactive"
+///     WatchPaths {
+///         - "~/.config/zellij/config.kdl"
+///     }
+///     KeepAlive {
+///         SuccessfulExit false
+///     }
+/// }
+/// ```
+fn plist_value_from_kdl(kdl_key: &KdlNode) -> Result<PlistValue, ConfigError> {
+    let name = kdl_name!(kdl_key);
+    if let Some(value) = kdl_first_entry_as_string!(kdl_key) {
+        return Ok(PlistValue::String(value.to_owned()));
+    }
+    if let Some(value) = kdl_first_entry_as_bool!(kdl_key) {
+        return Ok(PlistValue::Bool(value));
+    }
+    if let Some(value) = kdl_first_entry_as_i64!(kdl_key) {
+        return Ok(PlistValue::Integer(value));
+    }
+    if let Some(children) = kdl_key.children() {
+        return plist_container_from_kdl(kdl_key, children.nodes());
+    }
+    Err(ConfigError::new_kdl_error(
+        format!(
+            "Failed to parse the launchd key {:?}: expected a string, an integer, a boolean, or a \
+             block of values",
+            name
+        ),
+        kdl_key.span().offset(),
+        kdl_key.span().len(),
+    ))
+}
+
+/// An array or a dictionary, decided by what its children are called.
+///
+/// A block mixing the two is refused rather than resolved one way: a plist is one or the other, and
+/// picking for the reader would produce a file that is not what they wrote.
+fn plist_container_from_kdl(
+    kdl_key: &KdlNode,
+    children: &[KdlNode],
+) -> Result<PlistValue, ConfigError> {
+    if children.is_empty() {
+        return Err(ConfigError::new_kdl_error(
+            format!(
+                "The launchd key {:?} has an empty block: write an array element as `- <value>`, \
+                 or a dictionary entry as `<Key> <value>`",
+                kdl_name!(kdl_key)
+            ),
+            kdl_key.span().offset(),
+            kdl_key.span().len(),
+        ));
+    }
+    let elements = children
+        .iter()
+        .filter(|child| kdl_name!(child) == PLIST_ARRAY_ELEMENT)
+        .count();
+    if elements == children.len() {
+        return children
+            .iter()
+            .map(plist_value_from_kdl)
+            .collect::<Result<Vec<_>, _>>()
+            .map(PlistValue::Array);
+    }
+    if elements > 0 {
+        return Err(ConfigError::new_kdl_error(
+            format!(
+                "The launchd key {:?} mixes array elements (`-`) with named entries: a plist value \
+                 is an array or a dictionary, not both",
+                kdl_name!(kdl_key)
+            ),
+            kdl_key.span().offset(),
+            kdl_key.span().len(),
+        ));
+    }
+    children
+        .iter()
+        .map(|child| Ok((kdl_name!(child).to_owned(), plist_value_from_kdl(child)?)))
+        .collect::<Result<Vec<_>, ConfigError>>()
+        .map(PlistValue::Dict)
+}
+
+/// One plist value back into the KDL that would have produced it.
+fn plist_value_to_kdl(name: &str, value: &PlistValue) -> KdlNode {
+    let mut node = KdlNode::new(name.to_owned());
+    match value {
+        PlistValue::String(value) => node.push(KdlValue::String(value.to_owned())),
+        PlistValue::Integer(value) => node.push(KdlValue::Base10(*value)),
+        PlistValue::Bool(value) => node.push(KdlValue::Bool(*value)),
+        PlistValue::Array(values) => {
+            let mut children = KdlDocument::new();
+            for value in values {
+                children
+                    .nodes_mut()
+                    .push(plist_value_to_kdl(PLIST_ARRAY_ELEMENT, value));
+            }
+            node.set_children(children);
+        },
+        PlistValue::Dict(entries) => {
+            let mut children = KdlDocument::new();
+            for (entry_name, value) in entries {
+                children
+                    .nodes_mut()
+                    .push(plist_value_to_kdl(entry_name, value));
+            }
+            node.set_children(children);
+        },
+    }
+    node
+}
+
 /// Every top-level node a config may hold: the blocks [`Config::from_kdl`] reads, every option
 /// [`Options::from_kdl`] reads, `layout` (a layout file goes through the same parse for the
 /// options it carries) and `remote_hosts` (read by the MCP server from the same file). Anything
@@ -3598,6 +3746,53 @@ impl Options {
         let scrollback_lines_to_serialize =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "scrollback_lines_to_serialize")
                 .map(|(v, _)| v as usize);
+        let snapshot_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "snapshot_dir")
+            .map(|(string, _entry)| expand_path(string));
+        let session_snapshot_limit =
+            kdl_property_first_arg_as_i64_or_error!(kdl_options, "session_snapshot_limit")
+                .map(|(v, _)| v.max(0) as usize);
+        let bell_clear_delay_ms =
+            kdl_property_first_arg_as_i64_or_error!(kdl_options, "bell_clear_delay_ms")
+                .map(|(delay, _entry)| delay.max(0) as u64);
+        let terminal_title_template =
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "terminal_title_template")
+                .map(|(template, _entry)| template.to_string());
+        let session_aliases = match kdl_options.get("session_aliases") {
+            Some(kdl_session_aliases) => Some(Self::session_aliases_from_kdl(kdl_session_aliases)?),
+            None => None,
+        };
+        let session_service = match kdl_options.get("session_service") {
+            Some(kdl_session_service) => Some(Self::session_service_from_kdl(kdl_session_service)?),
+            None => None,
+        };
+        let resurrect_command_hints = match kdl_options.get("resurrect_command_hints") {
+            Some(kdl_hints) => Some(Self::resurrect_command_hints_from_kdl(kdl_hints)?),
+            None => None,
+        };
+        let resurrect_commands = Self::resurrect_commands_from_kdl(kdl_options);
+        let default_floating_size = match kdl_options.get("default_floating_size") {
+            Some(kdl_default_floating_size) => Some(Self::default_floating_size_from_kdl(
+                kdl_default_floating_size,
+            )?),
+            None => None,
+        };
+        let session_restart_drop_env = match kdl_options.get("session_restart_drop_env") {
+            Some(kdl_drop_env) => Some(
+                kdl_string_arguments!(kdl_drop_env)
+                    .iter()
+                    .map(|pattern| pattern.to_string())
+                    .collect(),
+            ),
+            None => None,
+        };
+        let pane_frame_agent_name =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frame_agent_name")
+                .map(|(v, _)| v);
+        let detect_agents =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "detect_agents").map(|(v, _)| v);
+        let session_up_resume =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "session_up_resume")
+                .map(|(v, _)| v);
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -4350,6 +4545,514 @@ impl Options {
         Some(node)
     }
 
+    /// The `session_up_resume` node: whether a plain `session up` reaches the snapshot archive.
+    fn session_up_resume_to_kdl(&self) -> Option<KdlNode> {
+        let session_up_resume = self.session_up_resume?;
+        let mut node = KdlNode::new("session_up_resume");
+        node.push(KdlValue::Bool(session_up_resume));
+        Some(node)
+    }
+    fn session_restart_drop_env_to_kdl(&self) -> Option<KdlNode> {
+        let patterns = self.session_restart_drop_env.as_ref()?;
+        if patterns.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("session_restart_drop_env");
+        for pattern in patterns {
+            node.push(KdlValue::String(pattern.to_owned()));
+        }
+        Some(node)
+    }
+    fn session_aliases_from_kdl(
+        kdl_session_aliases: &KdlNode,
+    ) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut session_aliases = BTreeMap::new();
+        for session_alias in
+            kdl_children_nodes_or_error!(kdl_session_aliases, "empty session_aliases block")
+        {
+            let session_name = kdl_name!(session_alias);
+            let alias =
+                kdl_first_entry_as_string!(session_alias).ok_or(ConfigError::new_kdl_error(
+                    format!("Failed to parse session alias: {:?}", session_name),
+                    session_alias.span().offset(),
+                    session_alias.span().len(),
+                ))?;
+            session_aliases.insert(session_name.into(), alias.to_string());
+        }
+        Ok(session_aliases)
+    }
+    /// The `default_floating_size` block: the size a floating pane gets when it asks for none.
+    ///
+    /// Both entries are optional and independent, so a config can widen floating panes without
+    /// touching their height. A bad value is an error here, at parse time, rather than a silently
+    /// ignored key - a floating pane that quietly stayed half-size would look like the feature
+    /// does not work.
+    fn default_floating_size_from_kdl(
+        kdl_default_floating_size: &KdlNode,
+    ) -> Result<DefaultFloatingSize, ConfigError> {
+        let mut default_floating_size = DefaultFloatingSize::default();
+        for entry in kdl_children_nodes_or_error!(
+            kdl_default_floating_size,
+            "empty default_floating_size block"
+        ) {
+            let entry_name = kdl_name!(entry);
+            if entry_name != "width" && entry_name != "height" {
+                note_unknown(
+                    entry.span().offset(),
+                    format!(
+                        "unknown default_floating_size entry {:?}, ignored (expected width or \
+                         height)",
+                        entry_name
+                    ),
+                );
+                continue;
+            }
+            let raw_value = entry
+                .entries()
+                .iter()
+                .next()
+                .and_then(|e| {
+                    e.value()
+                        .as_string()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.value().as_i64().map(|i| i.to_string()))
+                })
+                .ok_or_else(|| {
+                    ConfigError::new_kdl_error(
+                        format!(
+                            "default_floating_size {} needs a value, eg. {} \"80%\"",
+                            entry_name, entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    )
+                })?;
+            let size = PercentOrFixed::from_str(&raw_value)
+                .ok()
+                .filter(|size| !size.is_zero())
+                .ok_or_else(|| {
+                    ConfigError::new_kdl_error(
+                        format!(
+                            "Invalid default_floating_size {}: {:?} (expected a percent like \
+                             \"80%\" or a column/row count like \"120\", and not zero)",
+                            entry_name, raw_value
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    )
+                })?;
+            match entry_name {
+                "width" => default_floating_size.width = Some(size),
+                // any other name was passed over above
+                _ => default_floating_size.height = Some(size),
+            }
+        }
+        Ok(default_floating_size)
+    }
+    fn default_floating_size_to_kdl(&self) -> Option<KdlNode> {
+        let default_floating_size = self.default_floating_size.as_ref()?;
+        if default_floating_size.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("default_floating_size");
+        let mut entries = KdlDocument::new();
+        for (name, size) in [
+            ("width", &default_floating_size.width),
+            ("height", &default_floating_size.height),
+        ] {
+            if let Some(size) = size {
+                let mut entry = KdlNode::new(name);
+                match size {
+                    PercentOrFixed::Percent(percent) => {
+                        entry.push(format!("{}%", percent));
+                    },
+                    PercentOrFixed::Fixed(fixed) => {
+                        entry.push(KdlValue::Base10(*fixed as i64));
+                    },
+                };
+                entries.nodes_mut().push(entry);
+            }
+        }
+        node.set_children(entries);
+        Some(node)
+    }
+    /// The `session_service` block: extra directives for the unit `zellij session enable` writes.
+    ///
+    /// Every entry is passed through verbatim - zellij models neither schema - so the only thing
+    /// checked here is that an entry does not take over a part of the unit the generator owns. It
+    /// is checked HERE, at parse time, rather than when a unit is written, so that a config error
+    /// is reported by `zellij setup --check` and by every other command, not only by the one
+    /// command that would have used it.
+    ///
+    /// An entry this build does not KNOW is a different case from one whose value is wrong, and
+    /// only the second is an error. An unknown name - at any depth in this block - is kept in
+    /// [`SessionServiceOptions::unknown_entries`], logged, and otherwise ignored, so a new key can
+    /// go into a shared config before every machine has the binary that reads it. That is how an
+    /// unknown TOP-LEVEL key has always behaved; a block that parses its own children lost the
+    /// property by accident, and a nested key and `launchd { env }` each cost a config that would
+    /// not load on any machine that was behind.
+    fn session_service_from_kdl(
+        kdl_session_service: &KdlNode,
+    ) -> Result<SessionServiceOptions, ConfigError> {
+        let mut session_service = SessionServiceOptions::default();
+        for init_system in
+            kdl_children_nodes_or_error!(kdl_session_service, "empty session_service block")
+        {
+            match kdl_name!(init_system) {
+                // not an init system but a property of the install: which binary the unit is to
+                // name. It sits in this block because that is the block the unit is generated from
+                "pin_exe" => {
+                    session_service.pin_exe = pin_exe_from_kdl(init_system)?;
+                },
+                // like `pin_exe`, not an init system but a property of how the install is used
+                "restart_via_launchd" => {
+                    session_service.restart_via_launchd =
+                        Some(kdl_first_entry_as_bool!(init_system).ok_or_else(|| {
+                            ConfigError::new_kdl_error(
+                                "restart_via_launchd takes true or false".to_owned(),
+                                init_system.span().offset(),
+                                init_system.span().len(),
+                            )
+                        })?);
+                },
+                "systemd" => {
+                    for section in kdl_children_nodes_or_error!(init_system, "empty systemd block")
+                    {
+                        let section_name = kdl_name!(section);
+                        if !SessionServiceOptions::is_known_systemd_section(section_name) {
+                            session_service.note_unknown_entry(format!(
+                                "unknown systemd section {:?} in session_service, ignored \
+                                 (expected unit, service or install)",
+                                section_name
+                            ));
+                            continue;
+                        }
+                        for directive in kdl_string_arguments!(section) {
+                            session_service
+                                .add_systemd_directive(section_name, directive)
+                                .map_err(|e| {
+                                    ConfigError::new_kdl_error(
+                                        e,
+                                        section.span().offset(),
+                                        section.span().len(),
+                                    )
+                                })?;
+                        }
+                    }
+                },
+                "launchd" => {
+                    for block in kdl_children_nodes_or_error!(init_system, "empty launchd block") {
+                        match kdl_name!(block) {
+                            "keys" => {
+                                for key in kdl_children_nodes_or_error!(block, "empty keys block") {
+                                    let name = kdl_name!(key);
+                                    let value = plist_value_from_kdl(key)?;
+                                    session_service.add_launchd_key(name, value).map_err(|e| {
+                                        ConfigError::new_kdl_error(
+                                            e,
+                                            key.span().offset(),
+                                            key.span().len(),
+                                        )
+                                    })?;
+                                }
+                            },
+                            // The environment the job runs in, which is not the same thing as a
+                            // plist key: these go inside EnvironmentVariables, and a name written
+                            // in `keys` instead lands where launchd never looks.
+                            "env" => {
+                                for entry in kdl_children_nodes_or_error!(block, "empty env block")
+                                {
+                                    let name = kdl_name!(entry);
+                                    let value =
+                                        kdl_first_entry_as_string!(entry).ok_or_else(|| {
+                                            ConfigError::new_kdl_error(
+                                                format!(
+                                                    "{} takes a string value, quoted",
+                                                    kdl_name!(entry)
+                                                ),
+                                                entry.span().offset(),
+                                                entry.span().len(),
+                                            )
+                                        })?;
+                                    session_service.add_launchd_env(name, value).map_err(|e| {
+                                        ConfigError::new_kdl_error(
+                                            e,
+                                            entry.span().offset(),
+                                            entry.span().len(),
+                                        )
+                                    })?;
+                                }
+                            },
+                            other => {
+                                session_service.note_unknown_entry(format!(
+                                    "unknown launchd option {:?} in session_service, ignored \
+                                     (expected a `keys` or `env` block)",
+                                    other
+                                ));
+                            },
+                        }
+                    }
+                },
+                other => {
+                    session_service.note_unknown_entry(format!(
+                        "unknown session_service entry {:?}, ignored (expected systemd, launchd, \
+                         pin_exe or restart_via_launchd)",
+                        other
+                    ));
+                },
+            }
+        }
+        Ok(session_service)
+    }
+    fn session_service_to_kdl(&self) -> Option<KdlNode> {
+        let session_service = self.session_service.as_ref()?;
+        if session_service.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("session_service");
+        let mut init_systems = KdlDocument::new();
+
+        match &session_service.pin_exe {
+            Some(PinnedExe::Canonical) => {
+                let mut pin = KdlNode::new("pin_exe");
+                pin.push(KdlValue::Bool(true));
+                init_systems.nodes_mut().push(pin);
+            },
+            Some(PinnedExe::At(path)) => {
+                let mut pin = KdlNode::new("pin_exe");
+                pin.push(KdlValue::String(path.display().to_string()));
+                init_systems.nodes_mut().push(pin);
+            },
+            None => {},
+        }
+
+        if let Some(via_launchd) = session_service.restart_via_launchd {
+            let mut node = KdlNode::new("restart_via_launchd");
+            node.push(KdlValue::Bool(via_launchd));
+            init_systems.nodes_mut().push(node);
+        }
+
+        let sections = [
+            ("unit", &session_service.systemd.unit),
+            ("service", &session_service.systemd.service),
+            ("install", &session_service.systemd.install),
+        ];
+        if sections.iter().any(|(_, lines)| !lines.is_empty()) {
+            let mut systemd = KdlDocument::new();
+            for (section_name, lines) in sections {
+                if lines.is_empty() {
+                    continue;
+                }
+                let mut section = KdlNode::new(section_name);
+                for line in lines {
+                    section.push(KdlValue::String(line.to_owned()));
+                }
+                systemd.nodes_mut().push(section);
+            }
+            let mut systemd_node = KdlNode::new("systemd");
+            systemd_node.set_children(systemd);
+            init_systems.nodes_mut().push(systemd_node);
+        }
+
+        if !session_service.launchd.is_empty() || !session_service.launchd_env.is_empty() {
+            let mut launchd = KdlDocument::new();
+            if !session_service.launchd.is_empty() {
+                let mut keys = KdlDocument::new();
+                for key in &session_service.launchd {
+                    keys.nodes_mut()
+                        .push(plist_value_to_kdl(&key.name, &key.value));
+                }
+                let mut keys_node = KdlNode::new("keys");
+                keys_node.set_children(keys);
+                launchd.nodes_mut().push(keys_node);
+            }
+            if !session_service.launchd_env.is_empty() {
+                let mut env = KdlDocument::new();
+                for entry in &session_service.launchd_env {
+                    let mut node = KdlNode::new(entry.name.as_str());
+                    node.push(KdlValue::String(entry.value.clone()));
+                    env.nodes_mut().push(node);
+                }
+                let mut env_node = KdlNode::new("env");
+                env_node.set_children(env);
+                launchd.nodes_mut().push(env_node);
+            }
+            let mut launchd_node = KdlNode::new("launchd");
+            launchd_node.set_children(launchd);
+            init_systems.nodes_mut().push(launchd_node);
+        }
+
+        node.set_children(init_systems);
+        Some(node)
+    }
+    /// The `resurrect_command_hints` block: how to record a resumable command when a session is
+    /// serialized.
+    ///
+    /// ```kdl
+    /// resurrect_command_hints {
+    ///     claude { match "claude"; env "CLAUDE_CODE_SESSION_ID"; resume_args "--continue" }
+    /// }
+    /// ```
+    ///
+    /// The block name (`claude` here) is a label - it names the hint in errors and logs and takes
+    /// no part in matching. All three entries are required. `resume_args` is APPENDED to the
+    /// command the pane was observed running, and `{}` in it is optional: a resume flag that needs
+    /// no id carries none.
+    ///
+    /// The old `rewrite` entry, which replaced the whole command line, is WARNED about and its
+    /// hint skipped. It is deliberately not an error: a config error here fails the whole file and
+    /// `zellij` exits before it starts a session, so refusing the key would let an upgraded binary
+    /// brick every machine whose config still carries it. A hint that does not load costs a
+    /// resumable command; a config that does not load costs the session.
+    ///
+    /// An entry this build does not KNOW is the same argument one step further, and is kept in
+    /// [`ResurrectCommandHints::unknown_entries`], logged, and otherwise passed over - so a new
+    /// entry can go into a shared config before every machine has the binary that reads it. Only
+    /// the unknown-NAME case is soft: a name this build knows, given a value it cannot mean, and a
+    /// hint that names no `match`, `env` or `resume_args` at all, are both still the whole config
+    /// failing. The operator meant that hint and is not getting it.
+    fn resurrect_command_hints_from_kdl(
+        kdl_hints: &KdlNode,
+    ) -> Result<ResurrectCommandHints, ConfigError> {
+        let mut hints = ResurrectCommandHints::default();
+        for kdl_hint in
+            kdl_children_nodes_or_error!(kdl_hints, "empty resurrect_command_hints block")
+        {
+            let name = kdl_name!(kdl_hint).to_owned();
+            let mut match_command: Option<String> = None;
+            let mut env: Option<String> = None;
+            let mut resume_args: Option<String> = None;
+            let mut retired_rewrite: Option<String> = None;
+            for entry in kdl_children_nodes_or_error!(
+                kdl_hint,
+                format!("empty resurrect_command_hints entry: {:?}", name)
+            ) {
+                let entry_name = kdl_name!(entry);
+                // checked BEFORE the value is read: every entry this build knows carries a string,
+                // and an entry it does not know is not held to that rule on its way to being
+                // ignored
+                if !ResurrectCommandHints::is_known_hint_entry(entry_name) {
+                    hints.note_unknown_entry(format!(
+                        "unknown resurrect_command_hints entry {:?} in hint {:?}, ignored \
+                         (expected match, env or resume_args)",
+                        entry_name, name
+                    ));
+                    continue;
+                }
+                let value = kdl_first_entry_as_string!(entry)
+                    .ok_or(ConfigError::new_kdl_error(
+                        format!(
+                            "resurrect_command_hints {:?}: {:?} needs a string value",
+                            name, entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    ))?
+                    .to_owned();
+                match entry_name {
+                    "match" => match_command = Some(value),
+                    "env" => env = Some(value),
+                    "resume_args" => resume_args = Some(value),
+                    "rewrite" => retired_rewrite = Some(value),
+                    // unreachable: is_known_hint_entry above lists exactly these names
+                    _ => {},
+                }
+            }
+            if let Some(rewrite) = retired_rewrite {
+                let outcome = if resume_args.is_some() {
+                    "the resume_args beside it is used"
+                } else {
+                    "this hint is SKIPPED"
+                };
+                log::warn!(
+                    "resurrect_command_hints {:?}: \"rewrite\" is retired and {}. It replaced the \
+                     whole command line, including arguments the pane never ran. Replace it with \
+                     \"resume_args\", holding only the arguments to append: \
+                     resume_args \"--continue\". (ignored value: {:?})",
+                    name,
+                    outcome,
+                    rewrite
+                );
+                if resume_args.is_none() {
+                    continue;
+                }
+            }
+            let missing = |field: &str| {
+                ConfigError::new_kdl_error(
+                    format!("resurrect_command_hints {:?} has no {}", name, field),
+                    kdl_hint.span().offset(),
+                    kdl_hint.span().len(),
+                )
+            };
+            let match_command = match_command.ok_or_else(|| missing("match"))?;
+            let env = env.ok_or_else(|| missing("env"))?;
+            let resume_args = resume_args.ok_or_else(|| missing("resume_args"))?;
+            if resume_args.split_whitespace().next().is_none() {
+                return Err(ConfigError::new_kdl_error(
+                    format!(
+                        "resurrect_command_hints {:?}: resume_args is empty, so the hint could \
+                         never add anything",
+                        name
+                    ),
+                    kdl_hint.span().offset(),
+                    kdl_hint.span().len(),
+                ));
+            }
+            hints.push(ResurrectCommandHint {
+                name,
+                match_command,
+                env,
+                resume_args,
+            });
+        }
+        Ok(hints)
+    }
+    fn resurrect_command_hints_to_kdl(&self) -> Option<KdlNode> {
+        let hints = self.resurrect_command_hints.as_ref()?;
+        if hints.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("resurrect_command_hints");
+        let mut children = KdlDocument::new();
+        for hint in &hints.hints {
+            let mut entries = KdlDocument::new();
+            for (name, value) in [
+                ("match", &hint.match_command),
+                ("env", &hint.env),
+                ("resume_args", &hint.resume_args),
+            ] {
+                let mut entry = KdlNode::new(name);
+                entry.push(KdlValue::String(value.to_owned()));
+                entries.nodes_mut().push(entry);
+            }
+            let mut hint_node = KdlNode::new(hint.name.as_str());
+            hint_node.set_children(entries);
+            children.nodes_mut().push(hint_node);
+        }
+        node.set_children(children);
+        Some(node)
+    }
+    fn expect_full_disk_access_to_kdl(&self) -> Option<KdlNode> {
+        self.expect_full_disk_access.map(|expect| {
+            let mut node = KdlNode::new("expect_full_disk_access");
+            node.push(KdlValue::Bool(expect));
+            node
+        })
+    }
+    fn stale_build_notice_to_kdl(&self) -> Option<KdlNode> {
+        self.stale_build_notice.map(|notice| {
+            let mut node = KdlNode::new("stale_build_notice");
+            node.push(KdlValue::Bool(notice));
+            node
+        })
+    }
+    fn plugin_watch_to_kdl(&self) -> Option<KdlNode> {
+        self.plugin_watch.map(|plugin_watch| {
+            let mut node = KdlNode::new("plugin_watch");
+            node.push(KdlValue::Bool(plugin_watch));
+            node
+        })
+    }
     fn mouse_mode_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
@@ -12614,6 +13317,23 @@ fn terminal_title_is_unset_by_default() {
 }
 
 #[test]
+fn session_restart_drop_env_config_parsing() {
+    let config_with_drop_env = r#"
+        session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
+    "#;
+    let config = Config::from_kdl(config_with_drop_env, None).unwrap();
+    assert_eq!(
+        config.options.session_restart_drop_env,
+        Some(vec!["MY_VAR".to_owned(), "MY_PREFIX_*".to_owned()])
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
 fn session_up_resume_config_parsing() {
     let config_contents = r#"
         session_up_resume false
@@ -12626,6 +13346,12 @@ fn session_up_resume_config_parsing() {
 fn session_up_resume_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_up_resume, None);
+}
+
+#[test]
+fn session_restart_drop_env_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.session_restart_drop_env, None);
 }
 
 #[test]
@@ -12793,6 +13519,466 @@ fn a_retired_report_pane_env_key_warns_and_loads() {
     );
 }
 
+#[test]
+fn session_service_config_parsing() {
+    let config_with_session_service = r#"
+        session_service {
+            systemd {
+                unit "After=network.target" "Before=some-other.service"
+                service "Nice=-5"
+            }
+            launchd {
+                keys {
+                    ProcessType "Interactive"
+                    Nice 5
+                    AbandonProcessGroup true
+                }
+            }
+        }
+    "#;
+    let config = Config::from_kdl(config_with_session_service, None).unwrap();
+    let session_service = config.options.session_service.clone().unwrap();
+    assert_eq!(
+        session_service.systemd.unit,
+        vec![
+            "After=network.target".to_owned(),
+            "Before=some-other.service".to_owned()
+        ]
+    );
+    assert_eq!(session_service.systemd.service, vec!["Nice=-5".to_owned()]);
+    assert!(session_service.systemd.install.is_empty());
+    assert_eq!(
+        session_service.launchd,
+        vec![
+            LaunchdKey {
+                name: "ProcessType".to_owned(),
+                value: PlistValue::String("Interactive".to_owned())
+            },
+            LaunchdKey {
+                name: "Nice".to_owned(),
+                value: PlistValue::Integer(5)
+            },
+            LaunchdKey {
+                name: "AbandonProcessGroup".to_owned(),
+                value: PlistValue::Bool(true)
+            },
+        ]
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+/// A plist array and a plist dictionary, spelled in KDL and surviving the round trip.
+///
+/// The keys that need them are the ones people actually reach for once the plist is generated:
+/// `WatchPaths` is an array, `KeepAlive` in its useful form is a dictionary, and neither could be
+/// written at all while a value had to be a scalar.
+#[test]
+fn launchd_keys_carry_arrays_and_dictionaries() {
+    let config = Config::from_kdl(
+        r#"
+        session_service {
+            launchd {
+                keys {
+                    WatchPaths {
+                        - "/one/path"
+                        - "/another/path"
+                    }
+                    KeepAlive {
+                        SuccessfulExit false
+                        Crashed true
+                    }
+                    StartCalendarInterval {
+                        - {
+                            Hour 3
+                            Minute 30
+                        }
+                    }
+                }
+            }
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let launchd = config.options.session_service.clone().unwrap().launchd;
+    assert_eq!(
+        launchd[0].value,
+        PlistValue::Array(vec![
+            PlistValue::String("/one/path".to_owned()),
+            PlistValue::String("/another/path".to_owned()),
+        ])
+    );
+    assert_eq!(
+        launchd[1].value,
+        PlistValue::Dict(vec![
+            ("SuccessfulExit".to_owned(), PlistValue::Bool(false)),
+            ("Crashed".to_owned(), PlistValue::Bool(true)),
+        ])
+    );
+    // an array OF dictionaries, which is the shape StartCalendarInterval takes for several times
+    assert_eq!(
+        launchd[2].value,
+        PlistValue::Array(vec![PlistValue::Dict(vec![
+            ("Hour".to_owned(), PlistValue::Integer(3)),
+            ("Minute".to_owned(), PlistValue::Integer(30)),
+        ])])
+    );
+
+    let written_out = config.to_string(false);
+    let read_back = Config::from_kdl(&written_out, None).unwrap();
+    assert_eq!(read_back.options, config.options);
+}
+
+/// A block that is neither an array nor a dictionary is refused rather than resolved one way.
+#[test]
+fn a_launchd_value_is_an_array_or_a_dictionary_not_both() {
+    let mixed = Config::from_kdl(
+        r#"
+        session_service {
+            launchd {
+                keys {
+                    KeepAlive {
+                        - "one"
+                        SuccessfulExit false
+                    }
+                }
+            }
+        }
+    "#,
+        None,
+    );
+    assert!(mixed.is_err(), "a mixed block should not parse");
+}
+
+/// The guard against pinning the socket directory has to see into a nested value too.
+#[test]
+fn a_forbidden_name_nested_inside_a_value_is_still_refused() {
+    let nested = Config::from_kdl(
+        r#"
+        session_service {
+            launchd {
+                keys {
+                    EnvironmentOverrides {
+                        ZELLIJ_SOCKET_DIR "/tmp/somewhere"
+                    }
+                }
+            }
+        }
+    "#,
+        None,
+    );
+    assert!(
+        nested.is_err(),
+        "a forbidden name inside a dictionary should be refused"
+    );
+}
+
+/// `pin_exe` is a switch that may also be a path, and both spellings have to survive the round trip
+/// through KDL - a config written back out with the pin silently dropped would turn the feature off
+/// on the next `zellij setup --dump-config`.
+#[test]
+fn pin_exe_is_a_switch_or_a_path() {
+    let on = Config::from_kdl(
+        "session_service {
+    pin_exe true
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        on.options.session_service.clone().unwrap().pin_exe,
+        Some(PinnedExe::Canonical)
+    );
+    assert_eq!(
+        Config::from_kdl(&on.to_string(false), None)
+            .unwrap()
+            .options,
+        on.options
+    );
+
+    let at = Config::from_kdl(
+        "session_service {\n    pin_exe \"/opt/zellij/bin/zellij\"\n}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        at.options.session_service.clone().unwrap().pin_exe,
+        Some(PinnedExe::At(PathBuf::from("/opt/zellij/bin/zellij")))
+    );
+    assert_eq!(
+        Config::from_kdl(&at.to_string(false), None)
+            .unwrap()
+            .options,
+        at.options
+    );
+
+    // written out as false, and read back as the off it says
+    let off = Config::from_kdl(
+        "session_service {
+    pin_exe false
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(off.options.session_service.unwrap().pin_exe, None);
+}
+
+/// A path is expanded like every other path in the config, so one config can be read on machines
+/// whose home directories differ.
+#[test]
+fn a_pinned_path_expands_like_any_other_config_path() {
+    std::env::set_var("ZELLIJ_TEST_PIN_ROOT", "/opt/zellij");
+    let config = Config::from_kdl(
+        "session_service {\n    pin_exe \"$ZELLIJ_TEST_PIN_ROOT/bin/zellij\"\n}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        config.options.session_service.unwrap().pin_exe,
+        Some(PinnedExe::At(PathBuf::from("/opt/zellij/bin/zellij")))
+    );
+    std::env::remove_var("ZELLIJ_TEST_PIN_ROOT");
+}
+
+#[test]
+fn pin_exe_refuses_a_value_that_is_neither() {
+    let error = Config::from_kdl(
+        "session_service {
+    pin_exe 5
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(format!("{:?}", error).contains("pin_exe"));
+}
+
+/// The escape hatch for `session up` deferring to the launch agent. Default-on is the half worth
+/// asserting: a machine whose config nobody has touched must get the deferral, or the fix reaches
+/// only the machines that were edited.
+#[test]
+fn restart_via_launchd_is_on_unless_the_config_turns_it_off() {
+    use crate::session_service::configured_restart_via_launchd;
+
+    let unset = Config::from_kdl("", None).unwrap();
+    assert!(configured_restart_via_launchd(
+        unset.options.session_service.as_ref()
+    ));
+
+    let off = Config::from_kdl(
+        "session_service {
+    restart_via_launchd false
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        off.options
+            .session_service
+            .clone()
+            .unwrap()
+            .restart_via_launchd,
+        Some(false)
+    );
+    assert!(!configured_restart_via_launchd(
+        off.options.session_service.as_ref()
+    ));
+    // and it survives being written out and read back, like every other key in this block
+    assert_eq!(
+        Config::from_kdl(&off.to_string(false), None)
+            .unwrap()
+            .options,
+        off.options
+    );
+
+    let on = Config::from_kdl(
+        "session_service {
+    restart_via_launchd true
+}",
+        None,
+    )
+    .unwrap();
+    assert!(configured_restart_via_launchd(
+        on.options.session_service.as_ref()
+    ));
+}
+
+/// The `env` block: the launchd side of what `systemd { service "Environment=..." }` already said.
+/// It has to survive being written out and read back, like every other entry in this block.
+#[test]
+fn a_launchd_env_block_round_trips_through_the_config() {
+    let config = Config::from_kdl(
+        "session_service {
+    launchd {
+        env {
+            SSH_AUTH_SOCK \"/private/tmp/agent/Listeners\"
+            HOMEBREW_PREFIX \"/opt/homebrew\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap();
+    let parsed = config.options.session_service.clone().unwrap();
+    assert_eq!(
+        parsed
+            .launchd_env
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("SSH_AUTH_SOCK", "/private/tmp/agent/Listeners"),
+            ("HOMEBREW_PREFIX", "/opt/homebrew"),
+        ],
+        "the config's order is the order the dictionary is written in"
+    );
+    // the block alone is worth writing, so a config carrying only this does not round-trip to
+    // nothing
+    assert!(config.to_string(false).contains("env"));
+    assert_eq!(
+        Config::from_kdl(&config.to_string(false), None)
+            .unwrap()
+            .options,
+        config.options
+    );
+
+    // and it sits beside the older hatch rather than replacing it
+    let both = Config::from_kdl(
+        "session_service {
+    launchd {
+        keys {
+            ProcessType \"Interactive\"
+        }
+        env {
+            SSH_AUTH_SOCK \"/private/tmp/agent/Listeners\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap();
+    let parsed = both.options.session_service.clone().unwrap();
+    assert_eq!(parsed.launchd.len(), 1);
+    assert_eq!(parsed.launchd_env.len(), 1);
+    assert_eq!(
+        Config::from_kdl(&both.to_string(false), None)
+            .unwrap()
+            .options,
+        both.options
+    );
+}
+
+/// A child block this build does not know is ignored with a warning naming what the block does
+/// accept - `environment` for `env` is the misspelling that reads as if it should work. What this
+/// build owes in return is an error naming the entry when the value is wrong.
+#[test]
+fn the_launchd_block_names_env_among_what_it_accepts() {
+    let config = Config::from_kdl(
+        "session_service {
+    launchd {
+        environment {
+            SSH_AUTH_SOCK \"/private/tmp/agent/Listeners\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap();
+    let session_service = config.options.session_service.as_ref().unwrap();
+    assert_eq!(
+        session_service.unknown_entries.len(),
+        1,
+        "{:?}",
+        session_service.unknown_entries
+    );
+    let warning = &session_service.unknown_entries[0];
+    assert!(warning.contains("environment"), "{}", warning);
+    assert!(warning.contains("env"), "{}", warning);
+    assert!(warning.contains("keys"), "{}", warning);
+    // nothing of the ignored block reached the plist
+    assert!(session_service.launchd_env.is_empty());
+    assert!(session_service.launchd.is_empty());
+
+    // an environment variable is a string, and a bare word is not one
+    let error = Config::from_kdl(
+        "session_service {
+    launchd {
+        env {
+            SSH_AUTH_SOCK true
+        }
+    }
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("SSH_AUTH_SOCK"),
+        "{:?}",
+        error
+    );
+
+    // the names no unit may pin are refused here as well as in `keys`
+    let error = Config::from_kdl(
+        "session_service {
+    launchd {
+        env {
+            ZELLIJ_SOCKET_DIR \"/tmp/mine\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("ZELLIJ_SOCKET_DIR"),
+        "{:?}",
+        error
+    );
+}
+
+/// The `session_service` block parses its OWN children, and an unknown one is ignored the way an
+/// unknown top-level key is - with a warning that names what the block does accept.
+#[test]
+fn session_service_names_restart_via_launchd_among_what_it_accepts() {
+    let config = Config::from_kdl(
+        "session_service {
+    restart_when_i_say_so true
+}",
+        None,
+    )
+    .unwrap();
+    let warnings = config
+        .options
+        .session_service
+        .as_ref()
+        .unwrap()
+        .unknown_entries
+        .clone();
+    assert_eq!(warnings.len(), 1, "{:?}", warnings);
+    assert!(
+        warnings[0].contains("restart_via_launchd"),
+        "{}",
+        warnings[0]
+    );
+
+    // and it takes a bool, not a word
+    let error = Config::from_kdl(
+        "session_service {
+    restart_via_launchd \"sometimes\"
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("restart_via_launchd"),
+        "{:?}",
+        error
+    );
+}
+
 /// No `session_service` key takes a value from a closed set, so it has no "unknown value" to fall
 /// back from: a string `pin_exe` is a path, and every other value check is a type or a range. Those
 /// are malformed known settings and still fail; the block's unknown NAMES warn, as above.
@@ -12813,6 +13999,12 @@ fn session_service_values_are_types_and_ranges_not_named_choices() {
     ] {
         assert!(Config::from_kdl(malformed, None).is_err(), "{}", malformed);
     }
+}
+
+#[test]
+fn session_service_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.session_service, None);
 }
 
 /// The rollout property, at every depth this block parses: a name this build does not know costs a
@@ -13118,6 +14310,135 @@ fn a_hint_entry_it_does_not_know_is_ignored_and_the_hint_still_loads() {
         serialized
     );
     assert!(serialized.contains("resume_args"), "{}", serialized);
+}
+
+/// The upgrade path that must never brick a machine: a config written for the retired `rewrite`
+/// entry still LOADS. A config error here is fatal - `zellij` prints the parse failure and exits
+/// before it starts a session - so refusing the key would stop every machine whose config still
+/// carries it. The stale hint is dropped and the rest of the file survives untouched.
+#[test]
+fn a_config_still_using_the_retired_rewrite_entry_still_loads() {
+    let config = Config::from_kdl(
+        r#"default_shell "fish"
+resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+    }
+    opencode {
+        match "opencode"
+        env "OPENCODE_SESSION_ID"
+        resume_args "--session {}"
+    }
+}"#,
+        None,
+    )
+    .expect("a retired hint entry must not fail the whole config");
+
+    // the rest of the file is untouched
+    assert_eq!(
+        config.options.default_shell,
+        Some(std::path::PathBuf::from("fish"))
+    );
+
+    // the stale hint is dropped, the sound one beside it is kept
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.hints,
+        vec![ResurrectCommandHint {
+            name: "opencode".to_owned(),
+            match_command: "opencode".to_owned(),
+            env: "OPENCODE_SESSION_ID".to_owned(),
+            resume_args: "--session {}".to_owned(),
+        }]
+    );
+    assert!(hints.hint_for("claude").is_none());
+}
+
+/// A config whose ONLY hint is the retired one loads to no hints at all - not to an error, and not
+/// to a hint with no arguments to add.
+#[test]
+fn a_lone_retired_hint_leaves_no_hints() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+    }
+}"#,
+        None,
+    )
+    .expect("a retired hint entry must not fail the whole config");
+    assert!(config
+        .options
+        .resurrect_command_hints
+        .as_ref()
+        .unwrap()
+        .is_empty());
+}
+
+/// Mid-migration, with both entries written, the new one is honoured and the retired one ignored.
+#[test]
+fn resume_args_wins_over_a_retired_rewrite_beside_it() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+        resume_args "--continue"
+    }
+}"#,
+        None,
+    )
+    .unwrap();
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.hints,
+        vec![ResurrectCommandHint {
+            name: "claude".to_owned(),
+            match_command: "claude".to_owned(),
+            env: "CLAUDE_CODE_SESSION_ID".to_owned(),
+            resume_args: "--continue".to_owned(),
+        }]
+    );
+}
+
+/// The entries the generator owns are rejected where a person can see it - at parse time, so that
+/// `zellij setup --check` reports them like any other config error rather than the unit quietly
+/// becoming one that builds an invisible session.
+#[test]
+fn session_service_refuses_the_entries_the_generator_owns() {
+    let offenders = [
+        (
+            r#"session_service { systemd { service "ExecStart=/bin/false" } }"#,
+            "ExecStart",
+        ),
+        (
+            r#"session_service { systemd { service "Environment=TMPDIR=/tmp/mine" } }"#,
+            "TMPDIR",
+        ),
+        (
+            r#"session_service { launchd { keys { Label "mine" } } }"#,
+            "Label",
+        ),
+        (
+            r#"session_service { launchd { keys { EnvironmentVariables "mine" } } }"#,
+            "EnvironmentVariables",
+        ),
+    ];
+    for (config, offender) in offenders {
+        let error = format!("{:?}", Config::from_kdl(config, None).unwrap_err());
+        assert!(
+            error.contains(offender),
+            "{:?} was not reported as naming {}: {}",
+            config,
+            offender,
+            error
+        );
+    }
 }
 
 #[cfg(test)]

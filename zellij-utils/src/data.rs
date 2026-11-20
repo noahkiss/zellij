@@ -3847,6 +3847,10 @@ pub struct PaneProgramStatus {
     pub working: u32,
 }
 
+fn is_zero_count(count: &u32) -> bool {
+    *count == 0
+}
+
 /// One pane's screen, in a `dump-screen` sweep of several: one JSON object per line.
 ///
 /// A sweep prints these rather than a single array because the content of one pane can be megabytes

@@ -1571,21 +1571,27 @@ impl Drop for SessionMetaData {
         let _ = self.senders.send_to_screen(ScreenInstruction::Exit);
         let _ = self.senders.send_to_plugin(PluginInstruction::Exit);
         let _ = self.senders.send_to_pty_writer(PtyWriteInstruction::Exit);
-        let _ = self.senders.send_to_background_jobs(BackgroundJob::Exit);
-        if let Some(screen_thread) = self.screen_thread.take() {
-            let _ = screen_thread.join();
-        }
+        // pty before screen: dropping `Pty` is what signals the pane shells, and screen can take
+        // an unbounded amount of time to wind down (it is still being fed by panes that are alive
+        // until pty kills them). Joining screen first made the shells outlive the whole teardown.
         if let Some(pty_thread) = self.pty_thread.take() {
-            let _ = pty_thread.join();
+            join_or_give_up(pty_thread, "pty");
+        }
+        if let Some(screen_thread) = self.screen_thread.take() {
+            join_or_give_up(screen_thread, "screen");
         }
         if let Some(plugin_thread) = self.plugin_thread.take() {
-            let _ = plugin_thread.join();
+            join_or_give_up(plugin_thread, "plugin");
         }
         if let Some(pty_writer_thread) = self.pty_writer_thread.take() {
-            let _ = pty_writer_thread.join();
+            join_or_give_up(pty_writer_thread, "pty writer");
         }
+        // background jobs are told to exit only once the plugin thread has: a `web_request` or a
+        // `run_command` a plugin issues from its `BeforeClose` handler is dispatched from here, and
+        // told to exit alongside the others this thread was gone before the handler had run
+        let _ = self.senders.send_to_background_jobs(BackgroundJob::Exit);
         if let Some(background_jobs_thread) = self.background_jobs_thread.take() {
-            let _ = background_jobs_thread.join();
+            join_or_give_up(background_jobs_thread, "background jobs");
         }
     }
 }
@@ -4859,7 +4865,9 @@ pub fn start_server_impl(
                             .send_to_plugin(PluginInstruction::RemoveClient(client_id));
                     }
                     if !session_state.read().unwrap().active_clients_are_connected() {
-                        *session_data.write().unwrap() = None;
+                        // the session itself is torn down after the loop, in the same order as
+                        // every other exit path -- dropping it here joined the session threads
+                        // while holding the write lock, which blocks every route thread
                         let client_ids_to_cleanup: Vec<ClientId> = session_state
                             .read()
                             .unwrap()
@@ -5859,8 +5867,38 @@ pub fn start_server_impl(
         }
     }
 
-    // Drop cached session data before exit.
-    *session_data.write().unwrap() = None;
+    // The accept loop is still running and will be until the process goes. Tell it to stop turning
+    // connections into clients: from here on there is nobody to serve them.
+    shutting_down.store(true, Ordering::Release);
+
+    // Nobody reads `to_server` past this point and it is bounded, so any thread that sends into it
+    // while winding down would block there forever and never reach its own exit — with the session
+    // threads joined below, that is a teardown that never finishes. Keep the channel drained. The
+    // panic hook holds a sender for the life of the process, so this thread is left detached
+    // rather than joined; it costs nothing and the process is about to go.
+    let _ = thread::Builder::new()
+        .name("server_teardown_drain".to_string())
+        .spawn(move || while server_receiver.recv().is_ok() {});
+
+    // Take the session out of the lock before dropping it. Its `Drop` joins every session thread,
+    // and doing that while holding the write lock blocks every route thread that touches it.
+    let session = take_session_within(&session_data, SESSION_LOCK_TIMEOUT);
+    drop(session);
+
+    // Archive after the last serialize and before the socket goes: the socket disappearing is what
+    // `delete-session` waits on, so a snapshot cut here is on disk before anything can delete the
+    // folder it was copied from.
+    if let Err(e) = archive_session_info(
+        &own_session_name,
+        SnapshotReason::Shutdown,
+        &snapshot_settings(),
+    ) {
+        log::error!(
+            "Failed to archive session {:?} on exit: {}",
+            own_session_name,
+            e
+        );
+    }
 
     server_socket.remove_on_exit();
     if delete_session_on_exit {

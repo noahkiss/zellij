@@ -367,6 +367,8 @@ impl WasmBridge {
             cached_worker_messages: HashMap::new(),
             loading_plugins: HashSet::new(),
             plugins_to_unload_once_loaded: HashSet::new(),
+            failed_plugins: HashMap::new(),
+            plugin_pane_placements: HashMap::new(),
             pending_plugin_reloads: HashSet::new(),
             zellij_cwd,
             session_env_vars,
@@ -475,6 +477,13 @@ impl WasmBridge {
                     Some(plugin) => plugin,
                     None => {
                         self.next_plugin_id += 1;
+        match run {
+            Some(run) => {
+                let plugin = match PluginConfig::from_run_plugin(run) {
+                    Some(plugin) => plugin,
+                    None => {
+                        self.next_plugin_id += 1;
+                        self.failed_plugins.insert(plugin_id, run.clone());
                         let mut loading_indication =
                             LoadingIndication::new(run.location.to_string());
                         handle_plugin_loading_failure(
@@ -655,6 +664,13 @@ impl WasmBridge {
     }
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
+        // read before anything is removed: this is the last moment the id still resolves to what it
+        // was running, which is what decides whether its .wasm is still worth watching
+        let unloaded_run_plugin = self.run_plugin_of_plugin_id(pid);
+        // the pane is going away, so nothing will ask about this id again
+        self.failed_plugins.remove(&pid);
+        self.plugin_pane_placements.remove(&pid);
+
         // a background plugin has no pane whose closing would tell Screen it is gone, so its
         // subscription entry would otherwise outlive it and have a PaneManifest and a tab list
         // built for it on every state change, forever
@@ -1549,8 +1565,18 @@ impl WasmBridge {
             self.plugin_ids_waiting_for_permission_request
                 .remove(&plugin_id);
             self.apply_cached_events_and_resizes_for_plugin(plugin_id, shutdown_sender.clone())?;
-            if let Some(run_plugin) = self.run_plugin_of_loading_plugin_id(plugin_id) {
+            let loading_run_plugin = self.run_plugin_of_loading_plugin_id(plugin_id).cloned();
+            if let Some(run_plugin) = &loading_run_plugin {
                 applied_plugin_paths.insert(run_plugin.clone());
+            }
+            // the loader has finished by the time it asks for cached events, so a plugin that is
+            // not in the map now never made it there - its file is missing, or it refused to
+            // start. Remember what it was meant to run before dropping the loading entry, which is
+            // the last record of it: see `failed_plugins`.
+            if self.plugin_is_running(plugin_id) {
+                self.failed_plugins.remove(&plugin_id);
+            } else if let Some(run_plugin) = loading_run_plugin {
+                self.failed_plugins.insert(plugin_id, run_plugin);
             }
             self.loading_plugins
                 .retain(|(p_id, _run_plugin)| p_id != &plugin_id);
@@ -1869,6 +1895,15 @@ impl WasmBridge {
             .lock()
             .unwrap()
             .run_plugin_of_plugin_id(plugin_id)
+            .or_else(|| self.failed_plugins.get(&plugin_id).cloned())
+    }
+    /// Whether this plugin id has a live instance, as opposed to a pane whose plugin never loaded.
+    fn plugin_is_running(&self, plugin_id: PluginId) -> bool {
+        self.plugin_map
+            .lock()
+            .unwrap()
+            .get_running_plugin(plugin_id, None)
+            .is_some()
     }
 
     pub fn reconfigure(

@@ -1,0 +1,2936 @@
+//! `zellij session up|down|restart` - the whole life of one named session.
+//!
+//! These were three shell scripts before they were three subcommands, and moving them into the
+//! binary is what fixes them. A script has to be told where the sockets live, which it learns from
+//! the environment; a shell that started before the last correction keeps the old answer, panes
+//! inherit it from the server, and the machine ends up with two servers for one name in two
+//! directories, each invisible to the other. The binary already knows: `ZELLIJ_SOCK_DIR` resolves
+//! itself, honouring an explicit override and deriving the value otherwise. Nothing here reads the
+//! environment for it, and nothing here needs a file to be sourced first.
+//!
+//! What survives from the scripts is the discipline: every one of these commands states a
+//! post-condition and checks it. See [`zellij_utils::session_lifecycle`].
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::time::{Duration, Instant};
+
+use zellij_utils::cli::{AttachArgs, CliArgs, Command, SessionLifecycleCli, Sessions};
+use zellij_utils::data::AgentListEntry;
+use zellij_utils::envs;
+use zellij_utils::session_lifecycle::{
+    build_verdict, colorterm_for_new_session, env_vars_to_drop, lock_up, own_executable,
+    server_executable, skew_decision, strict_version, term_for_new_session, BuildVerdict,
+    DownOutcome, ExecutableIdentity, SessionFacts, SkewCaller, SkewDecision,
+};
+use zellij_utils::session_service::{
+    self, configured_pinned_exe, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome,
+    PinState, PlistValue, ServiceExe, ServiceKind, SessionServiceOptions, UnitDrift,
+};
+use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
+
+use crate::commands::{get_config_options_from_cli_args, snapshot_settings, start_client};
+
+/// How long to wait for a freshly requested server to appear before calling the creation a failure.
+/// `attach --create-background` returns as soon as the spawn is requested, not once it has happened.
+///
+/// Thirty seconds because launchd was measured at 15 to 20 on the fleet's Macs. The old ten
+/// reported a post-condition failure on both of them during an upgrade, on sessions that were up
+/// moments later - and a false failure on a healthy machine is worse than a slow true one, because
+/// it is the shape a real fault takes and it teaches everyone to ignore the line.
+const SERVER_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The first gap between polls. Short, because a server that is going to appear usually has.
+const SERVER_APPEARANCE_FIRST_POLL: Duration = Duration::from_millis(50);
+/// The longest gap. Each poll forks `ps` to walk the whole process table, and a fixed short
+/// interval spent the same hundred forks on the session that came up in 200ms and on the one that
+/// was never going to - and the second is the case the watchdog repeats every minute, forever.
+const SERVER_APPEARANCE_MAX_POLL: Duration = Duration::from_millis(1500);
+
+pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs) {
+    match cli {
+        SessionLifecycleCli::Up {
+            session_name,
+            restore,
+            fresh,
+        } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            refuse_a_scratch_pin(&opts);
+            process::exit(match up(&name, up_shape(fresh, restore), &opts) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Down {
+            session_name,
+            wait_timeout,
+            force,
+        } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            refuse_from_inside(&name);
+            refuse_if_agents_are_working("down", &name, force, None);
+            process::exit(match down(&name, wait_timeout, &opts) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Restart {
+            session_name,
+            fresh,
+            restore,
+            wait_timeout,
+            force,
+        } => {
+            let name = resolve_session_name(session_name, &opts, true);
+            refuse_a_scratch_pin(&opts);
+            refuse_if_agents_are_working(
+                "restart",
+                &name,
+                force,
+                Some(&zellij_utils::consts::ZELLIJ_STATE_DIR.join("restart.log")),
+            );
+            restart(
+                &name,
+                restart_restore_target(fresh, restore),
+                wait_timeout,
+                &opts,
+            );
+        },
+        SessionLifecycleCli::Enable {
+            session_name,
+            exe,
+            force,
+            dry_run,
+        } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            if !dry_run {
+                refuse_a_scratch_pin(&opts);
+            }
+            let enabled = if dry_run {
+                enable_dry_run(&name, exe, force, &opts)
+            } else {
+                enable(&name, exe, force, &opts)
+            };
+            process::exit(match enabled {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Disable { session_name } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(match disable(&name) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Status { session_name, exe } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(status(&name, exe, &opts));
+        },
+        SessionLifecycleCli::Doctor {
+            session_name,
+            dry_run,
+            fix: _,
+            no_fix,
+            sign: _,
+            no_sign,
+            regranted,
+            exe,
+        } => crate::session_doctor_command::session_doctor_command(
+            session_name,
+            dry_run,
+            no_fix,
+            no_sign,
+            regranted,
+            exe,
+            opts,
+        ),
+    }
+}
+
+/// Exit 2, having changed nothing, when this is a scratch environment whose config pins to the
+/// real pin. Asked before the verb does anything, so a scratch `session up` starts no server on a
+/// pin it was not allowed to refresh. The rule is
+/// [`scratch_pin_refusal`](zellij_utils::session_lifecycle::scratch_pin_refusal)'s.
+#[cfg(unix)]
+pub(crate) fn refuse_a_scratch_pin(opts: &CliArgs) {
+    let Some(pinned) = configured_pinned_exe(configured_extras(opts).as_ref()) else {
+        return;
+    };
+    if let Some(refusal) = zellij_utils::session_lifecycle::scratch_pin_refusal(&pinned) {
+        eprintln!("{}", refusal);
+        process::exit(2);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn refuse_a_scratch_pin(_opts: &CliArgs) {}
+
+/// The init system of this machine, or a refusal naming what it would have driven.
+fn native_service_kind() -> Result<ServiceKind, ()> {
+    session_service::native_service_kind().ok_or_else(|| {
+        eprintln!(
+            "session enable: no init system this build can install into. \
+             `zellij setup --generate-service` still prints a unit to adapt by hand."
+        );
+    })
+}
+
+/// Which binary the unit should run, warning when the answer is one an upgrade can break.
+fn service_exe(explicit: Option<PathBuf>, pinned: Option<PathBuf>) -> PathBuf {
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let exe = resolve_service_exe(explicit, pinned, &current_exe, &path_dirs());
+    if let ServiceExe::Resolved(path) = &exe {
+        eprintln!(
+            "warning: no `zellij` on PATH resolves to this binary, so the unit will run\n  \
+             {}\nwhich is where this binary actually is. If that is inside a version-specific\n\
+             directory, the unit will break the next time zellij is upgraded. Name a stable\n\
+             path with `--exe <PATH>` if it is.",
+            path.display()
+        );
+    }
+    exe.path().to_path_buf()
+}
+
+/// What the config adds to the generated unit, if anything.
+///
+/// A generated unit knows the binary, the session and the schedule; everything local - an ordering
+/// against another service, a nice level - comes from here. The config is where it lives so that
+/// the tool can see it: a systemd drop-in would work and `zellij session status` could never
+/// report it.
+pub(crate) fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
+    get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_service)
+}
+
+/// Put this build at the pinned path for a command that is about to name that path in a unit.
+///
+/// A failure is fatal only when there is nothing at the path yet: a unit naming a binary that does
+/// not exist cannot be run by anything. When a build IS there it still runs, so the failure is a
+/// stale copy rather than a broken install, and the next `session up` writes it again.
+fn pin_before_writing_the_unit(pinned: &PathBuf) -> Result<(), ()> {
+    let existed = pinned.exists();
+    match pin_this_build_at(pinned) {
+        // a candidate does not become the pin, and with nothing already at the path the unit about
+        // to be written would name a binary that does not exist. Refused here rather than reported
+        // later, because a launcher pointed at nothing fails at boot, where nobody is watching.
+        Ok(PinHolds::Nothing) if !existed => {
+            eprintln!(
+                "session enable: nothing was pinned at {}, because this build is a release \
+                 candidate, and the unit would name a binary that is not there. Run it again from \
+                 a release.",
+                pinned.display()
+            );
+            Err(())
+        },
+        Ok(_) => Ok(()),
+        Err(reason) if existed => {
+            eprintln!("warning: {}", reason);
+            eprintln!(
+                "         the build already at {} is what the unit will run",
+                pinned.display()
+            );
+            Ok(())
+        },
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Copy this build to `pinned`, reporting what that came to.
+///
+/// Silent when the copy is already this build, which is every pass but the first after an upgrade:
+/// `session up` runs this each time, and a line saying nothing happened, every minute, from a
+/// watchdog, is a line nobody reads.
+///
+/// **THIS BINARY is the source, and once the launcher runs the pin this binary IS the pin.** That
+/// is the ordinary configuration, and in it there is nothing to do:
+/// [`install_pinned_exe`](zellij_utils::session_lifecycle::install_pinned_exe) recognises a source
+/// that is its own target and returns without touching the pin or its stamp. Nothing is wrong with
+/// that - the process has not seen the package and has nothing to compare against - but it means
+/// the watchdog is not what notices an upgrade. What does is any zellij run off another path: an interactive launch,
+/// which resolves the server binary through here on the way past, or `session up`, `session doctor
+/// --fix` or `session enable` typed in a shell, where `PATH` leads to the new build. See FORK.md,
+/// "Once the launcher runs the pin".
+#[cfg(unix)]
+fn pin_this_build_at(pinned: &PathBuf) -> Result<PinHolds, String> {
+    use zellij_utils::session_lifecycle::{install_pinned_exe, PinOutcome};
+
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot find this binary to pin it: {}", e))?;
+    match install_pinned_exe(&current_exe, pinned)? {
+        PinOutcome::Installed(path) => println!("      pinned this build at {}", path.display()),
+        PinOutcome::Refreshed(path) => {
+            println!("      refreshed the pinned copy at {}", path.display())
+        },
+        PinOutcome::AsReleased(path) => {
+            println!(
+                "      refreshed the pinned copy with the release's own signature at {}",
+                path.display()
+            )
+        },
+        // the pin was left alone because the refresh was refused, and the sink has already said
+        // so in full. A second line here would read as a second fault.
+        PinOutcome::Kept(_) => {},
+        // likewise for a release candidate, which the writer has already said it left the pin for
+        PinOutcome::Candidate(_) => return Ok(PinHolds::Nothing),
+        PinOutcome::UpToDate(_) => {},
+    }
+    Ok(PinHolds::ABuild)
+}
+
+/// Whether the pinned path holds a build after a pass over it, which is what a unit may name.
+///
+/// Only one outcome answers `Nothing`: the pin was not written because this build is a release
+/// candidate. Every other outcome either wrote a build or found one already there.
+#[derive(Debug, PartialEq, Eq)]
+enum PinHolds {
+    ABuild,
+    Nothing,
+}
+
+#[cfg(not(unix))]
+fn pin_this_build_at(_pinned: &PathBuf) -> Result<PinHolds, String> {
+    Ok(PinHolds::ABuild)
+}
+
+/// Keep the pinned copy current, on the path the INSTALLED UNIT records.
+///
+/// Not the path this process would derive: the canonical directory honours `XDG_DATA_HOME` on
+/// Linux, and a launcher's environment is not the calling shell's, so a re-derived path can name a
+/// different file from the one the launcher execs - and refreshing that one would leave the running
+/// copy stale while reporting success.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>) {
+    let Some(configured) = configured_pinned_exe(extras) else {
+        return;
+    };
+    // The pin's writer decides for itself; this run only says a release may replace a signed pin.
+    zellij_utils::session_signing::set_pin_signing_policy(
+        zellij_utils::session_signing::PinSigningPolicy {
+            allowed: true,
+            regranted: false,
+        },
+    );
+    let installed = session_service::installed_session_exe(name);
+    match session_service::pin_state(&configured, installed.as_deref()) {
+        PinState::Recorded(path) | PinState::Unrecorded(path) => {
+            if let Err(reason) = pin_this_build_at(&path) {
+                eprintln!("warning: {}", reason);
+            }
+        },
+        PinState::Mismatch {
+            configured,
+            installed,
+        } => eprintln!(
+            "warning: `pin_exe` asks for a copy of zellij at\n           \
+             {}\n         \
+             but the launcher for '{}' runs\n           \
+             {}\n         \
+             Nothing was copied: what `session up` keeps current is the binary the launcher\n         \
+             actually runs. Run `zellij session enable {}` to point it at the pinned path.\n         \
+             On macOS a file-access grant is recorded against the exact path, so the grant has\n         \
+             to name the path the launcher runs.",
+            configured.display(),
+            name,
+            installed,
+            name
+        ),
+    }
+}
+
+/// Nowhere else has a launcher this build installs into, so there is no recorded path and nothing
+/// to keep current.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn assert_pinned_exe(_name: &str, _extras: Option<&SessionServiceOptions>) {}
+
+/// Write the unit and hand it to the init system.
+///
+/// The whole command is idempotent, because the thing it installs is: `zellij session up` over a
+/// healthy session is a no-op, so re-enabling costs nothing and enabling twice is not an error to
+/// report but a state to confirm.
+fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    print_unit_dir_disagreement();
+    let extras = configured_extras(opts);
+    // The copy goes in BEFORE the unit that names it. A unit whose binary does not exist is a unit
+    // the init system cannot run, and the command that would have created the copy is the one that
+    // unit runs - so leaving it to the first `session up` would leave nothing able to make the
+    // first `session up` happen.
+    let pinned = configured_pinned_exe(extras.as_ref());
+    if let Some(pinned) = &pinned {
+        pin_before_writing_the_unit(pinned)?;
+    }
+    let exe = service_exe(exe, pinned);
+    // asked before `enable` writes, while the installed unit is still the one it judges
+    let kept_path = session_service::path_kept_on_enable(kind, &exe, name, extras.as_ref());
+    match session_service::enable(kind, &exe, name, extras.as_ref(), force) {
+        Ok(EnableOutcome::AlreadyEnabled) => {
+            print_kept_path(kept_path);
+            println!("ok    service for '{}' is already enabled", name);
+            Ok(())
+        },
+        Ok(EnableOutcome::Enabled {
+            written,
+            changed,
+            beside,
+        }) => {
+            print_kept_path(kept_path);
+            for path in written {
+                println!("      wrote {}", path.display());
+            }
+            // Named key by key, because this command records the CALLING shell's PATH and state
+            // directory. A rewrite from a shell with a thinner PATH is visible here, when it is
+            // made, rather than later as a command the server can no longer find.
+            for file in changed {
+                println!(
+                    "      {} changed: {}",
+                    file.path.display(),
+                    file.differing_keys()
+                );
+                for change in &file.changes {
+                    println!("        {}", change.describe());
+                }
+            }
+            // only reachable with --force: two launchers for one session race at login, and the
+            // one that loses is left failed. Say so where the person who typed --force sees it.
+            for job in beside {
+                eprintln!(
+                    "warning: {} also runs `session up {}` ({}); both will start at login",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
+            println!("on    service for '{}' enabled and started", name);
+            Ok(())
+        },
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// `session enable --dry-run`: say what `enable` would write, where, and with which binary and PATH,
+/// and change nothing.
+///
+/// Nothing is written, no directory is made, no job is loaded and the pin is not refreshed. The
+/// only command it may run is the read-only `systemctl --user show-environment` that `enable` also
+/// asks, to find the directory the user's systemd manager reads units from. It exits non-zero
+/// when `enable` would refuse.
+fn enable_dry_run(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    print_unit_dir_disagreement();
+    let extras = configured_extras(opts);
+    let pinned = configured_pinned_exe(extras.as_ref());
+    println!(
+        "dry run: what `zellij session enable {}` would do. Nothing here was done.",
+        name
+    );
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let chosen = resolve_service_exe(exe, pinned.clone(), &current_exe, &path_dirs());
+    println!("exe   {}", chosen.path().display());
+    println!(
+        "      {}",
+        match &chosen {
+            ServiceExe::Given(_) => "given with --exe",
+            ServiceExe::Pinned(_) => "the pinned copy that `pin_exe` asks for",
+            ServiceExe::Stable(_) => "the stable name on PATH that leads to this binary",
+            ServiceExe::Resolved(_) => {
+                "this binary's own path: no `zellij` on PATH leads to it, so an upgrade can \
+                 break the unit"
+            },
+        }
+    );
+    let mut refused = false;
+    match &pinned {
+        Some(pinned) => {
+            let (said, refuses) = pin_plan(&current_exe, pinned);
+            refused |= refuses;
+            println!("pin   {}", said);
+        },
+        None => println!("pin   off: the config sets no `pin_exe`"),
+    }
+    let plan = match session_service::plan_enable(kind, chosen.path(), name, extras.as_ref(), force)
+    {
+        Ok(plan) => plan,
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            return Err(());
+        },
+    };
+    print_path_decision(&plan);
+    for planned in &plan.files {
+        let file = &planned.file;
+        match &planned.change {
+            session_service::PlannedChange::New => {
+                println!("file  {} (new: would be written)", file.path.display())
+            },
+            session_service::PlannedChange::Unchanged => {
+                println!("file  {} (unchanged)", file.path.display())
+            },
+            session_service::PlannedChange::Rewritten(drift) => {
+                println!(
+                    "file  {} (would be rewritten: {})",
+                    file.path.display(),
+                    drift.differing_keys()
+                );
+                for change in &drift.changes {
+                    println!("        {}", change.describe());
+                }
+            },
+        }
+    }
+    for job in &plan.beside {
+        println!(
+            "      {} also runs `session up {}` ({})",
+            job.name,
+            name,
+            job.path.display()
+        );
+    }
+    println!("load  `enable` would run, unless every file is unchanged and the job is loaded:");
+    for command in &plan.load {
+        println!("        {}", command);
+    }
+    for planned in &plan.files {
+        println!();
+        println!("----- {} -----", planned.file.path.display());
+        print!("{}", planned.file.contents);
+        if !planned.file.contents.ends_with('\n') {
+            println!();
+        }
+    }
+    if let Some(refusal) = &plan.refusal {
+        eprintln!("session enable would refuse: {}", refusal);
+        refused = true;
+    }
+    if refused {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+/// The PATH line of a dry run: where the unit's PATH comes from, and what it keeps.
+fn print_path_decision(plan: &session_service::EnablePlan) {
+    use session_service::PathDecision;
+    let (said, kept): (&str, &[String]) = match &plan.path {
+        PathDecision::Configured => (
+            "pinned by the config: `session_service` states PATH, so it is written as stated",
+            &[],
+        ),
+        PathDecision::Fresh { installed: false } => (
+            "this shell's PATH: no unit is installed to keep one from",
+            &[],
+        ),
+        PathDecision::Fresh { installed: true } => (
+            "this shell's PATH: it drops nothing the installed unit records that still exists",
+            &[],
+        ),
+        PathDecision::Kept { kept } => (
+            "kept: the installed unit's PATH, because this shell adds nothing to it; this shell \
+             lacks",
+            kept,
+        ),
+        PathDecision::Merged { kept } => (
+            "merged: this shell's PATH, then the installed unit's directories it lacks",
+            kept,
+        ),
+    };
+    println!("path  {}", said);
+    for dir in kept {
+        println!("        {}", dir);
+    }
+    if let Some(path) = &plan.path_value {
+        println!("      PATH={}", path);
+    }
+}
+
+/// What `enable` would do to the pinned copy, asked without writing it, and whether `enable` would
+/// stop there. The same questions `install_pinned_exe` asks, in its order.
+#[cfg(unix)]
+fn pin_plan(current_exe: &Path, pinned: &Path) -> (String, bool) {
+    use zellij_utils::session_lifecycle::{pin_needs_refresh, release_candidate_refused_for};
+
+    if !pin_needs_refresh(current_exe, pinned) {
+        return (
+            format!(
+                "{} already holds this build; nothing to copy",
+                pinned.display()
+            ),
+            false,
+        );
+    }
+    if release_candidate_refused_for(pinned) {
+        if pinned.exists() {
+            return (
+                format!(
+                    "{} would be left alone: this build is a release candidate. The unit runs the \
+                     build already there",
+                    pinned.display()
+                ),
+                false,
+            );
+        }
+        return (
+            format!(
+                "nothing is pinned at {}, and this build is a release candidate, so `enable` \
+                 would stop before writing a unit that names a missing binary",
+                pinned.display()
+            ),
+            true,
+        );
+    }
+    if !pinned.exists() {
+        return (
+            format!(
+                "would pin this build ({}) at {}",
+                current_exe.display(),
+                pinned.display()
+            ),
+            false,
+        );
+    }
+    if pin_is_anchored(pinned) {
+        return (
+            format!(
+                "would refresh {} from this build ({}) through the signing transaction: the pin \
+                 is signed, and only a release build replaces it",
+                pinned.display(),
+                current_exe.display()
+            ),
+            false,
+        );
+    }
+    (
+        format!(
+            "would refresh {} from this build ({})",
+            pinned.display(),
+            current_exe.display()
+        ),
+        false,
+    )
+}
+
+#[cfg(not(unix))]
+fn pin_plan(_current_exe: &Path, pinned: &Path) -> (String, bool) {
+    (
+        format!("{} is not pinned on this platform", pinned.display()),
+        false,
+    )
+}
+
+/// Whether the pin carries a signature only a release build may replace. Asks `codesign -d`,
+/// which reads and writes nothing; only macOS has one to ask.
+#[cfg(target_os = "macos")]
+fn pin_is_anchored(pinned: &Path) -> bool {
+    zellij_utils::session_signing::pin_is_anchored(
+        &zellij_utils::session_doctor::SystemCommander,
+        pinned,
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pin_is_anchored(_pinned: &Path) -> bool {
+    false
+}
+
+/// Say which directories of the installed unit's PATH `enable` kept, because this shell lacks them.
+///
+/// Said every time it happens, so an `enable` over SSH does not read as one that recorded the SSH
+/// shell's PATH. See [`session_service::path_to_keep`].
+fn print_kept_path(kept: Option<session_service::KeptPath>) {
+    let Some(kept) = kept else {
+        return;
+    };
+    println!(
+        "      kept {} {} from the installed PATH that this shell lacks and that exist:",
+        kept.kept.len(),
+        if kept.kept.len() == 1 {
+            "directory"
+        } else {
+            "directories"
+        }
+    );
+    for dir in kept.kept {
+        println!("        {}", dir);
+    }
+    println!(
+        "      to drop one, run `session disable`, then `session enable` from a shell without it"
+    );
+}
+
+/// Name the two answers to "where do this user's units live", when they differ.
+///
+/// The unit goes where the MANAGER reads, which is the one that matters - but a person who then
+/// looks under their own `XDG_CONFIG_HOME` will not find it, and a file that is not where its owner
+/// expects is the beginning of a second install beside the first. So the difference is said out
+/// loud at the moment it is acted on rather than left to be discovered.
+fn print_unit_dir_disagreement() {
+    let Some((manager, shell)) = session_service::unit_dir_disagreement() else {
+        return;
+    };
+    eprintln!(
+        "note: this shell's XDG_CONFIG_HOME and the systemd user manager's disagree.\n      \
+         manager: {}\n      \
+         shell:   {}\n      \
+         The unit goes in the manager's directory, because that is the one it reads. A unit\n      \
+         written to the other would load for nothing and `daemon-reload` would never see it.",
+        manager.display(),
+        shell.display()
+    );
+}
+
+/// Unload the unit, then remove it.
+fn disable(name: &str) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    match session_service::disable(kind, name) {
+        Ok(DisableOutcome::NotInstalled) => {
+            println!(
+                "ok    no service installed for '{}'; nothing to remove",
+                name
+            );
+            Ok(())
+        },
+        Ok(DisableOutcome::NotOurs { jobs }) => {
+            // `status` reports this job by name, so reporting "nothing installed" here would have
+            // the two commands contradicting each other over the same machine. What this command
+            // removes is what `session enable` wrote, and that is not this.
+            println!(
+                "warn  nothing zellij installed for '{}'; nothing of ours to remove",
+                name
+            );
+            for job in jobs {
+                println!(
+                    "      but {} runs `session up {}` ({}) - not written by zellij, so it is left \
+                     alone",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
+            // Non-zero, because the question this command answers is "will the session come back",
+            // and here it still will. A caller reading only the exit code would otherwise take
+            // this for a session that has been switched off - and the next boot would disagree.
+            eprintln!(
+                "session disable: '{}' is still launched by a job zellij did not write; remove \
+                 that job by hand to stop it",
+                name
+            );
+            Err(())
+        },
+        Ok(DisableOutcome::Disabled {
+            removed,
+            remaining,
+            unload_error,
+        }) => {
+            for path in removed {
+                println!("      removed {}", path.display());
+            }
+            println!(
+                "off   service for '{}' unloaded and removed; the session itself is untouched",
+                name
+            );
+            for job in &remaining {
+                println!(
+                    "      {} still runs `session up {}` ({}) - not written by zellij, so it is \
+                     left alone",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
+            // Two ways this is a partial result rather than a success, and both leave the session
+            // able to come back. Reported after the removals, because the removals happened.
+            let mut clean = true;
+            if let Some(reason) = &unload_error {
+                eprintln!(
+                    "session disable: the files are removed, but the init system did not accept \
+                     every\n                 command: {}",
+                    reason
+                );
+                clean = false;
+            }
+            // Removing our own unit while another launcher still starts the session is a partial
+            // result too: the session keeps coming back, from something this command has just made
+            // harder to find. Same reasoning as the NotOurs arm above.
+            if !remaining.is_empty() {
+                eprintln!(
+                    "session disable: '{}' is still launched by a job zellij did not write; \
+                     remove that job by hand to stop it",
+                    name
+                );
+                clean = false;
+            }
+            if clean {
+                Ok(())
+            } else {
+                Err(())
+            }
+        },
+        Err(reason) => {
+            eprintln!("session disable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Report the install, one fact per line.
+///
+/// Installed, loaded and running are three different states and they come apart in ways that each
+/// mean something different: a file with no job is an install that was never loaded, a job with no
+/// session is a unit that is failing, and a session with no job is one that will not come back.
+/// Reporting them together as "ok" would hide exactly the case worth reporting.
+///
+/// Exits 0 when the unit is installed AND loaded, whatever the session is doing - the session is
+/// the thing the unit repairs, and `zellij session up` is the command that reports on it. Drift, a
+/// pin the launcher does not run, and a running server of another build each fail it too: each is a
+/// step still owed.
+///
+/// The report goes through a handle rather than through `println!` so that a reader who stops
+/// reading ends it. See [`report_exit_code`].
+fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
+    let Ok(kind) = native_service_kind() else {
+        return 1;
+    };
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let extras = configured_extras(opts);
+    let pinned = configured_pinned_exe(extras.as_ref());
+    let exe = resolve_service_exe(exe, pinned.clone(), &current_exe, &path_dirs());
+    let status = match session_service::status(kind, exe.path(), name, extras.as_ref()) {
+        Ok(status) => status,
+        Err(reason) => {
+            eprintln!("session status: {}", reason);
+            return 1;
+        },
+    };
+
+    let mut stdout = io::stdout().lock();
+    let report = print_status(
+        &mut stdout,
+        name,
+        kind,
+        exe.path(),
+        &status,
+        extras.as_ref(),
+        pinned.as_deref(),
+    );
+    report_exit_code("session status", report)
+}
+
+/// The body of `session status`, written to a handle a test can hand a closed pipe.
+#[allow(clippy::too_many_arguments)]
+fn print_status<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    kind: ServiceKind,
+    exe: &std::path::Path,
+    status: &session_service::ServiceStatus,
+    extras: Option<&SessionServiceOptions>,
+    pinned: Option<&std::path::Path>,
+) -> io::Result<i32> {
+    writeln!(out, "session   {}", name)?;
+    writeln!(out, "init      {}", status.kind.name())?;
+    print_unit_dir_disagreement();
+    // A job that runs `session up` for this session under another name is doing the work, so the
+    // file this build would have written being absent is not the fault it looks like. It is
+    // reported against the first file, which is the one that runs the command - the timer beside it
+    // on systemd is this build's own arrangement and says nothing about someone else's.
+    //
+    // The timer beside it is found the same way, through the service it starts rather than through
+    // a name derived here - a watchdog somebody wrote by hand arms whatever service does the work,
+    // and calling it missing tells a reader to install a second one.
+    let elsewhere = status.installed_as.first();
+    let timer_elsewhere = status.timer_installed_as.as_ref();
+    for (index, file) in status.files.iter().enumerate() {
+        let found_elsewhere = if file.role == "timer" {
+            timer_elsewhere.map(|timer| (&timer.name, &timer.path))
+        } else if index == 0 {
+            elsewhere.map(|job| (&job.name, &job.path))
+        } else {
+            None
+        };
+        let state = match (file.present, file.stale, found_elsewhere) {
+            (false, _, Some((name, path))) => format!(
+                "installed under a different name: {} ({})",
+                name,
+                path.display()
+            ),
+            (false, ..) => "missing".to_owned(),
+            (true, true, ..) => {
+                "installed (differs from what `session enable` would write now)".to_owned()
+            },
+            (true, false, ..) => "installed".to_owned(),
+        };
+        writeln!(out, "{:9} {} - {}", file.role, file.path.display(), state)?;
+    }
+    let installed = match elsewhere {
+        // this build did not write that install and cannot say which files belong to it, so
+        // whether the init system holds the job is the whole of what can be judged
+        Some(_) => true,
+        // a timer under another name arms the same service, so it stands in for the file this
+        // build would have written
+        None => status
+            .files
+            .iter()
+            .all(|file| file.present || (file.role == "timer" && timer_elsewhere.is_some())),
+    };
+    for other in status.installed_as.iter().skip(1) {
+        writeln!(
+            out,
+            "{:9} {} also runs `session up {}` ({})",
+            "ambiguous",
+            other.name,
+            name,
+            other.path.display()
+        )?;
+    }
+    writeln!(
+        out,
+        "loaded    {} ({})",
+        if status.loaded { "yes" } else { "no" },
+        status.load_detail
+    )?;
+
+    // what the config adds is reported here because it can be: this is the whole argument for
+    // keeping it in the config rather than in a drop-in directory the tool cannot see
+    print_configured_extras(out, kind, extras)?;
+    let unit_is_current = print_unit_drift(out, kind, exe, name, extras)?;
+    let pinned_agrees = print_pin_state(out, name, pinned)?;
+
+    let facts = SessionFacts::collect(name);
+    match facts.assert_up() {
+        Ok(()) => writeln!(out, "running   yes, in {}", facts.socket_dir.display())?,
+        Err(reason) => writeln!(out, "running   no - {}", reason)?,
+    }
+    let verdict = (!facts.our_servers().is_empty()).then(|| build_verdict(name));
+    let build_is_current = print_build(out, name, verdict.as_ref())?;
+
+    // A pipe holds what has been written until the reader takes it, so the last line of the report
+    // can still fail here rather than at the `writeln!` that produced it.
+    out.flush()?;
+
+    let healthy =
+        installed && status.loaded && pinned_agrees && unit_is_current && build_is_current;
+    Ok(if healthy { 0 } else { 1 })
+}
+
+/// What a report that could not finish being written exits with.
+///
+/// `zellij session status <name> | head -3` closes the pipe as soon as it has its three lines, and
+/// the next write gets `EPIPE` back. `println!` turns that into a panic - `failed printing
+/// to stdout: Broken pipe (os error 32)` - which is a crash report for a reader doing something
+/// entirely ordinary. A reader that left is not this command's failure, so it exits 0 and says
+/// nothing.
+///
+/// Only `BrokenPipe`. A full disk on a redirected stdout is a real failure and is still reported,
+/// and the process-wide `SIGPIPE` disposition is deliberately left alone - this binary also runs
+/// the server and every pane in it.
+fn report_exit_code(label: &str, report: io::Result<i32>) -> i32 {
+    match report {
+        Ok(code) => code,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => 0,
+        Err(e) => {
+            eprintln!("{}: could not write the report: {}", label, e);
+            1
+        },
+    }
+}
+
+/// The `drift` line: whether the unit on disk is still what this config would write.
+///
+/// Reported, and counted against the exit code, because nothing else notices. Edit the config and
+/// the loaded job does not change with it - the file is stale, the init system is still running the
+/// definition it was handed, and every angle you can look from is internally consistent. It is only
+/// wrong when the two are compared, which is the same shape as the pin mismatch reported below it.
+///
+/// The remedy has to be `session enable` and not a reload by hand, and launchd is why: a plist
+/// whose CONTENT changed needs `bootout` then `bootstrap`, and `launchctl kickstart` restarts the
+/// job from the definition launchd already holds - so the obvious command runs the old plist and
+/// looks like the edit did nothing.
+fn print_unit_drift<W: Write + ?Sized>(
+    out: &mut W,
+    kind: ServiceKind,
+    exe: &std::path::Path,
+    name: &str,
+    extras: Option<&SessionServiceOptions>,
+) -> io::Result<bool> {
+    match session_service::unit_drift(kind, exe, name, extras) {
+        Ok(UnitDrift::NotInstalled) => {
+            writeln!(
+                out,
+                "drift     nothing zellij wrote is installed to compare against"
+            )?;
+            Ok(true)
+        },
+        Ok(UnitDrift::Current) => {
+            writeln!(
+                out,
+                "drift     none - the installed unit is what this config would write"
+            )?;
+            Ok(true)
+        },
+        Ok(UnitDrift::Drifted { files }) => {
+            for file in files {
+                writeln!(
+                    out,
+                    "drift     {} is NOT what this config would write now: {}",
+                    file.path.display(),
+                    file.differing_keys()
+                )?;
+            }
+            writeln!(
+                out,
+                "drift     run `zellij session enable {}` to rewrite and reload it",
+                name
+            )?;
+            if kind == ServiceKind::Launchd {
+                writeln!(
+                    out,
+                    "drift     a changed plist needs bootout then bootstrap, which that command \
+                     does; `launchctl kickstart` restarts the job from the definition launchd \
+                     already holds"
+                )?;
+            }
+            Ok(false)
+        },
+        Err(reason) => {
+            eprintln!("session status: {}", reason);
+            Ok(false)
+        },
+    }
+}
+
+/// Say once that the installed unit no longer matches the config.
+///
+/// On `up`, because `up` is what runs - from a shell after a config edit, and from the launcher
+/// every minute. The launcher's copy of this message is the one that reaches a machine nobody is
+/// looking at, and it goes to the journal or to the log the plist names.
+///
+/// Silent unless something this build wrote is actually installed and actually differs: an `up` on
+/// a machine with no launcher has nothing to say, and saying it every minute would be worse than
+/// saying nothing.
+fn warn_if_unit_drifted(name: &str, opts: &CliArgs) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let Some(kind) = session_service::native_service_kind() else {
+            return;
+        };
+        let extras = configured_extras(opts);
+        let pinned = configured_pinned_exe(extras.as_ref());
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let exe = resolve_service_exe(None, pinned, &current_exe, &path_dirs());
+        let Ok(UnitDrift::Drifted { files }) =
+            session_service::unit_drift(kind, exe.path(), name, extras.as_ref())
+        else {
+            return;
+        };
+        for file in files {
+            eprintln!(
+                "warning: {} is not what `zellij session enable` would write now ({}), so the\n         \
+                 loaded job is running an older definition. Run `zellij session enable {}` to bring\n         \
+                 them back together - a config edit does not reach a unit that was not rewritten.",
+                file.path.display(),
+                file.differing_keys(),
+                name
+            );
+        }
+    });
+}
+
+/// The `build` line: whether the running server is this build, by the comparison doctor makes.
+///
+/// `Different` counts against the exit code, because a restart is owed and nothing else in this
+/// report says so. `CannotTell` does not: an unread identity is not proof of a stale server, and
+/// failing on it would fail every status taken while the server's executable is unreadable.
+/// `None` is no server of ours running, which leaves nothing to compare.
+fn print_build<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    verdict: Option<&BuildVerdict>,
+) -> io::Result<bool> {
+    match verdict {
+        None => {
+            writeln!(out, "build     no server running to compare")?;
+            Ok(true)
+        },
+        Some(BuildVerdict::Same) => {
+            writeln!(out, "build     the running server is this build")?;
+            Ok(true)
+        },
+        Some(BuildVerdict::Different { running, this }) => {
+            writeln!(
+                out,
+                "build     DIFFERENT - the server runs {}",
+                running.display()
+            )?;
+            writeln!(
+                out,
+                "build     this is {} - `zellij session restart {}` brings it onto this build",
+                this.display(),
+                name
+            )?;
+            Ok(false)
+        },
+        Some(BuildVerdict::CannotTell(reason)) => {
+            writeln!(out, "build     cannot tell - {}", reason)?;
+            Ok(true)
+        },
+    }
+}
+
+/// What the config's `pin_exe` and the installed unit say between them, and whether they agree.
+///
+/// Reported even though nothing is broken, because the disagreement is invisible from every other
+/// angle: the config asks for a pinned copy, the launcher runs something else, and each of them is
+/// internally fine. It is the state a key turned on after `session enable` leaves behind, and the
+/// paths are BOTH named because a macOS grant is keyed to one exact path - a reader who is about to
+/// add it by hand in System Settings needs to know which.
+fn print_pin_state<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    pinned: Option<&std::path::Path>,
+) -> io::Result<bool> {
+    let Some(pinned) = pinned else {
+        writeln!(out, "pin       off (no `pin_exe` in session_service)")?;
+        return Ok(true);
+    };
+    // the stamp beside the pin vouches for the file zellij wrote; a build copied over it since is
+    // not what that stamp describes, whatever the launcher points at
+    let agrees = print_pin_line(out, name, pinned)?;
+    if zellij_utils::session_lifecycle::pin_replaced_outside_zellij(pinned) {
+        writeln!(
+            out,
+            "pin       {} was replaced outside zellij - `zellij session doctor --fix`, run from \
+             the installed build, refreshes it",
+            pinned.display()
+        )?;
+        return Ok(false);
+    }
+    Ok(agrees)
+}
+
+/// Which pin the launcher runs, for [`print_pin_state`].
+fn print_pin_line<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    pinned: &std::path::Path,
+) -> io::Result<bool> {
+    match pin_state_of(name, pinned) {
+        PinState::Recorded(path) => {
+            writeln!(out, "pin       {} - the launcher runs it", path.display())?;
+            Ok(true)
+        },
+        PinState::Unrecorded(path) => {
+            writeln!(
+                out,
+                "pin       {} - nothing installed runs it yet",
+                path.display()
+            )?;
+            Ok(true)
+        },
+        PinState::Mismatch {
+            configured,
+            installed,
+        } => {
+            writeln!(
+                out,
+                "pin       {} - NOT what the launcher runs",
+                configured.display()
+            )?;
+            writeln!(
+                out,
+                "pin       the launcher runs {} - `zellij session enable {}` re-points it",
+                installed, name
+            )?;
+            Ok(false)
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pin_state_of(name: &str, pinned: &std::path::Path) -> PinState {
+    session_service::pin_state(
+        pinned,
+        session_service::installed_session_exe(name).as_deref(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pin_state_of(_name: &str, pinned: &std::path::Path) -> PinState {
+    session_service::pin_state(pinned, None)
+}
+
+/// One configured plist value on one line of `status`.
+///
+/// A container is written out in full rather than summarised as "a dictionary": the whole reason
+/// `status` lists the extras is that a person can check what the unit will contain against what
+/// they typed, and a count of entries answers neither question.
+fn plist_value_summary(value: &PlistValue) -> String {
+    match value {
+        PlistValue::String(value) => value.to_owned(),
+        PlistValue::Integer(value) => value.to_string(),
+        PlistValue::Bool(value) => value.to_string(),
+        PlistValue::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(plist_value_summary)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PlistValue::Dict(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(name, value)| format!("{} = {}", name, plist_value_summary(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// List what `session_service` in the config puts into the unit, for the init system in use.
+fn print_configured_extras<W: Write + ?Sized>(
+    out: &mut W,
+    kind: ServiceKind,
+    extras: Option<&SessionServiceOptions>,
+) -> io::Result<()> {
+    let Some(extras) = extras.filter(|extras| extras.has_unit_extras()) else {
+        return writeln!(out, "config    no session_service extras");
+    };
+    match kind {
+        ServiceKind::Systemd => {
+            let sections = [
+                ("Unit", &extras.systemd.unit),
+                ("Service", &extras.systemd.service),
+                ("Install", &extras.systemd.install),
+            ];
+            for (section, directives) in sections {
+                for directive in directives {
+                    writeln!(out, "config    [{}] {}", section, directive)?;
+                }
+            }
+        },
+        ServiceKind::Launchd => {
+            for key in &extras.launchd {
+                writeln!(
+                    out,
+                    "config    {} = {}",
+                    key.name,
+                    plist_value_summary(&key.value)
+                )?;
+            }
+            // Prefixed, because these are not plist keys: they go inside EnvironmentVariables, and
+            // a listing that showed them the same way would read as a claim that launchd has a
+            // top-level key by that name.
+            for entry in &extras.launchd_env {
+                writeln!(out, "config    env {} = {}", entry.name, entry.value)?;
+            }
+        },
+    }
+    Ok(())
+}
+
+/// The name to act on: what was asked for, else the session this shell is in (for `restart`, which
+/// is the one command that means "this one"), else `--session`, else the `session_name` config
+/// option. There is no built-in default: a lifecycle command that guesses the name is a lifecycle
+/// command that eventually kills the wrong session.
+pub(crate) fn resolve_session_name(
+    session_name: Option<String>,
+    opts: &CliArgs,
+    prefer_current_session: bool,
+) -> String {
+    let name = session_name
+        .or_else(|| {
+            if prefer_current_session {
+                envs::get_session_name().ok()
+            } else {
+                None
+            }
+        })
+        .or_else(|| opts.session.clone())
+        .or_else(|| {
+            get_config_options_from_cli_args(opts)
+                .ok()
+                .and_then(|options| options.session_name)
+        });
+    let Some(name) = name else {
+        eprintln!(
+            "No session name given, and no `session_name` is set in the config. \
+             Name the session to act on."
+        );
+        process::exit(2);
+    };
+    if let Err(e) = validate_session_name(&name) {
+        eprintln!("{}", e);
+        process::exit(2);
+    }
+    name
+}
+
+/// Tearing a session down kills every pane shell in it, including the one running the command, so a
+/// `down` typed inside the session it names would never come back to report anything. `restart`
+/// leaves the process tree before it does the same thing, and is the supported way in.
+fn refuse_from_inside(name: &str) {
+    if envs::get_session_name().ok().as_deref() == Some(name) {
+        eprintln!(
+            "Refusing to tear down '{}' from inside it - this shell would be killed mid-run.",
+            name
+        );
+        eprintln!(
+            "  Detach first and re-run, or use `zellij session restart`, which detaches itself."
+        );
+        process::exit(2);
+    }
+}
+
+/// The exit code of a teardown refused because an agent in the session is working. Not 1
+/// (error), not 2 (refused, changed nothing) and not 3 (strict-version refusal): a caller must be
+/// able to tell "wait for the agents" from all three.
+pub(crate) const AGENTS_BUSY_EXIT_CODE: i32 = 4;
+
+/// Why one agent makes a teardown refuse, or `None` when it does not.
+///
+/// Busy is `working`, `blocked` of any kind, a state this build does not know (an unknown state
+/// fails closed), or any `working` record under another state: Claude Code reports each
+/// background subagent as a record of its own, and a turn that ended with subagents still running
+/// reports `done` or `idle` above them. A `blocked` agent is mid-turn, waiting for the operator,
+/// and a teardown cuts that turn off. `idle`, `done` and `error` are not busy: the turn is over.
+/// An agent that reported nothing is not busy either, because nothing says it is.
+/// The caller's own pane never counts: an agent that restarts its own session has decided to.
+pub(crate) fn busy_reason(agent: &AgentListEntry) -> Option<String> {
+    if agent.is_self {
+        return None;
+    }
+    let status = agent.program_status.as_ref()?;
+    let state = status.state.as_str();
+    match state {
+        "working" => {
+            let others = status.working.saturating_sub(1);
+            Some(if others == 0 {
+                "working".to_owned()
+            } else {
+                format!("working, and {} background task(s) working", others)
+            })
+        },
+        "blocked" => {
+            let blocked = match &status.kind {
+                Some(kind) => format!("blocked:{}", kind),
+                None => "blocked".to_owned(),
+            };
+            Some(if status.working == 0 {
+                blocked
+            } else {
+                format!(
+                    "{}, and {} background task(s) working",
+                    blocked, status.working
+                )
+            })
+        },
+        "idle" | "done" | "error" => (status.working > 0).then(|| {
+            format!(
+                "{}, but {} background task(s) still working",
+                state, status.working
+            )
+        }),
+        unknown => Some(format!("{} (a state this build does not know)", unknown)),
+    }
+}
+
+/// What a teardown does about the agents in the session it is about to kill.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TeardownGuard<'a> {
+    Proceed,
+    /// Each busy agent, with why it counts as busy.
+    Refuse(Vec<(&'a AgentListEntry, String)>),
+}
+
+pub(crate) fn teardown_guard(agents: &[AgentListEntry], force: bool) -> TeardownGuard<'_> {
+    if force {
+        return TeardownGuard::Proceed;
+    }
+    let busy: Vec<_> = agents
+        .iter()
+        .filter_map(|agent| busy_reason(agent).map(|reason| (agent, reason)))
+        .collect();
+    if busy.is_empty() {
+        TeardownGuard::Proceed
+    } else {
+        TeardownGuard::Refuse(busy)
+    }
+}
+
+/// The refusal, as printed and as written to the restart log.
+fn busy_refusal_text(verb: &str, name: &str, busy: &[(&AgentListEntry, String)]) -> String {
+    let mut text = format!(
+        "session {}: refusing - {} agent(s) in '{}' are working:\n",
+        verb,
+        busy.len(),
+        name
+    );
+    for (agent, reason) in busy {
+        text.push_str(&format!(
+            "  tab {:?}  {}  {}  {}\n",
+            agent.tab_name, agent.handle, agent.agent.kind, reason
+        ));
+    }
+    text.push_str(&format!(
+        "Nothing was torn down. Wait for them to finish, or pass --force to {} anyway.\n\
+         Exit status {}: a caller that started this in a pane that closes on exit must check it.\n",
+        verb, AGENTS_BUSY_EXIT_CODE
+    ));
+    text
+}
+
+/// Refuse the teardown, exiting [`AGENTS_BUSY_EXIT_CODE`], when an agent in `name` is working.
+///
+/// Asked only of a session that is running. A session that is running and does not answer goes
+/// ahead with a warning: a wedged server is what a restart is for, and refusing would leave no way
+/// to fix it short of `--force`. `log_file` is where a restart writes its output; the refusal
+/// goes there too, so a remote caller that started the restart in a pane can read why.
+fn refuse_if_agents_are_working(verb: &str, name: &str, force: bool, log_file: Option<&Path>) {
+    if force {
+        return;
+    }
+    let running = zellij_utils::sessions::get_sessions()
+        .map(|sessions| sessions.iter().any(|(session, _)| session == name))
+        .unwrap_or(false);
+    if !running {
+        return;
+    }
+    let make_os_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
+        match zellij_client::os_input_output::get_cli_client_os_input() {
+            Ok(os_input) => Box::new(os_input),
+            Err(e) => {
+                eprintln!("session {}: could not open a client: {}", verb, e);
+                process::exit(1);
+            },
+        }
+    };
+    // Asked twice before going ahead: one failed answer was seen in a live proof and did not
+    // repeat, and a guard that gives up on the first miss is a guard a busy server can skip.
+    let ask = || zellij_client::cli_client::agents_before_teardown(&make_os_input, name);
+    let agents = match ask().or_else(|_| {
+        std::thread::sleep(Duration::from_millis(500));
+        ask()
+    }) {
+        Ok(answer) => answer,
+        Err(e) => {
+            eprintln!(
+                "warning: could not ask '{}' which agents are working ({}); going ahead.",
+                name, e
+            );
+            return;
+        },
+    };
+    let busy = match teardown_guard(&agents, force) {
+        TeardownGuard::Proceed => return,
+        TeardownGuard::Refuse(busy) => busy,
+    };
+    let text = busy_refusal_text(verb, name, &busy);
+    eprint!("{}", text);
+    if let Some(log_file) = log_file {
+        if let Some(dir) = log_file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if log_file.exists() {
+            let _ = std::fs::rename(log_file, log_file.with_extension("log.1"));
+        }
+        let _ = std::fs::write(log_file, &text);
+    }
+    hold_a_pane_that_would_close(name);
+    process::exit(AGENTS_BUSY_EXIT_CODE);
+}
+
+/// Keep the refusal on screen when it was typed in, or launched into, the session it refused.
+///
+/// A restart is usually started inside the session as `zellij run --floating --close-on-exit --
+/// zellij session restart`, and that pane closes the moment this exits, taking the refusal with
+/// it. With a terminal on stdin inside the named session, this waits for Enter first. A script, an
+/// agent's tool call and an SSH caller have no terminal there, and never wait.
+fn hold_a_pane_that_would_close(name: &str) {
+    use std::io::IsTerminal;
+    if envs::get_session_name().ok().as_deref() != Some(name) || !io::stdin().is_terminal() {
+        return;
+    }
+    eprintln!("Press Enter to close.");
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+}
+
+/// What shape a `session up` is asked to build.
+///
+/// The three cases differ in more than which layout is read. Only `Snapshot` is a demand: it names
+/// a shape the caller chose, so failing to produce it is an error worth exiting on. `Resume` is a
+/// preference - come back as you were, if you can - and every one of its sources is allowed to be
+/// missing, because the caller of a bare `up` is usually the watchdog, which wants a session more
+/// than it wants a particular one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpShape {
+    /// Come back with the shape the session had, from whichever store still holds it.
+    Resume,
+    /// Come back from the layout, discarding the shape the session had.
+    Fresh,
+    /// Come back from this archived snapshot, by id or unique prefix.
+    Snapshot(String),
+}
+
+/// What the flags on `session up` mean. Clap refuses `--fresh` with `--restore`, so this never has
+/// to.
+fn up_shape(fresh: bool, restore: Option<String>) -> UpShape {
+    match (fresh, restore) {
+        (true, _) => UpShape::Fresh,
+        (false, Some(id)) => UpShape::Snapshot(id),
+        (false, None) => UpShape::Resume,
+    }
+}
+
+/// How long a restart's request for a shape stays good once nobody has acted on it.
+///
+/// The request is written before the teardown and written again once the teardown is done, so
+/// the age that matters runs from the end of the `down` to the `up` that creates the session. That
+/// stretch is a kickstarted launch agent or a started unit reaching its own `up` - launchd was
+/// measured at 15 to 20 seconds - and it is bounded by the 90 seconds any `up` waits for the lock.
+/// Two minutes clears both. Anything older belongs to a restart that died before it came back, and
+/// honouring it would turn an ordinary watchdog tick an hour later into a layout reset nobody asked
+/// for.
+const PENDING_SHAPE_TTL: Duration = Duration::from_secs(120);
+
+/// The file a `session restart` leaves for whichever `up` creates the session next.
+///
+/// Beside the up lock, for the reason the lock is where it is: the restart and the launch agent or
+/// unit it hands creation to are two zellij processes with two environments, and the socket
+/// directory is the one path both resolve the same way. See `session_lifecycle::up_lock_path`.
+fn pending_shape_path(name: &str) -> PathBuf {
+    zellij_utils::consts::ZELLIJ_SOCK_DIR.join(format!(".{}.up.pending", name))
+}
+
+/// The marker's contents for a shape, or `None` for `Resume`, which is what a bare `up` does
+/// anyway and so is nothing to ask for.
+fn encode_pending_shape(shape: &UpShape) -> Option<String> {
+    match shape {
+        UpShape::Resume => None,
+        UpShape::Fresh => Some("fresh\n".to_owned()),
+        UpShape::Snapshot(id) => Some(format!("restore {}\n", id)),
+    }
+}
+
+fn decode_pending_shape(contents: &str) -> Option<UpShape> {
+    let contents = contents.trim();
+    if contents == "fresh" {
+        return Some(UpShape::Fresh);
+    }
+    match contents.split_once(' ') {
+        Some(("restore", id)) if !id.trim().is_empty() => {
+            Some(UpShape::Snapshot(id.trim().to_owned()))
+        },
+        _ => None,
+    }
+}
+
+/// Leave `shape` for the next creator. False when there is nothing to leave or it could not be
+/// written, which puts the restart back where it was before the marker existed.
+fn write_pending_shape_at(path: &Path, shape: &UpShape) -> bool {
+    let Some(contents) = encode_pending_shape(shape) else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(path, contents) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "warning: could not write {} ({}); if the launch agent or unit creates the \
+                 session, it comes back however a bare `session up` would",
+                path.display(),
+                e
+            );
+            false
+        },
+    }
+}
+
+/// What a creating `up` found waiting for it.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingShape {
+    Nothing,
+    Live(UpShape),
+    /// Left by a restart that never came back, this long ago. Removed and not honoured.
+    Stale(Duration),
+}
+
+/// Take the marker, whatever is in it: one creator honours a request, and only one.
+fn take_pending_shape_at(path: &Path, ttl: Duration) -> PendingShape {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return PendingShape::Nothing;
+    };
+    // a clock that went backwards makes the file look young, which errs towards the request
+    let age = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(path);
+    match decode_pending_shape(&contents) {
+        Some(_) if age > ttl => PendingShape::Stale(age),
+        Some(shape) => PendingShape::Live(shape),
+        None => PendingShape::Nothing,
+    }
+}
+
+/// The shape a creating `up` builds, given what it was asked for and what a restart left.
+///
+/// The marker answers only a bare `up` - the launch agent's, the unit's, a watchdog's - because
+/// that is the request that carries no opinion. An explicit `--fresh` or `--restore` was typed by
+/// somebody and wins.
+fn shape_to_build(requested: UpShape, pending: Option<UpShape>) -> UpShape {
+    match (requested, pending) {
+        (UpShape::Resume, Some(pending)) => pending,
+        (requested, _) => requested,
+    }
+}
+
+/// How a shape reads in a sentence: "came back <this>".
+fn describe_shape(shape: &UpShape) -> String {
+    match shape {
+        UpShape::Resume => "with the shape it had".to_owned(),
+        UpShape::Fresh => "fresh from the layout".to_owned(),
+        UpShape::Snapshot(id) => format!("from snapshot {}", id),
+    }
+}
+
+/// Whether a `Resume` has to reach for the archive.
+///
+/// The in-place cache is the fresher of the two stores and `attach` reads it by itself, so the
+/// archive is consulted only when that file is gone - which is exactly what `session down` and
+/// `delete-session` leave behind, and the whole of the gap this branch closes.
+fn resume_wants_archive(resume_enabled: bool, cache_exists: bool) -> bool {
+    resume_enabled && !cache_exists
+}
+
+/// Whether a plain `up` resumes at all. Default true; `session_up_resume false` goes back to
+/// coming up from the layout whenever the in-place cache is gone.
+fn resume_enabled(opts: &CliArgs) -> bool {
+    get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_up_resume)
+        .unwrap_or(true)
+}
+
+/// The snapshot a bare `up` should come back from, as `(id, age)`, or `None` for the layout.
+///
+/// The layout is parsed here rather than left to `attach`, because the two callers want opposite
+/// things from a snapshot that no longer parses. `--restore` names one and exits 2 when it cannot
+/// be read; a derived one was nobody's request, and turning a routine watchdog tick into a machine
+/// with no session is a worse answer than a fresh session and a warning.
+fn resume_archive_target(name: &str, opts: &CliArgs) -> Option<(String, String)> {
+    use zellij_utils::consts::session_layout_cache_file_name;
+    use zellij_utils::session_snapshot::snapshots_for_session;
+
+    if !resume_wants_archive(
+        resume_enabled(opts),
+        session_layout_cache_file_name(&zellij_utils::sessions::session_id_for(name)).exists(),
+    ) {
+        return None;
+    }
+    // oldest first, so the newest is the one to pop
+    let snapshot = snapshots_for_session(&snapshot_settings(opts), name).pop()?;
+    let age = snapshot.saved_at_description();
+    match snapshot.layout() {
+        Ok(_) => Some((snapshot.id, age)),
+        Err(reason) => {
+            println!(
+                "      snapshot {} ({}) no longer parses, so it is left on disk and the session \
+                 comes up from the layout: {}",
+                snapshot.id, age, reason
+            );
+            None
+        },
+    }
+}
+
+/// Where the watchdog records the build pair it last warned about for `session`.
+///
+/// State, not cache: the stamp has to mean the same thing to every tick, and the cache directory
+/// moves with an environment a launcher does not share (see `consts.rs`).
+fn build_warning_stamp(session: &str) -> PathBuf {
+    zellij_utils::consts::ZELLIJ_STATE_DIR
+        .join("build-warned")
+        .join(session)
+}
+
+/// The running server's build and this binary's, in the fields `compare_builds` reads.
+///
+/// An upgrade changes this binary's identity and a restart changes the server's, so either one
+/// makes a new pair, and the watchdog warns about it again.
+fn build_pair(ours: Option<&ExecutableIdentity>, theirs: Option<&ExecutableIdentity>) -> String {
+    fn one(identity: Option<&ExecutableIdentity>) -> String {
+        let Some(identity) = identity else {
+            return "none".to_owned();
+        };
+        let build_id = identity.build_id.as_ref().map_or_else(
+            || "-".to_owned(),
+            |id| id.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+        );
+        let file_id = identity
+            .file_id
+            .map_or_else(|| "-".to_owned(), |(dev, ino)| format!("{}:{}", dev, ino));
+        let size = identity
+            .size
+            .map_or_else(|| "-".to_owned(), |size| size.to_string());
+        format!(
+            "{} file={} build={} size={} replaced={}",
+            identity.path.display(),
+            file_id,
+            build_id,
+            size,
+            identity.replaced
+        )
+    }
+    format!("running {}\nthis {}\n", one(theirs), one(ours))
+}
+
+/// The build-mismatch warning to print, if any, given the stamp the last tick left.
+///
+/// From a shell, every time: a person typed `up`, and the answer must say what "already running"
+/// hides. From the init system's own job, once per [`build_pair`]: the watchdog asks every
+/// 15 seconds, and while a restart was owed the same four lines went to stderr on
+/// every tick - 25,615 copies on one Mac. `session status` and `session doctor` still report it on
+/// demand. A stamp that cannot be written costs the old behaviour, never the warning.
+fn warning_to_print(
+    warning: Option<String>,
+    pair: &str,
+    as_the_unit: bool,
+    stamp: &Path,
+) -> Option<String> {
+    let warning = warning?;
+    if !as_the_unit {
+        return Some(warning);
+    }
+    if std::fs::read_to_string(stamp).map_or(false, |last| last == pair) {
+        return None;
+    }
+    if let Some(dir) = stamp.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(stamp, pair);
+    Some(warning)
+}
+
+/// Say that the healthy session `name` is served by a superseded build, if it is.
+fn warn_about_a_superseded_build(name: &str, as_the_unit: bool) {
+    let ours = own_executable();
+    let theirs = server_executable(name);
+    // `up` is how a caller gets OUT of skew, so strict mode never refuses it: exempt, it warns
+    let warning = match skew_decision(
+        name,
+        ours.as_ref(),
+        theirs.as_ref(),
+        strict_version(),
+        SkewCaller::Exempt,
+    ) {
+        SkewDecision::Warn(warning) | SkewDecision::Refuse(warning) => Some(warning),
+        SkewDecision::Proceed => None,
+    };
+    let pair = build_pair(ours.as_ref(), theirs.as_ref());
+    let stamp = build_warning_stamp(name);
+    if let Some(warning) = warning_to_print(warning, &pair, as_the_unit, &stamp) {
+        eprintln!("{}", warning);
+    }
+}
+
+/// Create the session if it is not there, then prove that it is.
+fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
+    // First, and on every `up` including the one that finds the session already healthy: an upgrade
+    // reaches the pinned copy through this pass and no other, and the pass that returns early is
+    // exactly the one an upgraded machine takes every minute.
+    assert_pinned_exe(name, configured_extras(opts).as_ref());
+    // Same pass, same reason: a config edit does not reach a unit nobody rewrote, and the `up` that
+    // returns early is exactly the one a machine with a stale unit takes every minute.
+    warn_if_unit_drifted(name, opts);
+
+    // Held for the rest of this function, which is what makes `up` idempotent under concurrency:
+    // the check and the creation are one step, so a `restart` overlapping the watchdog's minute
+    // tick waits here and then finds the session already up. See `session_lifecycle::lock_up`.
+    let _up_lock = lock_up(name);
+
+    let facts = SessionFacts::collect(name);
+    let healthy = facts.assert_up().is_ok();
+
+    // Only a NAMED snapshot is a demand that a running session contradicts. A bare `up` that would
+    // have resumed is answered by the session that is already there, which is what it wanted, and a
+    // watchdog tick must not start exiting 2 for finding the session up.
+    let named_snapshot = matches!(shape, UpShape::Snapshot(_));
+    if healthy && !named_snapshot {
+        // Silent when the init system's own job is the caller. The watchdog runs this every
+        // 15 seconds, and on a healthy session this line was its only output: a
+        // journal line per tick. A user unit cannot filter it with `LogLevelMax=` - journald reads
+        // that setting for the SYSTEM manager's units only - so the line has to not be written. The
+        // build warning below and every failure still go to stderr, and a pass that CREATES the
+        // session still prints `up`.
+        let as_the_unit = zellij_utils::session_lifecycle::running_as_the_unit(name);
+        if !as_the_unit {
+            println!("ok    session '{}' already running", name);
+        }
+        // "already running" is exactly the answer that hides a superseded build: an `up` after an
+        // upgrade reports success and leaves the old server serving the session.
+        warn_about_a_superseded_build(name, as_the_unit);
+        return Ok(());
+    }
+    if (healthy || facts.listed) && named_snapshot {
+        eprintln!(
+            "Session '{}' is running, so there is nothing to restore into.",
+            name
+        );
+        process::exit(2);
+    }
+    // Building a second server for a name that already has one is how the invisible duplicates were
+    // made in the first place. If something is already serving this name and the post-condition
+    // still does not hold, the fault is the thing to report - not a third server.
+    if !facts.servers.is_empty() && !healthy {
+        eprintln!(
+            "session up: refusing to create a second server for '{}'",
+            name
+        );
+        facts.print_diagnostics();
+        return Err(());
+    }
+
+    // Which macOS session domain a server is created in is decided once and inherited by every
+    // pane, so `up` from a shell that is not in the graphical session hands that decision to
+    // launchd rather than making it here. See `zellij_utils::session_lifecycle`.
+    #[cfg(target_os = "macos")]
+    match zellij_utils::session_lifecycle::ensure_gui_session_domain(
+        name,
+        facts.listed,
+        session_service::configured_restart_via_launchd(configured_extras(opts).as_ref()),
+    ) {
+        Ok(true) => {
+            // launchd is the creator now, and the job it just started runs `session up` - which
+            // takes this same lock. Held any longer, this process waits for a session that is
+            // waiting for this process. See `session_lifecycle::hand_over_up_lock`.
+            zellij_utils::session_lifecycle::hand_over_up_lock(name);
+            let facts = wait_for_server(name);
+            if let Err(reason) = facts.assert_up() {
+                eprintln!("session up: post-condition FAILED - {}", reason);
+                facts.print_diagnostics();
+                return Err(());
+            }
+            println!(
+                "up    session '{}' in {} (started in the graphical session)",
+                name,
+                facts.socket_dir.display()
+            );
+            return Ok(());
+        },
+        Ok(false) => {},
+        Err(reason) => {
+            eprintln!("session up: {}", reason);
+            return Err(());
+        },
+    }
+
+    // Everything from here to `start_client` is the environment the new session is built with, and
+    // only on the path that creates it: the server takes this process's environment and hands it to
+    // every pane shell, so what is set here is set in every pane for the life of the session. An
+    // `up` that found the session healthy has already returned, so nothing here touches a session
+    // that exists, and `restart` ends in this function and is covered by it.
+
+    // "Which session am I in" is read from these three. A launcher's environment has none - but
+    // `systemctl --user import-environment` and `dbus-update-activation-environment --systemd`, run
+    // from inside a pane as a desktop session ordinarily does, put a pane's copies into the user
+    // manager's environment, and from there into this unit. zellij would then believe it is running
+    // INSIDE a session, refuse to attach, and the timer would repeat that every minute forever.
+    // `restart` scrubs them for its own reason - it is about to destroy the session it was typed
+    // in - and this is the same scrub for the creator that never had a pane. It is also what makes
+    // an `UnsetEnvironment=` directive in the unit unnecessary rather than merely permitted.
+    for var in [
+        envs::ZELLIJ_ENV_KEY,
+        envs::SESSION_NAME_ENV_KEY,
+        "ZELLIJ_PANE_ID",
+    ] {
+        std::env::remove_var(var);
+    }
+    // A stale agent socket is worse than none, and the server hands its environment to every pane
+    // for the life of the session - so one dead path here is `git push` failing with "Permission
+    // denied (publickey)" in every pane, beside a terminal where it works. See
+    // `session_lifecycle::ssh_auth_sock_is_dangling`. Nothing is invented in its place: this
+    // machine cannot know where an agent would be, and a wrong path is the fault being removed.
+    let ssh_auth_sock = std::env::var("SSH_AUTH_SOCK").ok();
+    if zellij_utils::session_lifecycle::ssh_auth_sock_is_dangling(ssh_auth_sock.as_deref()) {
+        println!(
+            "      SSH_AUTH_SOCK names a socket that is not there ({}); dropping it rather than \
+             handing it to every pane",
+            ssh_auth_sock.unwrap_or_default()
+        );
+        std::env::remove_var("SSH_AUTH_SOCK");
+    }
+
+    warn_if_copy_command_has_no_display(opts);
+
+    // The configured drop-list is about the same hazard from the other end: a variable describing
+    // the ONE program that asked for this would otherwise describe every pane of the session. It
+    // reads as restart-specific and is not - `session up other-session` typed in an agent's pane
+    // bakes the agent's variables into a session it has nothing to do with.
+    drop_configured_env(opts);
+
+    // A launcher has no TERM and no COLORTERM - see
+    // `zellij_utils::session_lifecycle::term_for_new_session`. Both describe the CONNECTION rather
+    // than the user, which is what makes them the generator's business at all: the rc chain in each
+    // pane re-derives a locale or a PATH for itself and cannot re-derive these.
+    if let Some(term) = term_for_new_session(std::env::var("TERM").ok().as_deref()) {
+        println!("      no usable TERM here; the session gets TERM={}", term);
+        std::env::set_var("TERM", term);
+    }
+    if let Some(colorterm) = colorterm_for_new_session(std::env::var("COLORTERM").ok().as_deref()) {
+        std::env::set_var("COLORTERM", colorterm);
+    }
+
+    // A restart that handed creation to the launch agent or the unit asked for a shape that agent's
+    // bare `up` cannot know about, and left it here. Taken only on this path, the one that creates:
+    // the `up` that hands over returned above, and has to leave the marker for the one it woke.
+    let shape = match take_pending_shape_at(&pending_shape_path(name), PENDING_SHAPE_TTL) {
+        PendingShape::Live(pending) => {
+            let built = shape_to_build(shape.clone(), Some(pending.clone()));
+            if built != shape {
+                println!(
+                    "      a restart is waiting on this session; it comes back {}",
+                    describe_shape(&built)
+                );
+            }
+            built
+        },
+        PendingShape::Stale(age) => {
+            println!(
+                "      ignoring a restart's request left {}s ago by a restart that never came back",
+                age.as_secs()
+            );
+            shape
+        },
+        PendingShape::Nothing => shape,
+    };
+
+    // Which shape this session is built from, decided once, here. `attach` resurrects from the
+    // in-place cache by itself, so `Resume` only has work to do when that file is gone.
+    let derived = match &shape {
+        UpShape::Resume => resume_archive_target(name, opts),
+        UpShape::Fresh | UpShape::Snapshot(_) => None,
+    };
+    let restore = match &shape {
+        UpShape::Snapshot(id) => Some(id.clone()),
+        UpShape::Fresh => None,
+        UpShape::Resume => derived.as_ref().map(|(id, _)| id.clone()),
+    };
+    // `--fresh` discards the in-place cache rather than merely ignoring it, which is what makes a
+    // layout edit apply. The archived snapshot is untouched, so the discarded shape is still
+    // reachable with `session up --restore`.
+    let no_resurrect = matches!(shape, UpShape::Fresh);
+
+    let mut opts = opts.clone();
+    opts.session = None;
+    opts.command = Some(Command::Sessions(Sessions::Attach {
+        args: AttachArgs {
+            session_name: Some(name.to_owned()),
+            create: true,
+            no_resurrect: no_resurrect,
+            restore: restore.clone(),
+            ..AttachArgs::default()
+        },
+        create_background: true,
+    }));
+    start_client(opts);
+
+    let facts = wait_for_server(name);
+    if let Err(reason) = facts.assert_up() {
+        eprintln!("session up: post-condition FAILED - {}", reason);
+        facts.print_diagnostics();
+        return Err(());
+    }
+    println!("up    session '{}' in {}", name, facts.socket_dir.display());
+    match (&derived, &restore) {
+        (Some((id, age)), _) => println!("      restored from snapshot {} (saved {})", id, age),
+        (None, Some(id)) => println!("      restored from snapshot {}", id),
+        (None, None) => {},
+    }
+    Ok(())
+}
+
+/// Poll until the session looks up, or until the timeout says it never will.
+///
+/// The gap doubles, because every poll costs a `ps` over the whole process table and the two cases
+/// want opposite things from it. A session that comes up does so in the first few hundred
+/// milliseconds and wants to be noticed at once; a session that is never coming up spends the whole
+/// of `SERVER_APPEARANCE_TIMEOUT` proving it, and that is the case a launcher REPEATS every minute
+/// for as long as the fault lasts. Backing off cuts the forks on the failing machine by about an
+/// order of magnitude and costs the healthy one nothing.
+///
+/// Nothing here gives up early or escalates, deliberately. This function's whole answer is "the
+/// post-condition does not hold yet", and its caller already reports that loudly and with
+/// diagnostics - to the journal on systemd, to the log the plist names on launchd. What would
+/// escalate is the watchdog deciding to stop retrying, and a watchdog that switches itself off is
+/// the one behaviour a person cannot recover from without a shell on the machine.
+fn wait_for_server(name: &str) -> SessionFacts {
+    let deadline = Instant::now() + SERVER_APPEARANCE_TIMEOUT;
+    let mut gap = SERVER_APPEARANCE_FIRST_POLL;
+    loop {
+        let facts = SessionFacts::collect(name);
+        if facts.assert_up().is_ok() || Instant::now() >= deadline {
+            return facts;
+        }
+        std::thread::sleep(gap);
+        gap = (gap * 2).min(SERVER_APPEARANCE_MAX_POLL);
+    }
+}
+
+/// Remove the session, then prove it is gone.
+///
+/// `delete-session` archives the session's shape on its way out and waits for the server process to
+/// have actually exited, so nothing here polls and nothing here kills. A server that outlives its
+/// delete is a fault to report, not a thing to paper over: a blind reap is what once left a server
+/// running for twelve minutes, still parenting four pane shells, while every caller believed the
+/// session was down.
+///
+/// Finding nothing to remove is not one of those faults, which is where this parts company with
+/// `delete-session`: the name asked about is down, which is the state that was asked for. Only a
+/// name something is still serving fails.
+fn down(name: &str, wait_timeout: u64, opts: &CliArgs) -> Result<(), ()> {
+    // The same lock `up` and `restart` take, and for the same reason from the other side: without
+    // it a teardown races the watchdog tick it is meant to be serialised against. Either the
+    // teardown kills the server a tick has just created - and the tick reports a post-condition
+    // failure on a healthy machine - or the tick's `up` puts the session straight back after this
+    // has printed `removed`, and the teardown silently did not stick.
+    //
+    // Held across the whole function, so the check and the removal are one step. A `restart` that
+    // already holds it re-enters rather than waiting; see `session_lifecycle::lock_up`.
+    let _down_lock = lock_up(name);
+
+    let facts = SessionFacts::collect(name);
+    if facts.assert_down().is_ok() && !facts.listed {
+        println!(
+            "ok    session '{}' is already down; nothing to remove",
+            name
+        );
+        return Ok(());
+    }
+
+    let no_wait = false;
+    let deleted = delete_session_reporting(
+        name,
+        true,
+        &snapshot_settings(opts),
+        KillWait::from_cli(no_wait, wait_timeout),
+    );
+
+    let facts = SessionFacts::collect(name);
+    match DownOutcome::judge(deleted, facts.assert_down()) {
+        DownOutcome::Failed(reason) => {
+            eprintln!("session down: post-condition FAILED - {}", reason);
+            facts.print_diagnostics();
+            eprintln!("  nothing was force-killed; inspect the above before retrying.");
+            Err(())
+        },
+        DownOutcome::NothingToRemove => {
+            println!("ok    session '{}' is down; nothing to remove", name);
+            Ok(())
+        },
+        DownOutcome::Removed => {
+            println!(
+                "down  session '{}' removed; snapshot archived (zellij snapshot list --session {})",
+                name, name
+            );
+            Ok(())
+        },
+    }
+}
+
+/// Say so when the session about to be created has a `copy_command` and no display.
+///
+/// `copy_command` runs in the SERVER, with the environment the session was created with, for the
+/// session's whole life - see `session_lifecycle::copy_command_has_no_display`. A launcher has
+/// neither display variable, so `wl-copy` or `xclip` exits non-zero on every copy and the only
+/// place that goes is `log::error!`: from inside, copy silently does nothing in a session where
+/// everything else works.
+///
+/// Not on macOS, where the ordinary `copy_command` is `pbcopy` and neither variable exists on any
+/// machine - the warning would be wrong on every Mac. Not on Windows either, which has no display
+/// variables to be missing.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn warn_if_copy_command_has_no_display(opts: &CliArgs) {
+    use zellij_utils::session_lifecycle::{copy_command_has_no_display, DISPLAY_ENV_NAMES};
+
+    let Some(copy_command) = get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.copy_command)
+    else {
+        return;
+    };
+    let names: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
+    if !copy_command_has_no_display(Some(&copy_command), names.iter().map(|name| name.as_str())) {
+        return;
+    }
+    eprintln!(
+        "warning: `copy_command` is set to `{}`, and none of {} is in the environment this\n         \
+         session is being created with. copy_command runs in the SERVER with that environment\n         \
+         for the life of the session, so if the command talks to X or Wayland every copy will\n         \
+         fail and the only record will be a line in the server log.\n         \
+         Give the launcher the variable it needs - a `session_service` extra sets one - or\n         \
+         create the session from the graphical login.",
+        copy_command,
+        DISPLAY_ENV_NAMES.join(" or ")
+    );
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn warn_if_copy_command_has_no_display(_opts: &CliArgs) {}
+
+/// Unset what `session_restart_drop_env` names, so the rebuilt session does not hand it out.
+///
+/// The environment a restart inherits is the environment of the pane it was typed in, and the
+/// session built from it gives that environment to every pane in it. A variable that describes the
+/// one program that asked for the restart would then describe all of them, and programs that read
+/// it would believe something about their pane that is not true. Called once the restart is a
+/// session of its own and before anything is rebuilt, so nothing carries the old values across.
+fn drop_configured_env(opts: &CliArgs) {
+    let Some(patterns) = get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_restart_drop_env)
+    else {
+        return;
+    };
+    let names: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
+    for name in env_vars_to_drop(&patterns, names.iter().map(|name| name.as_str())) {
+        println!("      dropping {} from the rebuilt session", name);
+        std::env::remove_var(name);
+    }
+}
+
+/// Take the session down and bring it back, from inside it or from anywhere else.
+///
+/// The work has to outlive the session it is destroying: the teardown kills every pane shell,
+/// including whichever one asked for the restart. Leaving the session's process tree first is the
+/// whole trick, and a background job is not enough - a pane's children are signalled as a process
+/// group and SIGKILLed shortly after. The double fork plus `setsid` that daemonizes the server is
+/// reused here for the same reason it exists there.
+#[cfg(unix)]
+
+/// What a `session restart` comes back from.
+///
+/// The pre-restart shape is what a restart is almost always for - the process is the thing being
+/// replaced, not the layout - so a snapshot is restored by default and `--fresh` is the deliberate
+/// exception, for picking up a layout edit. Clap refuses the two together, so this never has to.
+fn restart_restore_target(fresh: bool, restore: Option<String>) -> UpShape {
+    if fresh {
+        // Load-bearing, and the reason this returns a shape rather than an `Option`: a plain `up`
+        // now resumes, so a `--fresh` restart that asked for "no snapshot" by passing `None` would
+        // be handed the newest one back. `Fresh` is the only way to the layout and stays that way.
+        UpShape::Fresh
+    } else {
+        UpShape::Snapshot(restore.unwrap_or_else(|| "latest".to_owned()))
+    }
+}
+
+/// The two handles the daemonized restart writes its output through, both append-mode.
+///
+/// **Both being append-mode is not a style choice, and mixing them cost a warning.** A descriptor
+/// from `File::create` carries an offset of its own, starting at zero; an append-mode one writes at
+/// the end of the file on every write. Handing stdout the first and stderr the second let the two
+/// cursors diverge: stderr's line landed at EOF, then the next stdout write went down at its own
+/// lower offset and overwrote the front of it. That is what ate the first 36 bytes of
+/// `warning: the pin was NOT refreshed: S…` and left a log holding `ecurity: SecKeychain…`
+/// (nkmk.12 fleet finding, deterministic, cosmetic). An `O_APPEND` write seeks to the end as part
+/// of the write itself, so two of them interleave by line instead of landing on top of each other.
+///
+/// Truncating is now a step of its own rather than a side effect of `create`, because starting the
+/// generation and handing out a descriptor were two jobs one call was doing.
+fn open_restart_log(log_file: &Path) -> std::io::Result<(std::fs::File, std::fs::File)> {
+    std::fs::File::create(log_file)?;
+    let appending = || std::fs::OpenOptions::new().append(true).open(log_file);
+    Ok((appending()?, appending()?))
+}
+
+fn restart(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
+    use zellij_utils::consts::ZELLIJ_STATE_DIR;
+
+    let log_file = ZELLIJ_STATE_DIR.join("restart.log");
+    eprintln!("detaching; output -> {}", log_file.display());
+
+    if let Err(e) = std::fs::create_dir_all(&*ZELLIJ_STATE_DIR) {
+        eprintln!("Failed to create {}: {}", ZELLIJ_STATE_DIR.display(), e);
+        process::exit(1);
+    }
+    // Keep one generation: a restart that goes wrong is usually diagnosed after the next one has
+    // already overwritten the log.
+    if log_file.exists() {
+        let _ = std::fs::rename(&log_file, log_file.with_extension("log.1"));
+    }
+    let (stdout, stderr) = match open_restart_log(&log_file) {
+        Ok(handles) => handles,
+        Err(e) => {
+            eprintln!("Failed to open {}: {}", log_file.display(), e);
+            process::exit(1);
+        },
+    };
+
+    let working_directory = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    if let Err(e) = daemonize::Daemonize::new()
+        .working_directory(working_directory)
+        .stdout(stdout)
+        .stderr(stderr)
+        .start()
+    {
+        eprintln!("Failed to detach from this session: {}", e);
+        process::exit(1);
+    }
+
+    // Past this point we are a session of our own, and the pane we came from is about to die.
+    // zellij reads "the session I am in" from these; left in place they make `down` refuse and the
+    // recreated session's panes believe they are nested inside a session that no longer exists.
+    for var in [
+        envs::ZELLIJ_ENV_KEY,
+        envs::SESSION_NAME_ENV_KEY,
+        "ZELLIJ_PANE_ID",
+    ] {
+        std::env::remove_var(var);
+    }
+    drop_configured_env(opts);
+
+    // Held across BOTH steps, and taken here rather than left to `up`. A restart is a `down`
+    // followed by an `up`, and the watchdog's minute tick fits between them: its `up` takes the
+    // lock first, finds nothing, and builds the session fresh from the layout. This `up` then
+    // waits, finds a healthy session, and either reports "already running" or refuses to restore
+    // into it - having thrown away the snapshot the restart existed to bring back. The inner `up`
+    // re-enters this hold rather than waiting for it; see `session_lifecycle::lock_up`.
+    //
+    // Taken after the daemonize, so the descriptor belongs to the process that does the work: a
+    // restart that dies mid-hold has the flock released for it by the kernel. At the default
+    // `--wait-timeout` both steps together are bounded well inside the lock's own 90 seconds - 10
+    // for the down and 30 for the up - so a waiting `up` waits rather than giving up and proceeding
+    // unlocked; a `--wait-timeout` past about a minute can outlast that, which `lock_up` records and
+    // `a_slow_restart_still_fits_inside_the_up_lock` asserts.
+    let _restart_lock = lock_up(name);
+
+    down_then_up(name, shape, wait_timeout, opts);
+}
+
+/// Windows has no fork, and no process group to escape from: the caller's shell is not a pane shell
+/// the server is about to kill.
+#[cfg(not(unix))]
+fn restart(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
+    drop_configured_env(opts);
+    down_then_up(name, shape, wait_timeout, opts);
+}
+
+/// The two halves of a restart, with the shape it asked for left where any creator will find it.
+///
+/// The up lock keeps a watchdog tick out of the gap, but it cannot carry the shape across a
+/// handover: when the inner `up` asks launchd or systemd for the session, the job that creates it
+/// runs a bare `session up`, which resumes - so a `--fresh` restart came back from the snapshot its
+/// own teardown had just archived, and said it had succeeded. The marker is how the shape reaches
+/// that job, and its absence afterwards is how this knows the shape was honoured.
+fn down_then_up(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
+    let pending = pending_shape_path(name);
+    let marked = write_pending_shape_at(&pending, &shape);
+    if down(name, wait_timeout, opts).is_err() {
+        let _ = std::fs::remove_file(&pending);
+        eprintln!("teardown failed; NOT recreating the session.");
+        process::exit(1);
+    }
+    // the TTL runs from here, not from before a teardown of unbounded `--wait-timeout`
+    let marked = marked && write_pending_shape_at(&pending, &shape);
+    if up(name, shape.clone(), opts).is_err() {
+        process::exit(1);
+    }
+    if marked && pending.exists() {
+        // Nobody that created the session took the request: a launch agent or unit running a
+        // build from before this marker existed, or a session already up when this came to
+        // create it. Either way it came back however that `up` decided, which is not this.
+        let _ = std::fs::remove_file(&pending);
+        eprintln!(
+            "session restart: '{}' is up, but whatever created it did not come back {} as this \
+             restart asked; it came back however a bare `session up` would. Check `zellij \
+             session status {}`, and restart again if the shape is wrong.",
+            name,
+            describe_shape(&shape),
+            name
+        );
+        process::exit(1);
+    }
+    if marked {
+        println!("ok    '{}' came back {}", name, describe_shape(&shape));
+    }
+    process::exit(0);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn identity(path: &str, build: u8) -> ExecutableIdentity {
+        ExecutableIdentity {
+            path: PathBuf::from(path),
+            file_id: Some((1, u64::from(build))),
+            build_id: Some(vec![build]),
+            size: Some(100),
+            replaced: false,
+        }
+    }
+
+    /// One healthy-session `up`, as it decides the warning, over identities and a stamp the test
+    /// owns.
+    fn tick(
+        ours: &ExecutableIdentity,
+        theirs: &ExecutableIdentity,
+        as_the_unit: bool,
+        stamp: &Path,
+    ) -> Option<String> {
+        let warning = zellij_utils::session_lifecycle::build_mismatch_warning_of(
+            "s",
+            Some(ours),
+            Some(theirs),
+        );
+        let pair = build_pair(Some(ours), Some(theirs));
+        warning_to_print(warning, &pair, as_the_unit, stamp)
+    }
+
+    fn stamp_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("build-warned").join("s")
+    }
+
+    #[test]
+    fn the_units_first_tick_on_a_superseded_build_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let warning = tick(&identity("/new", 2), &identity("/old", 1), true, &stamp);
+        assert!(warning.unwrap().contains("running a different build"));
+        assert!(stamp.exists());
+    }
+
+    #[test]
+    fn the_units_next_tick_on_the_same_pair_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let (ours, theirs) = (identity("/new", 2), identity("/old", 1));
+        assert!(tick(&ours, &theirs, true, &stamp).is_some());
+        assert_eq!(tick(&ours, &theirs, true, &stamp), None);
+        assert_eq!(tick(&ours, &theirs, true, &stamp), None);
+    }
+
+    #[test]
+    fn the_unit_warns_again_when_the_pair_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let theirs = identity("/old", 1);
+        assert!(tick(&identity("/new", 2), &theirs, true, &stamp).is_some());
+        // a second upgrade lands before the restart: this binary is a new build again
+        assert!(tick(&identity("/new", 3), &theirs, true, &stamp).is_some());
+        assert_eq!(tick(&identity("/new", 3), &theirs, true, &stamp), None);
+        // a restart onto a build that is still not this one
+        assert!(tick(&identity("/new", 3), &identity("/mid", 4), true, &stamp).is_some());
+    }
+
+    #[test]
+    fn up_from_a_shell_warns_every_time_and_leaves_the_stamp_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let (ours, theirs) = (identity("/new", 2), identity("/old", 1));
+        for _ in 0..3 {
+            assert!(tick(&ours, &theirs, false, &stamp).is_some());
+        }
+        assert!(!stamp.exists());
+        // and a shell call after the unit has warned still warns
+        assert!(tick(&ours, &theirs, true, &stamp).is_some());
+        assert!(tick(&ours, &theirs, false, &stamp).is_some());
+        assert_eq!(tick(&ours, &theirs, true, &stamp), None);
+    }
+
+    #[test]
+    fn the_same_build_says_nothing_and_writes_no_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let build = identity("/same", 1);
+        assert_eq!(tick(&build, &build, true, &stamp), None);
+        assert_eq!(tick(&build, &build, false, &stamp), None);
+        assert!(!stamp.exists());
+    }
+
+    #[test]
+    fn a_restart_comes_back_from_the_newest_snapshot() {
+        assert_eq!(
+            restart_restore_target(false, None),
+            UpShape::Snapshot("latest".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_restart_can_be_told_which_snapshot() {
+        assert_eq!(
+            restart_restore_target(false, Some("abc123".to_owned())),
+            UpShape::Snapshot("abc123".to_owned())
+        );
+    }
+
+    /// The two handles wrote over each other while only one of them appended: the second stream's
+    /// line landed at the end of the file, and the first stream's next write went down at its own
+    /// lower offset and ate the front of it. Written here in the order the fleet finding saw -
+    /// stderr's long warning, then a shorter line on stdout - because that is the order that
+    /// exposes it.
+    #[test]
+    fn both_restart_log_handles_append_so_neither_stream_eats_the_other() {
+        use std::io::Write;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let log_file = scratch.path().join("restart.log");
+        let (mut stdout, mut stderr) = open_restart_log(&log_file).unwrap();
+
+        let warning = "warning: the pin was NOT refreshed: Security: SecKeychainUnlock failed";
+        writeln!(stderr, "{}", warning).unwrap();
+        writeln!(stdout, "tearing down mysession").unwrap();
+
+        let written = std::fs::read_to_string(&log_file).unwrap();
+        assert!(written.contains(warning), "{:?}", written);
+        assert!(written.contains("tearing down mysession"), "{:?}", written);
+    }
+
+    /// A restart keeps one generation, so the handles must start an empty file rather than append
+    /// to whatever the last run left.
+    #[test]
+    fn opening_the_restart_log_starts_a_new_generation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log_file = scratch.path().join("restart.log");
+        std::fs::write(&log_file, "output from the run before this one\n").unwrap();
+
+        let _handles = open_restart_log(&log_file).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&log_file).unwrap(), "");
+    }
+
+    #[test]
+    fn a_fresh_restart_restores_nothing() {
+        // the negative control: --fresh is the only way back to the layout, and it stays that way.
+        // `Fresh` rather than "no snapshot named" is the whole point of the enum - a bare `up`
+        // resumes, so "nothing named" would now mean "resume from the newest snapshot".
+        assert_eq!(restart_restore_target(true, None), UpShape::Fresh);
+    }
+
+    #[test]
+    fn a_bare_up_resumes() {
+        assert_eq!(up_shape(false, None), UpShape::Resume);
+    }
+
+    #[test]
+    fn a_fresh_up_comes_from_the_layout() {
+        assert_eq!(up_shape(true, None), UpShape::Fresh);
+    }
+
+    #[test]
+    fn an_up_can_be_told_which_snapshot() {
+        assert_eq!(
+            up_shape(false, Some("abc123".to_owned())),
+            UpShape::Snapshot("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_resume_leaves_an_in_place_shape_to_attach() {
+        // attach resurrects from the in-place cache by itself, and that file is fresher than any
+        // snapshot, so the archive is not consulted while it exists
+        assert!(!resume_wants_archive(true, true));
+    }
+
+    #[test]
+    fn a_resume_reaches_the_archive_once_the_in_place_shape_is_gone() {
+        // what `session down` and `delete-session` leave behind, and the gap this closes
+        assert!(resume_wants_archive(true, false));
+    }
+
+    #[test]
+    fn resuming_can_be_turned_off() {
+        assert!(!resume_wants_archive(false, false));
+    }
+
+    #[test]
+    fn a_restart_marker_round_trips_every_shape_it_carries() {
+        for shape in [
+            UpShape::Fresh,
+            UpShape::Snapshot("1790912056110-27d33eb6".to_owned()),
+        ] {
+            let encoded = encode_pending_shape(&shape).unwrap();
+            assert_eq!(decode_pending_shape(&encoded), Some(shape));
+        }
+    }
+
+    #[test]
+    fn a_resume_leaves_no_marker() {
+        // a bare `up` resumes anyway, so there is nothing to ask the next creator for
+        assert_eq!(encode_pending_shape(&UpShape::Resume), None);
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join(".s.up.pending");
+        assert!(!write_pending_shape_at(&path, &UpShape::Resume));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_marker_nobody_wrote_is_not_honoured() {
+        for garbage in ["", "restore", "restore  ", "resume", "fresh please"] {
+            assert_eq!(decode_pending_shape(garbage), None, "{:?}", garbage);
+        }
+    }
+
+    #[test]
+    fn the_creator_takes_the_marker_so_only_one_honours_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join(".s.up.pending");
+        assert!(write_pending_shape_at(&path, &UpShape::Fresh));
+
+        assert_eq!(
+            take_pending_shape_at(&path, PENDING_SHAPE_TTL),
+            PendingShape::Live(UpShape::Fresh)
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            take_pending_shape_at(&path, PENDING_SHAPE_TTL),
+            PendingShape::Nothing
+        );
+    }
+
+    #[test]
+    fn a_marker_from_a_restart_that_never_came_back_expires() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join(".s.up.pending");
+        assert!(write_pending_shape_at(&path, &UpShape::Fresh));
+        let old = std::time::SystemTime::now() - (PENDING_SHAPE_TTL + Duration::from_secs(60));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        match take_pending_shape_at(&path, PENDING_SHAPE_TTL) {
+            PendingShape::Stale(age) => assert!(age > PENDING_SHAPE_TTL),
+            other => panic!("expected a stale marker, got {:?}", other),
+        }
+        // removed as well as ignored, so the next tick does not report it again
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_bare_up_builds_what_the_restart_asked_for() {
+        // the launch agent's or the unit's `up`: the case the race lost
+        assert_eq!(
+            shape_to_build(UpShape::Resume, Some(UpShape::Fresh)),
+            UpShape::Fresh
+        );
+        assert_eq!(
+            shape_to_build(UpShape::Resume, Some(UpShape::Snapshot("abc".to_owned()))),
+            UpShape::Snapshot("abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_bare_up_with_no_restart_waiting_still_resumes() {
+        assert_eq!(shape_to_build(UpShape::Resume, None), UpShape::Resume);
+    }
+
+    #[test]
+    fn an_explicit_up_wins_over_the_marker() {
+        assert_eq!(
+            shape_to_build(UpShape::Snapshot("abc".to_owned()), Some(UpShape::Fresh)),
+            UpShape::Snapshot("abc".to_owned())
+        );
+        assert_eq!(
+            shape_to_build(UpShape::Fresh, Some(UpShape::Snapshot("abc".to_owned()))),
+            UpShape::Fresh
+        );
+    }
+
+    /// The marker has to be a file both sides of a handover resolve to, which is the up lock's
+    /// directory and nowhere derived from the environment.
+    #[test]
+    fn the_marker_sits_beside_the_up_lock() {
+        use zellij_utils::session_lifecycle::up_lock_path;
+        assert_eq!(pending_shape_path("s").parent(), up_lock_path("s").parent());
+    }
+    use zellij_utils::session_lifecycle::UP_LOCK_TIMEOUT;
+
+    /// The default `--wait-timeout` on `session restart`, read from the parser rather than copied,
+    /// because the invariant below is only guarded if a change to that default breaks this test.
+    ///
+    /// Parsed on a big stack, like every other test that builds the clap tree: a test thread's own
+    /// stack overflows on it. See [`on_big_stack`].
+    fn default_restart_wait_timeout() -> Duration {
+        use clap::Parser;
+        use zellij_utils::cli::on_big_stack;
+
+        let parsed =
+            on_big_stack(|| CliArgs::try_parse_from(["zellij", "session", "restart", "a-session"]))
+                .expect("`session restart` parses with no flags");
+        match parsed.command {
+            Some(Command::Sessions(Sessions::Session(SessionLifecycleCli::Restart {
+                wait_timeout,
+                ..
+            }))) => Duration::from_secs(wait_timeout),
+            other => panic!("expected a `session restart` command, got {:?}", other),
+        }
+    }
+
+    /// `restart` holds the up-lock across its down and its up, so the longest hold a healthy
+    /// machine produces is a `--wait-timeout` down plus this wait for the server. A waiting `up`
+    /// that gives up first goes ahead without the lock, which is the two-servers-for-one-name race
+    /// the lock exists to prevent - so raising ANY of the three without the others reintroduces it.
+    #[test]
+    fn a_slow_restart_still_fits_inside_the_up_lock() {
+        let longest_down = default_restart_wait_timeout();
+        assert!(
+            longest_down + SERVER_APPEARANCE_TIMEOUT < UP_LOCK_TIMEOUT,
+            "a restart can hold the lock for {:?}, but a waiting `up` gives up after {:?}",
+            longest_down + SERVER_APPEARANCE_TIMEOUT,
+            UP_LOCK_TIMEOUT
+        );
+    }
+
+    /// The arithmetic above holds only while the thing being waited for is not itself waiting for
+    /// this lock, and a kickstarted launch agent is exactly that. It runs `zellij session up
+    /// <name>` in ANOTHER process, whose `lock_up` cannot re-enter this one - re-entrancy is
+    /// per thread - so it blocks on the `flock` for `UP_LOCK_TIMEOUT` while this side spends
+    /// `SERVER_APPEARANCE_TIMEOUT` waiting for the session it would have created. The inequality
+    /// that makes a slow restart safe is what guarantees the deadlock here: the caller always
+    /// gives up first, reports `post-condition FAILED`, exits non-zero, and the session appears
+    /// moments later anyway.
+    ///
+    /// So the `Ok(true)` arm hands the lock over before it waits. Asserted through the derived
+    /// path rather than a scratch one, because the two processes only meet if `up_lock_path` gives
+    /// them the same file.
+    #[test]
+    #[cfg(unix)]
+    fn handing_the_session_to_launchd_releases_the_lock_the_job_needs() {
+        use zellij_utils::session_lifecycle::{
+            hand_over_up_lock, lock_up, up_lock_is_free, up_lock_path,
+        };
+
+        let name = format!("zj-handover-{}", std::process::id());
+
+        // the shape `restart` makes: its own hold, with the inner `up`'s inside it
+        let restart_lock = lock_up(&name).expect("the lock is free");
+        let up_lock = lock_up(&name).expect("re-entered rather than waited");
+        assert!(
+            !up_lock_is_free(&name),
+            "nothing was holding it to begin with"
+        );
+
+        hand_over_up_lock(&name);
+        // what the kickstarted job's own `lock_up` finds, asked on its own descriptor - which is
+        // how another process asks it
+        assert!(
+            up_lock_is_free(&name),
+            "the job launchd just started would block here for {:?}",
+            UP_LOCK_TIMEOUT
+        );
+
+        drop(up_lock);
+        drop(restart_lock);
+        let _ = std::fs::remove_file(up_lock_path(&name));
+    }
+
+    /// `down` now takes the up-lock too, and a `restart` calls `down` while already holding it.
+    ///
+    /// So the nested acquisition has to RE-ENTER. A second `flock` would wait `UP_LOCK_TIMEOUT`
+    /// for a hold this very thread owns and then go ahead unlocked, which is the two-servers race
+    /// the lock exists to close - a restart would deadlock against itself for a minute and a half
+    /// and then run without the protection.
+    #[test]
+    #[cfg(unix)]
+    fn a_down_nested_inside_a_restart_re_enters_the_lock_rather_than_waiting() {
+        use zellij_utils::session_lifecycle::{lock_up, up_lock_is_free, up_lock_path};
+
+        let name = format!("zj-downlock-{}", std::process::id());
+        let restart_lock = lock_up(&name).expect("the lock is free");
+
+        let started = std::time::Instant::now();
+        let down_lock = lock_up(&name).expect("re-entered rather than waited");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the nested `down` waited {:?} for a lock this thread already holds",
+            started.elapsed()
+        );
+
+        // the outer hold survives the inner drop, or `restart`'s `up` would run unlocked
+        drop(down_lock);
+        assert!(
+            !up_lock_is_free(&name),
+            "`down` finishing released the lock `restart` still needs"
+        );
+
+        drop(restart_lock);
+        assert!(up_lock_is_free(&name), "the outermost hold never let go");
+        let _ = std::fs::remove_file(up_lock_path(&name));
+    }
+
+    /// launchd was measured at 15 to 20 seconds on the fleet's Macs, and a `session up` that
+    /// reports a false post-condition failure on every slow start teaches everyone to ignore the
+    /// one line that reports a real one.
+    #[test]
+    fn the_wait_for_a_server_outlasts_a_measured_launchd_start() {
+        assert!(SERVER_APPEARANCE_TIMEOUT >= Duration::from_secs(30));
+    }
+
+    /// The stdout `head -3` leaves behind: every write after the reader has gone gets `EPIPE`.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+        }
+    }
+
+    /// `zellij session status <name> | head -3` used to panic here, because every line of the
+    /// report went out through `println!`. The exit code is 0 even though the report it was
+    /// carrying was going to be 1: the reader left before the answer, so there is nobody to fail.
+    #[test]
+    fn a_reader_that_stopped_reading_ends_the_report_at_zero() {
+        let cut_short =
+            print_configured_extras(&mut ClosedPipe, ServiceKind::Systemd, None).map(|()| 1);
+
+        assert_eq!(
+            cut_short.as_ref().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(report_exit_code("session status", cut_short), 0);
+    }
+
+    /// The other half of the same rule. A redirected stdout that cannot be written is this
+    /// command's failure and is still reported - it is only the reader leaving that is not.
+    #[test]
+    fn a_write_that_fails_for_another_reason_is_still_a_failure() {
+        let failed = Err(io::Error::new(io::ErrorKind::PermissionDenied, "read-only"));
+
+        assert_eq!(report_exit_code("session status", failed), 1);
+    }
+
+    /// The build line and its vote on the exit code: only a server known to run another build
+    /// fails the report. A comparison that could not be made is said, and does not fail it.
+    #[test]
+    fn the_build_line_fails_status_only_for_a_different_build() {
+        let line = |verdict: Option<&BuildVerdict>| {
+            let mut out = Vec::new();
+            let current = print_build(&mut out, "work", verdict).unwrap();
+            (String::from_utf8(out).unwrap(), current)
+        };
+
+        let (text, current) = line(Some(&BuildVerdict::Same));
+        assert_eq!(text, "build     the running server is this build\n");
+        assert!(current);
+
+        let (text, current) = line(Some(&BuildVerdict::Different {
+            running: PathBuf::from("/pin/zellij"),
+            this: PathBuf::from("/opt/zellij"),
+        }));
+        assert!(!current);
+        assert!(text.contains("the server runs /pin/zellij"), "{}", text);
+        assert!(text.contains("this is /opt/zellij"), "{}", text);
+        assert!(text.contains("zellij session restart work"), "{}", text);
+
+        let (text, current) = line(Some(&BuildVerdict::CannotTell("unreadable".to_owned())));
+        assert_eq!(text, "build     cannot tell - unreadable\n");
+        assert!(current);
+
+        let (text, current) = line(None);
+        assert_eq!(text, "build     no server running to compare\n");
+        assert!(current);
+    }
+
+    /// The negative control: routing the report through a handle must not stop it being written.
+    #[test]
+    fn a_reader_that_stays_gets_the_line() {
+        let mut out = Vec::new();
+
+        print_configured_extras(&mut out, ServiceKind::Systemd, None).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "config    no session_service extras\n"
+        );
+    }
+
+    /// One `list-agents --json` row, with `state` and `state_working` as given.
+    fn agent(handle: &str, state: Option<&str>, working: u32) -> AgentListEntry {
+        let mut row = serde_json::json!({
+            "handle": handle,
+            "pane_id": 1,
+            "tab_id": 0,
+            "tab_position": 0,
+            "tab_name": "develop",
+            "title": "claude",
+            "kind": "claude",
+            "source": "command",
+        });
+        if let Some(state) = state {
+            row["state"] = state.into();
+            row["state_at"] = 1.into();
+            if working > 0 {
+                row["state_working"] = working.into();
+            }
+        }
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn a_working_agent_refuses_the_teardown_and_force_overrides_it() {
+        let agents = vec![
+            agent("idle-otter", Some("idle"), 0),
+            agent("busy-fox", Some("working"), 1),
+        ];
+        match teardown_guard(&agents, false) {
+            TeardownGuard::Refuse(busy) => {
+                assert_eq!(busy.len(), 1);
+                assert_eq!(busy[0].0.handle, "busy-fox");
+                assert_eq!(busy[0].1, "working");
+            },
+            other => panic!("expected a refusal, got {:?}", other),
+        }
+        assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+    }
+
+    #[test]
+    fn idle_finished_and_silent_agents_let_the_teardown_through() {
+        for state in [Some("idle"), Some("done"), Some("error"), None] {
+            let agents = vec![agent("quiet-heron", state, 0)];
+            assert_eq!(
+                teardown_guard(&agents, false),
+                TeardownGuard::Proceed,
+                "state {:?}",
+                state
+            );
+            assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+        }
+        assert_eq!(teardown_guard(&[], false), TeardownGuard::Proceed);
+    }
+
+    /// A turn that ended with subagents still running reports `done` above their `working`
+    /// records; the count is what makes the guard see them.
+    #[test]
+    fn background_work_under_a_finished_turn_is_busy() {
+        for state in ["idle", "done", "error"] {
+            let agents = vec![agent("brisk-heron", Some(state), 2)];
+            match teardown_guard(&agents, false) {
+                TeardownGuard::Refuse(busy) => assert_eq!(
+                    busy[0].1,
+                    format!("{}, but 2 background task(s) still working", state)
+                ),
+                other => panic!("{}: expected a refusal, got {:?}", state, other),
+            }
+            assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+        }
+        let agents = vec![agent("brisk-heron", Some("working"), 3)];
+        assert_eq!(
+            busy_reason(&agents[0]).as_deref(),
+            Some("working, and 2 background task(s) working")
+        );
+    }
+
+    /// A blocked agent is mid-turn, waiting for the operator: a permission prompt, a question,
+    /// a sign-in. A teardown would cut that turn off.
+    #[test]
+    fn a_blocked_agent_of_any_kind_refuses_the_teardown_and_force_overrides_it() {
+        for kind in [Some("permission"), Some("question"), Some("auth"), None] {
+            let mut blocked = agent("stuck-wren", Some("blocked"), 0);
+            blocked.program_status.as_mut().unwrap().kind = kind.map(str::to_owned);
+            let expected = match kind {
+                Some(kind) => format!("blocked:{}", kind),
+                None => "blocked".to_owned(),
+            };
+            let agents = vec![blocked];
+            match teardown_guard(&agents, false) {
+                TeardownGuard::Refuse(busy) => assert_eq!(busy[0].1, expected),
+                other => panic!("{:?}: expected a refusal, got {:?}", kind, other),
+            }
+            assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+        }
+        let mut blocked = agent("stuck-wren", Some("blocked"), 2);
+        blocked.program_status.as_mut().unwrap().kind = Some("permission".to_owned());
+        assert_eq!(
+            busy_reason(&blocked).as_deref(),
+            Some("blocked:permission, and 2 background task(s) working")
+        );
+    }
+
+    #[test]
+    fn a_state_this_build_does_not_know_fails_closed() {
+        let agents = vec![agent("odd-lynx", Some("compiling"), 0)];
+        assert!(matches!(
+            teardown_guard(&agents, false),
+            TeardownGuard::Refuse(_)
+        ));
+        assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+    }
+
+    /// An agent that runs the restart from its own pane has decided to cut itself off.
+    #[test]
+    fn the_callers_own_pane_never_counts() {
+        let mut me = agent("my-pane", Some("working"), 4);
+        me.is_self = true;
+        assert_eq!(teardown_guard(&[me], false), TeardownGuard::Proceed);
+    }
+
+    #[test]
+    fn the_refusal_names_each_busy_agent_force_and_the_exit_code() {
+        let agents = vec![agent("busy-fox", Some("working"), 1)];
+        let TeardownGuard::Refuse(busy) = teardown_guard(&agents, false) else {
+            panic!("expected a refusal");
+        };
+        let text = busy_refusal_text("restart", "work", &busy);
+        assert!(
+            text.contains("tab \"develop\"  busy-fox  claude  working"),
+            "{}",
+            text
+        );
+        assert!(text.contains("--force"), "{}", text);
+        assert!(text.contains("Exit status 4"), "{}", text);
+        assert!(![
+            0,
+            1,
+            2,
+            zellij_utils::session_lifecycle::STRICT_VERSION_EXIT_CODE
+        ]
+        .contains(&AGENTS_BUSY_EXIT_CODE));
+    }
+
+    #[test]
+    fn force_parses_on_down_and_restart_and_yes_does_not_exist() {
+        use clap::Parser;
+        use zellij_utils::cli::on_big_stack;
+
+        let parse =
+            |args: &'static [&'static str]| on_big_stack(move || CliArgs::try_parse_from(args));
+        match parse(&["zellij", "session", "restart", "work", "--force"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Sessions(Sessions::Session(SessionLifecycleCli::Restart {
+                force,
+                ..
+            }))) => assert!(force),
+            other => panic!("expected `session restart`, got {:?}", other),
+        }
+        match parse(&["zellij", "session", "down", "work", "--force"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Sessions(Sessions::Session(SessionLifecycleCli::Down {
+                force, ..
+            }))) => assert!(force),
+            other => panic!("expected `session down`, got {:?}", other),
+        }
+        assert!(parse(&["zellij", "session", "restart", "work", "--yes"]).is_err());
+    }
+}

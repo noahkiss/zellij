@@ -1676,6 +1676,16 @@ fn last_reply_of(
     })
 }
 
+/// The agents of one session as a teardown sees them. `zellij session restart` and `session down` ask this before they
+/// kill anything: the rows of `list-agents`, the caller's own pane marked, and the screen
+/// detector's `blocked` where an agent reported no state.
+pub fn agents_before_teardown(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<ListAgentsResponse, String> {
+    agent_snapshot(make_os_input, session_name, None)
+}
+
 /// How long a session event stream waits for its `hello` before calling the server too old. A
 /// server that predates the stream ignores the subscription it does not know, and says nothing.
 const SESSION_EVENT_HELLO_TIMEOUT: Duration = Duration::from_secs(5);

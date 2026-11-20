@@ -716,66 +716,288 @@ pub fn send_kill_session(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn delete_session(name: &str, force: bool) {
-    // The socket and the cache folder are named by the session id; the index row by the name.
+/// Whether a kill waits for the server process to be gone, and for how long.
+///
+/// The default is to wait: "the kill was sent" is not a useful answer to callers who kill a session
+/// in order to build another one in its place.
+#[derive(Debug, Clone, Copy)]
+pub struct KillWait {
+    timeout: Option<Duration>,
+}
+
+impl KillWait {
+    /// Build from the CLI's `--no-wait` / `--wait-timeout <secs>` pair.
+    pub fn from_cli(no_wait: bool, wait_timeout_secs: u64) -> Self {
+        KillWait {
+            timeout: if no_wait {
+                None
+            } else {
+                Some(Duration::from_secs(wait_timeout_secs))
+            },
+        }
+    }
+
+    /// Send the kill and return, without waiting for anything.
+    pub fn none() -> Self {
+        KillWait { timeout: None }
+    }
+}
+
+/// How long a `--no-wait` kill still allows for the message itself to reach the server.
+const KILL_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Kill the session's server. Returns `false` if it was still running when the wait ran out.
+pub fn kill_session(name: &str, wait: KillWait) -> bool {
+    kill_and_wait(name, wait)
+}
+
+/// Send `KillSession` and, unless waiting is switched off, block until the server is really gone.
+///
+/// The send itself awaits the server's `Exit` acknowledgement (or its socket closing), so even
+/// `--no-wait` no longer returns before the server has read the message.
+fn kill_and_wait(name: &str, wait: KillWait) -> bool {
+    kill_and_wait_by_id(name, &session_id_for(name), wait)
+}
+
+/// [`kill_and_wait`] for a session whose id is already resolved. `name` is only for messages.
+fn kill_and_wait_by_id(name: &str, session_id: &str, wait: KillWait) -> bool {
+    let send_budget = wait.timeout.unwrap_or(KILL_SEND_TIMEOUT);
+    let deadline = std::time::Instant::now() + send_budget;
+    // ask who is on the other end before killing them; afterwards there is nobody to ask
+    let pid = server_pid(session_id);
+    send_kill_session_and_await(session_id, send_budget);
+
+    let Some(timeout) = wait.timeout else {
+        return true;
+    };
+    while std::time::Instant::now() < deadline {
+        if server_is_gone(session_id, pid) {
+            return true;
+        }
+        std::thread::sleep(KILL_POLL_INTERVAL);
+    }
+    if server_is_gone(session_id, pid) {
+        return true;
+    }
+    eprintln!(
+        "session '{}': server still running after {}s",
+        name,
+        timeout.as_secs()
+    );
+    false
+}
+
+/// Deliver `KillSession` and wait for the server to acknowledge it.
+///
+/// Failures here are not reported: connecting to a socket that has already gone is the ordinary
+/// outcome of racing another kill, and whether the server is gone is settled by polling, not by
+/// this send.
+fn send_kill_session_and_await(session_id: &str, budget: Duration) {
+    let name = session_id;
+    let path = ZELLIJ_SOCK_DIR.join(session_id);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            log::error!(
+                "Failed to build a runtime to kill session {:?}: {}",
+                name,
+                e
+            );
+            return;
+        },
+    };
+    if let Err(e) = runtime.block_on(async {
+        tokio::time::timeout(budget, crate::ipc::async_send_kill_and_await(&path)).await
+    }) {
+        log::debug!("Session {:?} did not acknowledge the kill: {}", name, e);
+    }
+}
+
+/// Whether the session's server is gone, as opposed to merely no longer answering.
+///
+/// A server that has been told to die stops answering immediately and then spends real time killing
+/// pane shells, so "stopped answering" is the wrong question -- it is what made `zellij ls` report
+/// a session as deleted while its server still held four shells. The server unlinks its socket only
+/// once teardown is complete, so the file going away is the honest signal. Where the kernel would
+/// name the peer (see [`server_pid`]), the process itself is checked and the socket is not
+/// consulted at all.
+#[cfg(unix)]
+fn server_is_gone(session_id: &str, pid: Option<u32>) -> bool {
+    if let Some(pid) = pid {
+        return !process_is_alive(pid);
+    }
+    let path = ZELLIJ_SOCK_DIR.join(session_id);
+    match crate::consts::ipc_connect(&path) {
+        Ok(_) => false,
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                || e.kind() == io::ErrorKind::ConnectionRefused =>
+        {
+            // a refused connection on a file that is still there is an abandoned socket; take it
+            // away so the absence check settles instead of spinning until the timeout
+            drop(fs::remove_file(&path));
+            !path.exists()
+        },
+        Err(_) => false,
+    }
+}
+
+/// Windows records the server's PID beside the pipe, so "gone" is answerable directly.
+#[cfg(not(unix))]
+fn server_is_gone(session_id: &str, _pid: Option<u32>) -> bool {
+    !assert_socket(session_id)
+}
+
+/// The PID of the process listening on this session's socket, where the kernel will say.
+///
+/// The server double-forks and writes no PID file, but a connected unix socket carries its peer's
+/// credentials, which is all the kill path needs. Platforms that decline to report a PID leave the
+/// caller watching the socket file instead.
+#[cfg(unix)]
+fn server_pid(session_id: &str) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let path = ZELLIJ_SOCK_DIR.join(session_id);
+    let stream = UnixStream::connect(&path).ok()?;
+    peer_pid(stream.as_raw_fd())
+}
+
+#[cfg(not(unix))]
+fn server_pid(_session_id: &str) -> Option<u32> {
+    None
+}
+
+/// `std::os::unix::net::UnixStream::peer_cred` is still unstable, so ask the socket directly.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_pid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    let mut creds: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&creds) as libc::socklen_t;
+    let got = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut creds as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (got == 0 && creds.pid > 0).then_some(creds.pid as u32)
+}
+
+#[cfg(target_vendor = "apple")]
+fn peer_pid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+    let got = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (got == 0 && pid > 0).then_some(pid as u32)
+}
+
+/// Everything else falls back to watching the socket file.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn peer_pid(_fd: std::os::unix::io::RawFd) -> Option<u32> {
+    None
+}
+
+/// Signal 0 asks the kernel whether the process exists without touching it. The server is
+/// daemonized, so it is never a zombie of ours and never lingers in the table after it exits.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// What a delete found to remove, and whether the server it belonged to went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletedSession {
+    /// `false` if the server was still running when the wait ran out.
+    pub killed: bool,
+    /// `false` if there was no session_info folder to remove - the session was already gone.
+    pub found: bool,
+}
+
+/// Delete the session, and say what was there to delete.
+///
+/// Whether finding nothing is a failure is the CALLER's question, not this function's: to
+/// `delete-session` it is a name that does not exist, and to `session down` it is the state that
+/// was asked for. Both need the same removal, so only the verdict is left to them.
+pub fn delete_session_reporting(
+    name: &str,
+    force: bool,
+    snapshot_settings: &SnapshotSettings,
+    wait: KillWait,
+) -> DeletedSession {
+    // upstream: the socket and the cache folder are named by the session id; the index row by
+    // the name
     let session_id = match resolve_session_id(name) {
         Some(id) => id,
         None => {
+            // a string that is another session's id names no session of its own
             if display_name_for_session_id(name) != name {
-                eprintln!("Session: {:?} not found.", name);
-                process::exit(2);
+                return DeletedSession {
+                    killed: true,
+                    found: false,
+                };
             }
             name.to_owned()
         },
     };
     if let Err(e) = validate_session_folder_name(&session_id) {
         eprintln!("{}", e);
-        process::exit(1);
+        return DeletedSession {
+            killed: true,
+            found: false,
+        };
     }
-    if force {
-        let _ = send_kill_session(&ZELLIJ_SOCK_DIR.join(&session_id));
-    }
+    let killed = if force {
+        kill_and_wait_by_id(name, &session_id, wait)
+    } else {
+        true
+    };
     if let Ok(index) = crate::session_index::SessionIndex::open_default() {
         let _ = index.delete(name);
     }
-    if let Err(e) = std::fs::remove_dir_all(session_info_folder_for_session(&session_id)) {
+    let mut found = true;
+    if let Err(e) = remove_session_info_folder(name, &session_id, snapshot_settings) {
         if e.kind() == std::io::ErrorKind::NotFound {
-            eprintln!("Session: {:?} not found.", name);
-            process::exit(2);
+            found = false;
         } else {
             log::error!("Failed to remove session {:?}: {:?}", name, e);
         }
     } else {
         println!("Session: {:?} successfully deleted.", name);
     }
+    DeletedSession { killed, found }
 }
 
-pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
-    let exit_code = match get_sessions() {
-        Ok(running_sessions) => {
-            let resurrectable_sessions = get_resurrectable_sessions();
-            let mut all_sessions: HashMap<String, (Duration, bool)> = resurrectable_sessions
-                .iter()
-                .map(|(name, timestamp)| (name.clone(), (timestamp.clone(), true)))
-                .collect();
-            for (session_name, duration) in running_sessions {
-                all_sessions.insert(session_name.clone(), (duration, false));
-            }
-            if all_sessions.is_empty() {
-                eprintln!("No active zellij sessions found.");
-                1
-            } else {
-                print_sessions(
-                    all_sessions
-                        .iter()
-                        .map(|(name, (timestamp, is_dead))| {
-                            (name.clone(), timestamp.clone(), *is_dead)
-                        })
-                        .collect(),
-                    no_formatting,
-                    short,
-                    reverse,
-                );
+/// Delete the session. Returns `false` if the server was still running when the wait ran out.
+pub fn delete_session(
+    name: &str,
+    force: bool,
+    snapshot_settings: &SnapshotSettings,
+    wait: KillWait,
+) -> bool {
+    let deleted = delete_session_reporting(name, force, snapshot_settings, wait);
+    if !deleted.found {
+        eprintln!("Session: {:?} not found.", name);
+        process::exit(2);
+    }
+    deleted.killed
+}
+
 const DELETE_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long to keep sweeping the session_info folder after the server socket has gone away.
 const DELETE_SESSION_SWEEP_DURATION: Duration = Duration::from_millis(500);

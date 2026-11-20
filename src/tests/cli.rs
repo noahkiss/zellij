@@ -612,6 +612,17 @@ fn setup_actions_refuse_the_other_setup_flags_and_replace_needs_a_copy() {
     assert!(try_parse(&["zellij", "setup", "--make-default-terminal", "--check"]).is_err());
     assert!(try_parse(&["zellij", "setup", "--replace-existing"]).is_err());
 }
+
+fn session_lifecycle_from(args: &[&str]) -> SessionLifecycleCli {
+    match parse_cli(args) {
+        Ok(CliArgs {
+            command: Some(Command::Sessions(Sessions::Session(cli))),
+            ..
+        }) => cli,
+        other => panic!("Expected a session lifecycle command, got {:?}", other),
+    }
+}
+
 #[test]
 fn session_up_resumes_unless_told_otherwise() {
     // the default a bare `up` carries: neither flag, which the command reads as "come back as you
@@ -653,6 +664,56 @@ fn session_up_refuses_fresh_together_with_restore() {
         "--fresh",
         "--restore",
         "abc123"
+    ])
+    .is_err());
+}
+
+#[test]
+fn session_up_restore_defaults_to_the_newest_snapshot() {
+    match session_lifecycle_from(&["zellij", "session", "up", "work", "--restore"]) {
+        SessionLifecycleCli::Up { restore, .. } => assert_eq!(restore.as_deref(), Some("latest")),
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "up", "work", "--restore", "abc123"]) {
+        SessionLifecycleCli::Up { restore, .. } => assert_eq!(restore.as_deref(), Some("abc123")),
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+}
+
+/// `enable` installs unless `--dry-run` or `-n` is typed.
+#[test]
+fn session_enable_installs_unless_told_to_dry_run() {
+    match session_lifecycle_from(&["zellij", "session", "enable", "work"]) {
+        SessionLifecycleCli::Enable { dry_run, .. } => assert!(!dry_run),
+        other => panic!("Expected `enable`, got {:?}", other),
+    }
+    for flag in ["--dry-run", "-n"] {
+        match session_lifecycle_from(&["zellij", "session", "enable", "work", flag]) {
+            SessionLifecycleCli::Enable { dry_run, .. } => assert!(dry_run),
+            other => panic!("Expected `enable`, got {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn a_session_name_is_optional_everywhere() {
+    // it falls back to the config's session_name at run time
+    match session_lifecycle_from(&["zellij", "session", "down"]) {
+        SessionLifecycleCli::Down { session_name, .. } => assert_eq!(session_name, None),
+        other => panic!("Expected `down`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_restart_cannot_be_both_fresh_and_restored() {
+    assert!(parse_cli(&[
+        "zellij",
+        "session",
+        "restart",
+        "work",
+        "--fresh",
+        "--restore",
+        "abc123",
     ])
     .is_err());
 }

@@ -799,6 +799,37 @@ fn resurrect_command_for_unknown_terminal_is_rejected() {
     assert!(result.is_err());
     assert!(pty.resurrect_commands.is_empty());
 }
+
+/// A launcher hands the server no SHELL, and the server hands its environment to every pane: the
+/// bare `sh` that used to follow is a session that looks up while none of the user's shell is
+/// there.
+#[test]
+#[cfg(not(windows))]
+fn a_pane_with_no_shell_in_the_environment_gets_the_one_from_the_passwd_entry() {
+    assert_eq!(
+        shell_from_env_or_passwd(None, || Some(PathBuf::from("/usr/bin/fish"))),
+        PathBuf::from("/usr/bin/fish")
+    );
+    // an empty SHELL is a variable nothing filled in, not a choice
+    assert_eq!(
+        shell_from_env_or_passwd(Some(""), || Some(PathBuf::from("/usr/bin/fish"))),
+        PathBuf::from("/usr/bin/fish")
+    );
+}
+
+#[test]
+#[cfg(not(windows))]
+fn what_the_environment_says_wins_and_bin_sh_is_still_the_last_resort() {
+    assert_eq!(
+        shell_from_env_or_passwd(Some("/bin/zsh"), || Some(PathBuf::from("/usr/bin/fish"))),
+        PathBuf::from("/bin/zsh")
+    );
+    assert_eq!(
+        shell_from_env_or_passwd(None, || None),
+        PathBuf::from("/bin/sh")
+    );
+}
+
 /// The pid of a reaped child is the OS's to hand out again, so a pane that outlives its command
 /// must not keep it: signalling it would hit whatever process holds that number now.
 #[test]

@@ -312,7 +312,7 @@ fn main() {
                 popup_capture_all_keys: false,
                 popup_outside_click: None,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
     }
@@ -321,33 +321,66 @@ fn main() {
         no_formatting,
         short,
         reverse,
+        json,
     })) = opts.command
     {
-        commands::list_sessions(no_formatting, short, reverse);
+        commands::list_sessions(no_formatting, short, reverse, json);
     } else if let Some(Command::Sessions(Sessions::ListAliases)) = opts.command {
         commands::list_aliases(opts);
     } else if let Some(Command::Sessions(Sessions::Watch { ref session_name })) = opts.command {
         commands::watch_session(session_name.clone(), opts);
-    } else if let Some(Command::Sessions(Sessions::KillAllSessions { yes })) = opts.command {
-        commands::kill_all_sessions(yes);
-    } else if let Some(Command::Sessions(Sessions::KillSession { ref target_session })) =
-        opts.command
+    } else if let Some(Command::Sessions(Sessions::Snapshot(snapshot_cli))) = opts.command.clone() {
+        commands::snapshot_command(snapshot_cli, opts);
+    } else if let Some(Command::Sessions(Sessions::Mcp { session })) = opts.command.clone() {
+        // the protocol owns stdout from here on, and the server never returns until the client
+        // goes away
+        // the config file is read by the server for its `remote_hosts` block, and nothing else
+        let config_path = Config::config_file_path(&opts);
+        std::process::exit(mcp::start(session, config_path));
+    } else if let Some(Command::Sessions(Sessions::Session(session_cli))) = opts.command.clone() {
+        session_commands::session_lifecycle_command(session_cli, opts);
+    } else if let Some(Command::Sessions(Sessions::KillAllSessions {
+        yes,
+        no_wait,
+        wait_timeout,
+    })) = opts.command
     {
-        commands::kill_session(target_session);
-    } else if let Some(Command::Sessions(Sessions::DeleteAllSessions { yes, force })) = opts.command
+        commands::kill_all_sessions(yes, KillWait::from_cli(no_wait, wait_timeout));
+    } else if let Some(Command::Sessions(Sessions::KillSession {
+        ref target_session,
+        no_wait,
+        wait_timeout,
+        yes,
+    })) = opts.command
     {
-        commands::delete_all_sessions(yes, force);
+        commands::kill_session(
+            target_session,
+            KillWait::from_cli(no_wait, wait_timeout),
+            yes,
+        );
+    } else if let Some(Command::Sessions(Sessions::DeleteAllSessions {
+        yes,
+        force,
+        no_wait,
+        wait_timeout,
+    })) = opts.command
+    {
+        commands::delete_all_sessions(yes, force, KillWait::from_cli(no_wait, wait_timeout), &opts);
     } else if let Some(Command::Sessions(Sessions::DeleteSession {
         ref target_session,
         force,
+        no_wait,
+        wait_timeout,
+        yes,
     })) = opts.command
     {
-        commands::delete_session(target_session, force);
-            commands::send_action_to_session(command_cli_action, opts.session, config, false);
-            std::process::exit(0);
-        }
-    }
-
+        commands::delete_session(
+            target_session,
+            force,
+            KillWait::from_cli(no_wait, wait_timeout),
+            &opts,
+            yes,
+        );
     } else if let Some(path) = opts.server {
         commands::start_server(path, opts.debug);
     } else if opts.layout.is_some() || opts.layout_string.is_some() {

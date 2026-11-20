@@ -78,6 +78,29 @@ pub(crate) fn confirm_or_exit(verb: &str, what: &str, yes: bool) {
     }
 }
 
+pub(crate) fn kill_all_sessions(yes: bool, wait: KillWait) {
+    match get_sessions() {
+        Ok(sessions) if sessions.is_empty() => {
+            eprintln!("No active zellij sessions found.");
+            process::exit(1);
+        },
+        Ok(sessions) => {
+            confirm_or_exit("kill-all-sessions", destroys::KILL_ALL_SESSIONS, yes);
+            // every session is attempted before the exit code is decided: a wedged server should
+            // not stop the rest of them from being killed
+            let mut all_gone = true;
+            for session in &sessions {
+                all_gone &= kill_session_impl(&session.0, wait);
+            }
+            process::exit(if all_gone { 0 } else { 1 });
+        },
+        Err(e) => {
+            eprintln!("Error occurred: {:?}", e);
+            process::exit(1);
+        },
+    }
+}
+
 pub(crate) fn snapshot_settings(opts: &CliArgs) -> SnapshotSettings {
     SnapshotSettings::from_options(get_config_options_from_cli_args(opts).ok().as_ref())
 }
@@ -214,6 +237,51 @@ fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, js
     }
 }
 
+pub(crate) fn delete_all_sessions(yes: bool, force: bool, wait: KillWait, opts: &CliArgs) {
+    use std::collections::{BTreeMap, BTreeSet};
+    use zellij_server::background_jobs::scan_session_list_default_dirs;
+
+    let active_sessions: Vec<String> = get_sessions()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| s.0.clone())
+        .collect();
+    let (_live_sessions, resurrectable_map) =
+        scan_session_list_default_dirs(&String::new(), &[], &BTreeMap::new());
+    let mut sessions_to_delete: BTreeSet<String> = resurrectable_map.into_keys().collect();
+    for (name, _elapsed) in get_resurrectable_sessions() {
+        sessions_to_delete.insert(name);
+    }
+    // a live session only becomes resurrectable once it has serialized itself, so scanning for
+    // resurrectable folders does not find a young one. `--force` is what makes live sessions
+    // targets, so take them from the session list directly rather than hoping they show up there.
+    let live_sessions_kept: Vec<String> = if force {
+        sessions_to_delete.extend(active_sessions.iter().cloned());
+        Vec::new()
+    } else {
+        sessions_to_delete.retain(|name| !active_sessions.contains(name));
+        active_sessions.clone()
+    };
+    confirm_or_exit("delete-all-sessions", destroys::DELETE_ALL_SESSIONS, yes);
+    // every session is attempted before the exit code is decided: one wedged server should not
+    // stop the rest of them from being deleted
+    let mut all_gone = true;
+    for session in &sessions_to_delete {
+        all_gone &= delete_session_impl(session, force, &snapshot_settings(opts), wait);
+    }
+    for session in &live_sessions_kept {
+        eprintln!(
+            "Session: {:?} is still running and was not deleted. Use --force to kill it first.",
+            session
+        );
+    }
+    process::exit(if all_gone && live_sessions_kept.is_empty() {
+        0
+    } else {
+        1
+    });
+}
+
 pub(crate) fn kill_session(target_session: &Option<String>, wait: KillWait, yes: bool) {
     match target_session {
         Some(target_session) => {
@@ -229,6 +297,19 @@ pub(crate) fn kill_session(target_session: &Option<String>, wait: KillWait, yes:
     }
 }
 
+pub(crate) fn delete_session(
+    target_session: &Option<String>,
+    force: bool,
+    wait: KillWait,
+    opts: &CliArgs,
+    yes: bool,
+) {
+    match target_session {
+        Some(target_session) => {
+            assert_dead_session(target_session, force);
+            confirm_or_exit("delete-session", destroys::DELETE_SESSION, yes);
+            let gone = delete_session_impl(target_session, force, &snapshot_settings(opts), wait);
+            process::exit(if gone { 0 } else { 1 });
         },
         None => {
             println!("Please specify the session name to delete.");
@@ -1338,6 +1419,21 @@ fn attach_with_cli_client(
     }
 }
 
+/// The session this invocation names, where it names one.
+///
+/// Two spellings, because `session up` uses the second: it clears `opts.session` and puts the name
+/// in the `Attach` command it hands to `start_client`. `None` is a session with no name yet, which
+/// has no launcher installed for it and so nothing to disagree with.
+fn session_name_in_opts(opts: &CliArgs) -> Option<String> {
+    if let Some(session) = opts.session.clone() {
+        return Some(session);
+    }
+    match &opts.command {
+        Some(Command::Sessions(Sessions::Attach { args, .. })) => args.session_name.clone(),
+        _ => None,
+    }
+}
+
 pub(crate) fn start_client(opts: CliArgs) {
     let (
         config,
@@ -1431,6 +1527,15 @@ pub(crate) fn start_client(opts: CliArgs) {
             create_background,
         })) = opts.command.clone()
         {
+            // fork: `attach`'s own positional wins when given - `zellij -s foo attach bar` means
+            // bar. But the top-level `-s`/`--session` already names which session every other verb
+            // here targets (`send_action_to_session`, `subscribe_to_session`), so `attach` on its
+            // own dropped it silently: `zellij -s myname attach -c` ignored `-s` entirely and, with
+            // no active session to fall back to, generated a fresh random name instead.
+            let mut args = args;
+            if args.session_name.is_none() {
+                args.session_name = opts.session.clone();
+            }
             if let Some(remote_session_url) = args.remote_url() {
                 if !cfg!(feature = "web_server_capability") {
                     eprintln!("This version of Zellij was compiled without web/remote-attach capabilities.");
@@ -1483,6 +1588,12 @@ pub(crate) fn start_client(opts: CliArgs) {
 
                 if let Err(failure) = session_resolution::refuse_self_attach(&client) {
                     panic!("{}", failure.message);
+                }
+
+                // an attach joins a server that may predate this binary. Said once per client, and
+                // only for a session that already exists - a new one is this build by definition.
+                if let ClientInfo::Attach(session_name, _) = &client {
+                    zellij_utils::session_lifecycle::check_server_build(session_name);
                 }
 
                 if let Some(layout_info) = layout_info {
