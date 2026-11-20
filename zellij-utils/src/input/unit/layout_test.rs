@@ -2251,18 +2251,57 @@ fn cannot_define_stacked_panes_for_bare_node() {
     assert!(layout.is_err(), "error provided for tab name with space");
 }
 
+/// A resurrection layout saved by an older build can carry `expanded=true` on a pane outside any
+/// stack. The flag is ignored there, so the session comes back instead of failing to parse.
 #[test]
-fn cannot_define_an_expanded_pane_outside_of_a_stack() {
-    let kdl_layout = r#"
+fn an_expanded_pane_outside_of_a_stack_loads_as_a_plain_pane() {
+    fn expanded_flags(pane: &TiledPaneLayout, out: &mut Vec<bool>) {
+        out.push(pane.is_expanded_in_stack);
+        for child in &pane.children {
+            expanded_flags(child, out);
+        }
+    }
+    for kdl_layout in [
+        // the shape a saved session had: a plain pane in a tab
+        r#"
+        layout {
+            tab name="work" {
+                pane expanded=true
+                pane
+            }
+        }
+        "#,
+        r#"
         layout {
             pane {
                 pane
                 pane expanded=true
             }
         }
+        "#,
+    ] {
+        let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None)
+            .expect("the layout loads");
+        let mut flags = vec![];
+        for (_, tab, _) in layout.tabs() {
+            expanded_flags(&tab, &mut flags);
+        }
+        if let Some(template) = layout.template.as_ref() {
+            expanded_flags(&template.0, &mut flags);
+        }
+        assert!(!flags.is_empty());
+        assert!(flags.iter().all(|expanded| !expanded), "{:?}", flags);
+    }
+    // inside a stack it still means what it says
+    let stacked = r#"
+        layout {
+            pane stacked=true {
+                pane
+                pane expanded=true
+            }
+        }
     "#;
-    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None);
-    assert!(layout.is_err(), "error provided for tab name with space");
+    assert!(Layout::from_kdl(stacked, Some("layout_file_name".into()), None, None).is_ok());
 }
 
 #[test]

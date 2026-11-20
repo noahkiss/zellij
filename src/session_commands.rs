@@ -1820,6 +1820,10 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
             let facts = wait_for_server(name);
             if let Err(reason) = facts.assert_up() {
                 eprintln!("session up: post-condition FAILED - {}", reason);
+                // the launch agent's own `up` resumes, so its saved layout is what it read
+                if let Some(line) = saved_layout_problem(&facts, true, name) {
+                    eprintln!("{}", line);
+                }
                 facts.print_diagnostics();
                 return Err(());
             }
@@ -1950,6 +1954,10 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     let facts = wait_for_server(name);
     if let Err(reason) = facts.assert_up() {
         eprintln!("session up: post-condition FAILED - {}", reason);
+        let resumes = matches!(shape, UpShape::Resume) && restore.is_none();
+        if let Some(line) = saved_layout_problem(&facts, resumes, name) {
+            eprintln!("{}", line);
+        }
         facts.print_diagnostics();
         return Err(());
     }
@@ -1960,6 +1968,30 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
         (None, None) => {},
     }
     Ok(())
+}
+
+/// Why no server came up, when the session's saved layout is the reason: the parse error, read by
+/// parsing that layout again. A server resuming a session parses the layout it was saved with,
+/// and one that cannot parse it never starts, so without this the only line was the missing
+/// process. Only for an `up` that resumed from that layout, and only when no server appeared.
+fn saved_layout_problem(facts: &SessionFacts, resumed: bool, name: &str) -> Option<String> {
+    saved_layout_line(facts.servers.is_empty() && resumed, || {
+        zellij_utils::sessions::resurrection_layout(name).map(|_| ())
+    })
+}
+
+/// [`saved_layout_problem`], apart from the machine.
+fn saved_layout_line(ask: bool, parse: impl FnOnce() -> Result<(), String>) -> Option<String> {
+    if !ask {
+        return None;
+    }
+    parse().err().map(|reason| {
+        format!(
+            "session up: the session's saved layout does not load, so no server could start: {}\n      \
+             `zellij session up --fresh` starts the session without it.",
+            reason.trim_end_matches('.')
+        )
+    })
 }
 
 /// Poll until the session looks up, or until the timeout says it never will.
@@ -2271,6 +2303,38 @@ fn down_then_up(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_up_with_no_server_names_the_saved_layout_that_does_not_load() {
+        let broken = || {
+            Err(
+                "Failed to parse resurrection layout file /c/session-layout.kdl: \
+                             Unknown pane property: bogus."
+                    .to_owned(),
+            )
+        };
+        let line = saved_layout_line(true, broken).expect("a line");
+        assert!(line.starts_with("session up: the session's saved layout does not load"));
+        assert!(line.contains("Unknown pane property: bogus\n"), "{}", line);
+        assert!(line.ends_with("`zellij session up --fresh` starts the session without it."));
+        // a layout that loads, or none saved, is not the reason
+        assert_eq!(saved_layout_line(true, || Ok(())), None);
+        // not asked: a server did appear, or the up did not resume
+        assert_eq!(saved_layout_line(false, broken), None);
+    }
+
+    /// The parse the line reports, on the shape a saved session had: since the fork ignores
+    /// `expanded` outside a stack, that layout loads and no line is written for it.
+    #[test]
+    fn a_saved_layout_with_an_expanded_plain_pane_is_not_the_reason() {
+        let saved = "layout {\n    tab name=\"work\" {\n        pane expanded=true\n    }\n}\n";
+        let parse = || {
+            zellij_utils::input::layout::Layout::from_kdl(saved, None, None, None)
+                .map(|_| ())
+                .map_err(|e| format!("{:?}", e))
+        };
+        assert_eq!(saved_layout_line(true, parse), None);
+    }
 
     fn identity(path: &str, build: u8) -> ExecutableIdentity {
         ExecutableIdentity {

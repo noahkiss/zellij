@@ -5258,6 +5258,37 @@ Operator-visible, on upgrading each Mac and with **no `session enable` re-run an
 `zjr` goes through launchd rather than spawning a server from the Cellar path, and the TCC prompts
 stop coming back at every `brew upgrade`.
 
+### A saved layout with `expanded` outside a stack still loads
+
+```
+# a resurrection layout an older build saved
+tab name="work" {
+    pane expanded=true command="zsh" ...
+}
+# before: "An expanded pane must be part of a stack"; no server, `session up` waits and
+#         reports only the missing process, and the launch agent retries every few seconds
+# after:  the session comes back; the log says
+#         "Ignoring expanded=true on a pane that is not part of a stack (at byte 290)"
+```
+
+0.45.1-nkmk.40 could save `expanded=true` on a pane it did not wrap in a stack. Upstream v0.46.0
+stops writing that (its serializer writes `expanded` only inside a stack), but its parser still
+refused it, so a session saved by the older build could not come back.
+
+- **The parser ignores `expanded` on a pane outside a stack**, with a warning in the log, instead
+  of refusing the layout. Inside a stack it means what it did. The serializer is upstream's and is
+  not touched.
+- **`session up` names the saved layout when it is why no server came.** When the post-condition
+  fails, no server process appeared, and the `up` resumed from the saved layout, it parses that
+  layout again and prints the error, with `session up --fresh` as the way past it. On macOS this is
+  the `up` that handed creation to the launch agent: the agent's own `up` printed the parse error to
+  its log, and the waiting `up` printed only "no 'zellij --server' process". On Linux the client's
+  own parse error already reached the caller and still does.
+
+`zellij-utils/src/kdl/kdl_layout_parser.rs` (`parse_pane_node`), `src/session_commands.rs`
+(`saved_layout_problem`). Tests: the issue's shape and a nested one load with no pane expanded, a
+stack keeps its expanded pane, and the line `session up` prints. No contract change.
+
 ### The pin is not stale against itself
 
 `pin_needs_refresh` — the question `session doctor` and its dry run ask, and the one

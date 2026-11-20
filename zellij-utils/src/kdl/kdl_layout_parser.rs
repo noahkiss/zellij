@@ -608,7 +608,7 @@ impl<'a> KdlLayoutParser<'a> {
         let children_are_stacked =
             kdl_get_bool_property_or_child_value_with_error!(kdl_node, "stacked").unwrap_or(false);
         let stack_orientation = self.parse_stack_orientation(kdl_node)?;
-        let is_expanded_in_stack =
+        let mut is_expanded_in_stack =
             kdl_get_bool_property_or_child_value_with_error!(kdl_node, "expanded").unwrap_or(false);
         let borderless = kdl_get_bool_property_or_child_value_with_error!(kdl_node, "borderless");
         let focus = kdl_get_bool_property_or_child_value_with_error!(kdl_node, "focus");
@@ -647,11 +647,14 @@ impl<'a> KdlLayoutParser<'a> {
                 kdl_node.span().len(),
             ));
         } else if is_expanded_in_stack && !is_part_of_stack {
-            return Err(ConfigError::new_layout_kdl_error(
-                format!("An expanded pane must be part of a stack"),
-                kdl_node.span().offset(),
-                kdl_node.span().len(),
-            ));
+            // fork: ignored with a warning, not refused. A resurrection layout saved by an older
+            // build can carry `expanded=true` on a pane it did not wrap in a stack, and refusing
+            // it kept that session from ever coming back. Outside a stack it means nothing
+            log::warn!(
+                "Ignoring expanded=true on a pane that is not part of a stack (at byte {})",
+                kdl_node.span().offset()
+            );
+            is_expanded_in_stack = false;
         }
         let default_fg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_fg")
             .map(|s| s.to_string());
