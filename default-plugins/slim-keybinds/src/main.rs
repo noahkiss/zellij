@@ -416,21 +416,20 @@ impl ZellijPlugin for SlimKeybinds {
                     return false;
                 }
                 self.probe.landed();
+                // Every other bar of the session draws these numbers instead of probing. A failed
+                // probe still sends, with no payload: it renews the other bars' lease, so they
+                // keep deferring rather than all probing in the same tick.
+                let ok = exit_code == Some(0);
+                let mut message = MessageToPlugin::new(vitals::PIPE_NAME).with_args(
+                    BTreeMap::from([(vitals::FROM_ARG.to_string(), self.own_key.to_string())]),
+                );
+                if ok {
+                    message = message.with_payload(String::from_utf8_lossy(&stdout).into_owned());
+                }
+                pipe_message_to_plugin(message);
                 // A non-zero exit means a partial or missing probe, or one its watchdog killed;
                 // keeping the previous numbers beats blanking the cluster on one bad tick.
-                if exit_code != Some(0) {
-                    return false;
-                }
-                // every other bar of the session draws these numbers instead of probing
-                pipe_message_to_plugin(
-                    MessageToPlugin::new(vitals::PIPE_NAME)
-                        .with_payload(String::from_utf8_lossy(&stdout).into_owned())
-                        .with_args(BTreeMap::from([(
-                            vitals::FROM_ARG.to_string(),
-                            self.own_key.to_string(),
-                        )])),
-                );
-                self.vitals.parse(&stdout)
+                ok && self.vitals.parse(&stdout)
             },
 
             _ => false,

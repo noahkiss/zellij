@@ -8990,7 +8990,9 @@ session until the Mac ran out of process slots: a probe given up as lost was nev
   parses and draws it. The bars pick the prober among themselves: the lowest plugin id, then the
   lowest client id, since a plugin runs one instance per attached client under one id. A bar that
   hears from a lower one defers for two ticks; one that stops hearing, because that bar's tab
-  closed or it went hidden, takes the probe up within twenty seconds. This was chosen over
+  closed or it went hidden, takes the probe up within twenty seconds. A probe that fails, or that
+  its watchdog kills, still sends, with no payload: the other bars keep deferring, and no tick
+  starts a probe in every bar at once. This was chosen over
   "probe only from a bar whose tab has a client" because it needs no knowledge of tabs or clients,
   and `Visible` alone did not hold the bars back: a three-tab scratch session on v0.46.0 with one
   client attached ran three probes every tick. With the pipe, the same session probes once per
@@ -9000,9 +9002,11 @@ session until the Mac ran out of process slots: a probe given up as lost was nev
   its probes; a bar switched to probes at once, unless a probe is already out or a lower bar
   probes. A fully detached scratch session on v0.46.0 ran no probes at all (measured), and a
   client that attaches gets fresh numbers at once.
-- The macOS probe still uses `top -l 2 -s 1`. A cheaper source of CPU ticks would need a
-  sample kept between probes; with one probe per session, killed at eight seconds, the cost is
-  bounded.
+- **The macOS probe samples CPU with `iostat -n 0 -c 2 -w 1`, not `top -l 2 -n 0 -s 1`.** Both
+  take a since-boot line and then a one-second sample, and the probe keeps the second. `top` walks
+  every process twice: about 0.4 s of CPU a probe, and two more programs launched, on a Mac where
+  an endpoint scanner inspects each launch. `iostat` costs no measurable CPU. The line is tagged
+  `CPUIO`; the busy share is 100 minus its third field.
 
 `default-plugins/slim-keybinds/src/vitals.rs` (`guarded`, `Lease`, `bar_key`, `ProbeGate`),
 `default-plugins/slim-keybinds/src/main.rs` (`pipe`). Tests in `vitals.rs`, one of which runs the
