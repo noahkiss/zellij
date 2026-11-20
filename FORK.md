@@ -8637,6 +8637,15 @@ The client forwarding guard uses `debug_assert!`.
 Its panic test now compiles only when debug assertions are enabled.
 This keeps the quick-profile release gate valid without changing production behavior.
 
+### A missing fixture plugin fails the blocking plugin tests at once
+
+The `#[ignore]`d plugin-system tests load `fixture-plugin-for-tests.wasm` and block on its output.
+Without the fixture, upstream's tests hang. The fork's tests panic at once and name the build
+command (`cargo xtask ci e2e --build`). `plugin_unloaded_while_loading_does_not_run_once_loaded`
+is the exception. It polls with a timeout and runs in `cargo xtask test`, where CI builds no
+fixture. It reads the fixture path without the check, as upstream does, so it passes there.
+`zellij-server/src/plugins/unit/plugin_tests.rs` (`PLUGIN_FIXTURE`).
+
 ### Nextest serializes tests that share the web token database
 
 Web client tests and token tests share a database and delete it between tests.

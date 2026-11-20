@@ -13885,7 +13885,10 @@ pub fn plugin_unloaded_while_loading_does_not_run_once_loaded() {
     let (plugin_thread_sender, screen_receiver, teardown) = create_plugin_thread(None, None);
     let run_plugin = RunPluginOrAlias::RunPlugin(RunPlugin {
         _allow_exec_host_cmd: false,
-        location: RunPluginLocation::File(PathBuf::from(&*PLUGIN_FIXTURE)),
+        // Upstream runs this test in CI without the fixture: the load then fails, nothing renders,
+        // and it passes. It polls with a timeout, so it cannot hang, and PLUGIN_FIXTURE's
+        // missing-fixture assert must not fail it.
+        location: RunPluginLocation::File(e2e_plugin_path("fixture-plugin-for-tests")),
         configuration: Default::default(),
         ..Default::default()
     });
