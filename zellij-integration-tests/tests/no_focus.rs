@@ -7,6 +7,7 @@ use zellij_utils::cli::CliAction;
 
 fn no_focus_new_pane_action(command: &[&str]) -> CliAction {
     CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: command.iter().map(|part| part.to_string()).collect(),
         plugin: None,
@@ -42,6 +43,9 @@ fn no_focus_new_pane_action(command: &[&str]) -> CliAction {
 
 fn no_focus_new_tab_action() -> CliAction {
     CliAction::NewTab {
+fn no_focus_new_tab_action() -> CliAction {
+    CliAction::NewTab {
+        ready: Default::default(),
         name: None,
         layout: None,
         layout_string: None,

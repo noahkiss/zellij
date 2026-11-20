@@ -12,6 +12,7 @@ fn replace_pane_in_place_with_held_command(
     command: &str,
 ) -> FakePtyHandle {
     zellij.run_cli_action(CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: vec![command.to_string()],
         plugin: None,

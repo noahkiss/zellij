@@ -1181,6 +1181,8 @@ pub enum Sessions {
         /// Border line style, eg. "double" or "top:double,left:single,rounded"
         #[clap(long, value_parser)]
         border_style: Option<String>,
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
     /// Send data to one or more plugins, launch them if they are not running.
     #[clap(override_usage(
@@ -1401,6 +1403,37 @@ pub enum CliAction {
         pane_id: Option<String>,
     },
     /// Toggle frames around panes in the UI
+/// `--wait-ready` and `--ready-timeout`, on every verb that makes a pane for a caller to type into.
+///
+/// Held by the client: it waits once the report names the pane, so nothing about it reaches the
+/// action or the client/server contract.
+#[derive(Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadyFlags {
+    /// Wait until the new pane's shell is ready for input before answering, as `zellij action
+    /// wait --for ready` does, and add `ready_by:` and `ready_ms:` to the report. A pane that is
+    /// not ready in time is still reported, and the exit is 2
+    #[clap(long)]
+    pub wait_ready: bool,
+
+    /// Seconds `--wait-ready` waits before giving up
+    #[clap(
+        long,
+        value_name = "SECONDS",
+        requires("wait_ready"),
+        default_value = "10"
+    )]
+    pub ready_timeout: u64,
+}
+
+impl Default for ReadyFlags {
+    fn default() -> Self {
+        ReadyFlags {
+            wait_ready: false,
+            ready_timeout: 10,
+        }
+    }
+}
+
     TogglePaneFrames,
     /// Switch the focused stack between showing its titles in a column (vertical) and in a row
     /// (horizontal)
@@ -2558,6 +2591,169 @@ mod tests {
         ] {
             let action = parse_action(&args);
             assert_eq!(missing_target(&action, false), None);
+        }
+    }
+
+    fn wait_bounds(args: &[&str]) -> (WaitFor, u64, u64) {
+        match parse_action(args) {
+            CliAction::Wait {
+                wait_for,
+                quiet_ms,
+                timeout,
+                ..
+            } => (wait_for, quiet_ms, timeout),
+            other => panic!("not a wait: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_wait_for_ready_has_its_own_short_defaults() {
+        // a shell that has not drawn a prompt in 10 seconds is a failure to report, not a wait
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "ready"]),
+            (WaitFor::Ready, 300, 10)
+        );
+        // both stay the caller's to set
+        assert_eq!(
+            wait_bounds(&[
+                "wait",
+                "build",
+                "--for",
+                "ready",
+                "--timeout",
+                "3",
+                "--quiet-ms",
+                "50"
+            ]),
+            (WaitFor::Ready, 50, 3)
+        );
+        // the negative control: every other wait keeps the defaults it had
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "quiet"]),
+            (WaitFor::Quiet, 500, 300)
+        );
+        assert_eq!(wait_bounds(&["wait", "build"]), (WaitFor::Exit, 500, 300));
+        // an agent's turn is minutes, and its spinner pauses: the silence that says it stopped
+        // is longer than a shell's
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "agent-idle"]),
+            (WaitFor::AgentIdle, 3000, 300)
+        );
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "agent-waiting"]),
+            (WaitFor::AgentWaiting, 3000, 300)
+        );
+    }
+
+    #[test]
+    fn wait_ready_is_taken_out_of_every_creating_verb() {
+        for args in [
+            vec!["new-pane", "--wait-ready"],
+            vec!["new-pane", "--wait-ready", "--", "htop"],
+            vec!["new-pane", "--wait-ready", "--new-tab"],
+            vec!["edit", "--wait-ready", "notes.md"],
+            vec!["new-tab", "--wait-ready"],
+        ] {
+            let mut action = parse_action(&args);
+            assert_eq!(
+                action.take_wait_ready(),
+                Ok(Some(Duration::from_secs(10))),
+                "{:?}",
+                args
+            );
+            // taken once: the client waits, and the flag does not travel with the action
+            assert_eq!(action.take_wait_ready(), Ok(None), "{:?}", args);
+        }
+        let mut action = parse_action(&["new-pane", "--wait-ready", "--ready-timeout", "3"]);
+        assert_eq!(action.take_wait_ready(), Ok(Some(Duration::from_secs(3))));
+        // the negative controls: a verb that did not ask, and one that makes no pane
+        assert_eq!(parse_action(&["new-pane"]).take_wait_ready(), Ok(None));
+        assert_eq!(parse_action(&["list-panes"]).take_wait_ready(), Ok(None));
+        // a timeout is only something `--wait-ready` has
+        assert!(parse_cli(
+            ["zellij", "action", "new-pane", "--ready-timeout", "3"]
+                .iter()
+                .map(|a| a.to_string())
+                .collect()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wait_ready_is_refused_beside_a_blocking_wait() {
+        for args in [
+            vec!["new-pane", "--wait-ready", "--blocking", "--", "make"],
+            vec![
+                "new-pane",
+                "--wait-ready",
+                "--block-until-exit",
+                "--",
+                "make",
+            ],
+            vec![
+                "new-pane",
+                "--wait-ready",
+                "--block-until-exit-success",
+                "--",
+                "make",
+            ],
+            vec![
+                "new-pane",
+                "--wait-ready",
+                "--block-until-exit-failure",
+                "--",
+                "make",
+            ],
+            vec![
+                "new-tab",
+                "--wait-ready",
+                "--block-until-exit",
+                "--",
+                "make",
+            ],
+        ] {
+            let refusal = parse_action(&args).take_wait_ready();
+            assert!(
+                refusal
+                    .as_ref()
+                    .is_err_and(|message| message.contains("--wait-ready")),
+                "{:?}: {:?}",
+                args,
+                refusal
+            );
+        }
+        // `zellij run` arrives with its blocking flags already folded into `unblock_condition`
+        let mut run = parse_action(&["new-pane", "--wait-ready", "--", "make"]);
+        if let CliAction::NewPane {
+            unblock_condition, ..
+        } = &mut run
+        {
+            *unblock_condition = Some(UnblockCondition::OnAnyExit);
+        }
+        assert!(run.take_wait_ready().is_err());
+    }
+
+    #[test]
+    fn the_top_level_creating_commands_take_wait_ready_too() {
+        for args in [
+            vec!["zellij", "run", "--wait-ready", "--", "htop"],
+            vec![
+                "zellij",
+                "edit",
+                "--wait-ready",
+                "--ready-timeout",
+                "4",
+                "notes.md",
+            ],
+        ] {
+            let cli = parse_cli(args.iter().map(|a| a.to_string()).collect())
+                .unwrap_or_else(|e| panic!("{:?}: {}", args, e));
+            let ready = match cli.command {
+                Some(Command::Sessions(Sessions::Run { ready, .. }))
+                | Some(Command::Sessions(Sessions::Edit { ready, .. })) => ready,
+                other => panic!("{:?}", other),
+            };
+            assert!(ready.wait_ready, "{:?}", args);
         }
     }
 

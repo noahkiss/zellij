@@ -393,6 +393,7 @@ fn new_pane_cli_action(
     block_until_exit: bool,
 ) -> CliAction {
     CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: command.iter().map(|part| part.to_string()).collect(),
         plugin: None,

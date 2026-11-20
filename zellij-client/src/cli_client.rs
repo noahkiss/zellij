@@ -37,6 +37,17 @@ pub fn start_cli_client(
     let pane_id = os_input
         .env_variable("ZELLIJ_PANE_ID")
         .and_then(|e| e.trim().parse().ok());
+/// `--wait-ready` on a verb that makes a pane: how long to wait for the pane's shell, and how to
+/// open the connections the wait asks the session on.
+pub struct WaitReady<'a> {
+    pub timeout: Duration,
+    pub make_os_input: &'a dyn Fn() -> Box<dyn ClientOsApi>,
+}
+
+/// The quiet window `--wait-ready` falls back on, for a shell that writes no OSC 133 prompt
+/// marker. The same default `wait --for ready` takes.
+const READY_QUIET: Duration = Duration::from_millis(300);
+
 
     for action in actions {
         match action {
@@ -79,6 +90,7 @@ pub fn start_cli_client(
                         popup_outside_click,
                     },
                     payload,
+                    PipeWait::cli(pipe_timeout),
                 );
                 if exit_status != 0 {
                     os_input.send_to_server(ClientToServerMsg::ClientExited);
@@ -86,10 +98,71 @@ pub fn start_cli_client(
                 }
             },
             action => {
-                if let Some(exit_status) =
-                    individual_messages_client(&mut os_input, action, pane_id)
-                {
-                    return exit_status;
+                let mark_panes = matches!(
+                    &action,
+                    Action::ListPanes {
+                        output_json: true,
+                        ..
+                    }
+                );
+                let promised_a_pane = action_reports_a_new_pane(&action);
+                let lines = match individual_messages_client(&mut os_input, action, pane_id) {
+                    ActionOutcome::Done(exit_status) => return exit_status,
+                    ActionOutcome::Reported(lines) => lines,
+                };
+                let lines = if mark_panes {
+                    pane_list_with_self(
+                        lines,
+                        os_input
+                            .env_variable("ZELLIJ_PANE_ID")
+                            .and_then(|id| id.parse().ok()),
+                        os_input.env_variable("ZELLIJ_SESSION_NAME").as_deref()
+                            == Some(session_name),
+                    )
+                } else {
+                    lines
+                };
+                // a verb that makes a pane answers with the pane it made, and the session writes
+                // that line only once a tab has taken the pane. No line means no pane, and the
+                // caller is about to address one - so this is a miss, said out loud, rather than a
+                // report of an id nothing answers to
+                if promised_a_pane && reported_pane(&lines).is_none() {
+                    eprintln!(
+                        "No pane was created: the session took the request and reported no pane."
+                    );
+                    return 2;
+                }
+                let Some(wait) = &wait_ready else {
+                    print_report(&lines, output_json);
+                    continue;
+                };
+                let Some(made) = reported_pane(&lines) else {
+                    print_report(&lines, output_json);
+                    eprintln!("The session reported no pane, so there was none to wait for.");
+                    return 2;
+                };
+                let started = Instant::now();
+                match wait_for_ready(
+                    wait.make_os_input,
+                    session_name,
+                    made,
+                    READY_QUIET,
+                    Some(started + wait.timeout),
+                ) {
+                    Ok(ready_by) => {
+                        print_report(&with_ready(lines, ready_by, started.elapsed()), output_json)
+                    },
+                    Err(miss) => {
+                        // the pane exists whether or not it is ready, so it is reported either way
+                        print_report(&lines, output_json);
+                        let (message, exit_status) = match miss {
+                            WaitMiss::Missed(message) => (message, 2),
+                            WaitMiss::Failed(message) => (message, 1),
+                        };
+                        eprintln!("{}", message);
+                        os_input.send_to_server(ClientToServerMsg::ClientExited);
+                        return exit_status;
+                    },
                 }
             },
         }
@@ -155,6 +228,60 @@ impl PipeRequest {
             client_id: None,
             is_cli_client: true,
         }
+    }
+}
+
+impl PipeRequest {
+    /// The pipe as the caller named it: `--name` is what they typed, and the id is a uuid that
+    /// means nothing to them.
+    fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.pipe_id)
+    }
+}
+
+/// How a pipe waits for the session to answer it.
+///
+/// Only a plugin that received the message can unblock a pipe, so a session with none listening
+/// never answers. `idle_timeout` is `pipe --timeout`: an IDLE window rather than a budget for the
+/// call. It measures how long the session has said nothing, and anything it says resets it. That
+/// is what makes it safe for a streaming pipe - `tail -f | zellij pipe` spends its time reading
+/// stdin, which is outside the window entirely, and each answer the plugin sends starts it again.
+/// Nothing bounds that read, which is why only a pipe that IS its stdin reaches it - see
+/// [`pipe_reads_stdin`].
+struct PipeWait {
+    idle_timeout: Option<Duration>,
+    /// `zellij pipe` says so when the session goes away mid-wait, and exits 1; `zellij prompt`
+    /// keeps its own exit codes and exits 2.
+    explain_session_loss: bool,
+}
+
+impl PipeWait {
+    fn cli(idle_timeout: Option<Duration>) -> Self {
+        PipeWait {
+            idle_timeout,
+            explain_session_loss: true,
+        }
+    }
+    fn prompt() -> Self {
+        PipeWait {
+            idle_timeout: None,
+            explain_session_loss: false,
+        }
+    }
+    fn session_gone(&self) -> i32 {
+        if self.explain_session_loss {
+            eprintln!("The session stopped answering while the pipe was waiting.");
+            1
+        } else {
+            2
+        }
+    }
+    /// The pipe went unanswered for the whole window. Whatever the plugins sent has already been
+    /// written to stdout, so the sentence goes to stderr and the status says the pipe was not
+    /// answered rather than that it failed.
+    fn timed_out(&self, request: &PipeRequest, window: Duration) -> i32 {
+        eprintln!("{}", pipe_timed_out(request.display_name(), window));
+        2
     }
 }
 
@@ -874,6 +1001,220 @@ pub fn start_subscribe_client(
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
     if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
         eprintln!("{}", crate::connect_error_message(e));
+/// The pane a creating command's report says it made.
+/// A creation report with `--wait-ready`'s two lines added: which signal said the pane was ready,
+/// and how long after it was made.
+fn with_ready(mut lines: Vec<String>, ready_by: ReadyBy, waited: Duration) -> Vec<String> {
+    lines.push(format!("ready_by: {}", ready_by.as_str()));
+    lines.push(format!("ready_ms: {}", waited.as_millis()));
+    lines
+}
+
+/// Which signal said a pane was ready for input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyBy {
+    /// The pane's shell wrote an OSC 133 prompt marker: `command_state` reads `prompt`. Exact.
+    Prompt,
+    /// The pane drew something and then nothing for the quiet window, and its shell wrote no
+    /// marker that says otherwise. A heuristic, for a shell without OSC 133.
+    Quiet,
+}
+
+impl ReadyBy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadyBy::Prompt => "prompt",
+            ReadyBy::Quiet => "quiet",
+        }
+    }
+}
+
+/// The decisions of a `--for ready` wait, apart from the session it asks, so they can be proven
+/// from a scripted sequence of renders and looks.
+///
+/// Two signals, and the exact one wins:
+///
+/// - **The prompt.** A look at the session that reads `command_state: prompt` is ready at once.
+/// - **Quiet after output.** A pane that has drawn a non-blank line and then nothing for the
+///   window is ready - but only when its shell says nothing to the contrary. `running` means a
+///   command is between its output marker and its end, and a silent build is not a ready shell.
+///
+/// A missing `command_state` is NOT taken as "this shell writes no markers, forever". A clear
+/// resets the pane's markers, so a shell that does write them reads as absent until it draws its
+/// next prompt - and one that redraws its prompt without running its hooks, as zsh's
+/// `clear-screen` does, stays absent. Absent and `done` both leave the fallback in play.
+#[derive(Debug)]
+struct ReadyWatch {
+    quiet: Duration,
+    /// When the pane last drew anything, once it has drawn a non-blank line. `None` until then:
+    /// a pane that has said nothing yet is not quiet, it has not started.
+    last_output: Option<Instant>,
+}
+
+impl ReadyWatch {
+    fn new(quiet: Duration) -> Self {
+        ReadyWatch {
+            quiet,
+            last_output: None,
+        }
+    }
+
+    /// A render of the pane's viewport arrived at `now`.
+    fn rendered(&mut self, viewport: &[String], now: Instant) {
+        if self.last_output.is_some() || viewport.iter().any(|line| !line.trim().is_empty()) {
+            self.last_output = Some(now);
+        }
+    }
+
+    /// When the quiet window closes, if the pane has drawn anything.
+    fn quiet_at(&self) -> Option<Instant> {
+        self.last_output.map(|at| at + self.quiet)
+    }
+
+    /// What a look at the session that read `command_state` says, at `now`.
+    fn judge(&self, command_state: Option<PaneCommandState>, now: Instant) -> Option<ReadyBy> {
+        match command_state {
+            Some(PaneCommandState::Prompt) => Some(ReadyBy::Prompt),
+            Some(PaneCommandState::Running) => None,
+            Some(PaneCommandState::Done) | None => self
+                .quiet_at()
+                .filter(|at| now >= *at)
+                .map(|_| ReadyBy::Quiet),
+        }
+    }
+}
+
+/// `--for ready`: the render stream for the fallback, and a poll of `list-panes` for the shell's
+/// own word, on the 250 ms tick `--for exit` uses.
+///
+/// A pane whose command ends or that closes before it is ready is a miss: there is no shell left
+/// to be ready.
+fn wait_for_ready(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    quiet: Duration,
+    deadline: Option<Instant>,
+) -> Result<ReadyBy, WaitMiss> {
+    let os_input = make_os_input();
+    let updates = subscribe_to_renders(&*os_input, session_name, pane)?;
+    let mut watch = ReadyWatch::new(quiet);
+    let mut next_look = Instant::now();
+    let answer = loop {
+        if Instant::now() >= next_look {
+            let look = ask(
+                make_os_input(),
+                session_name,
+                Action::ListPanes {
+                    show_tab: false,
+                    show_command: false,
+                    show_state: false,
+                    show_geometry: false,
+                    show_all: true,
+                    output_json: true,
+                },
+                &pane.to_string(),
+            )
+            .and_then(|lines| pane_look(&lines.join("\n"), pane));
+            match look {
+                Err(message) => break Err(WaitMiss::Failed(message)),
+                Ok((PaneState::Gone, _)) => {
+                    break Err(WaitMiss::Missed(format!(
+                        "{} closed before it was ready.",
+                        pane
+                    )))
+                },
+                Ok((PaneState::Exited(status), _)) => {
+                    break Err(WaitMiss::Missed(format!(
+                        "{} exited before it was ready (exit_status: {}).",
+                        pane,
+                        status.map_or_else(|| "-".to_owned(), |status| status.to_string())
+                    )))
+                },
+                Ok((PaneState::Running, command_state)) => {
+                    if let Some(ready_by) = watch.judge(command_state, Instant::now()) {
+                        break Ok(ready_by);
+                    }
+                },
+            }
+            next_look = Instant::now() + EXIT_POLL_INTERVAL;
+        }
+        let now = Instant::now();
+        if remaining(deadline, now) == Some(Duration::ZERO) {
+            break Err(WaitMiss::Missed(format!(
+                "{} was not ready when the wait timed out.",
+                pane
+            )));
+        }
+        // a quiet window that closes before the next look moves the look up to it, so a quiet
+        // pane is answered when it falls quiet rather than up to a tick later. One that closed
+        // already is judged at the next look, so it cannot spin this loop
+        if let Some(quiet_at) = watch.quiet_at().filter(|at| *at > now) {
+            next_look = next_look.min(quiet_at);
+        }
+        let wake = match deadline {
+            Some(deadline) => next_look.min(deadline),
+            None => next_look,
+        };
+        match updates.recv_timeout(wake.saturating_duration_since(now)) {
+            Ok(ServerToClientMsg::PaneRenderUpdate { viewport, .. }) => {
+                watch.rendered(&viewport, Instant::now());
+            },
+            Ok(ServerToClientMsg::SubscribedPaneClosed { .. }) => {
+                break Err(WaitMiss::Missed(format!(
+                    "{} closed before it was ready.",
+                    pane
+                )))
+            },
+            Ok(ServerToClientMsg::LogError { lines }) => {
+                break Err(WaitMiss::Failed(lines.join("\n")))
+            },
+            Ok(ServerToClientMsg::Exit { .. }) => {
+                break Err(WaitMiss::Missed(
+                    "The session exited before the pane was ready.".to_owned(),
+                ))
+            },
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {},
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(WaitMiss::Failed(
+                    "The session stopped answering while the wait was running.".to_owned(),
+                ))
+            },
+        }
+    };
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    answer
+}
+
+/// Subscribe to one pane's renders, and hand them over on a channel read by a thread - so that a
+/// deadline is still reachable while nothing is arriving. `recv_from_server` blocks, and a pane
+/// that fell silent is exactly the case where it blocks longest.
+fn subscribe_to_renders(
+    os_input: &dyn ClientOsApi,
+    session_name: &str,
+    pane: PaneId,
+) -> Result<mpsc::Receiver<ServerToClientMsg>, WaitMiss> {
+    let zellij_ipc_pipe = socket_for(session_name).map_err(WaitMiss::Failed)?;
+    os_input
+        .connect_to_server(&zellij_ipc_pipe)
+        .map_err(|e| WaitMiss::Failed(e.to_string()))?;
+    os_input.send_to_server(ClientToServerMsg::SubscribeToPaneRenders {
+        pane_ids: vec![pane],
+        scrollback: None,
+        ansi: false,
+    });
+    let (sender, updates) = mpsc::channel();
+    let reader = os_input.box_clone();
+    std::thread::spawn(move || {
+        while let Some((message, _)) = reader.recv_from_server() {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(updates)
+}
+
         process::exit(1);
     }
 

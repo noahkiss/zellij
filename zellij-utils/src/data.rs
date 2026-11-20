@@ -3744,6 +3744,23 @@ pub struct ClientInfo {
     pub tab_id: usize,
 }
 
+/// What a shell's OSC 133 markers say about the pane's command right now.
+///
+/// A shell that emits the markers (`PS1`/`precmd` hooks in bash, zsh, fish, nushell) reports where
+/// its prompt starts, where a command's output starts, and where the command ended. That is the
+/// only exact answer to "is this pane busy" there is: everything else - a foreground process group,
+/// a child process, output arriving - infers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCommandState {
+    /// The shell has drawn a prompt and no command has started. Nothing is running.
+    Prompt,
+    /// A command has started producing output and has not reported an end.
+    Running,
+    /// The last command reported an end.
+    Done,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ClientInfo {
     pub client_id: ClientId,
