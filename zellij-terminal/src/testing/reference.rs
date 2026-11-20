@@ -532,15 +532,9 @@ fn named_color(named: NamedColor) -> String {
 }
 
 fn link_uri(anchor: Option<LinkAnchor>, links: &LinkHandler) -> Option<String> {
-    match anchor {
-        Some(LinkAnchor::Start(_)) => links.output_osc8(anchor).and_then(|osc8| {
-            let mut parts = osc8.splitn(3, ';');
-            parts.next()?;
-            parts.next()?;
-            Some(parts.next()?.trim_end_matches("\u{1b}\\").to_owned())
-        }),
-        _ => None,
-    }
+    // Read the stored URI rather than parse it back out of the emitted OSC 8: the emitter's
+    // terminator is not the projection's business.
+    links.uri(anchor).map(str::to_owned)
 }
 
 #[cfg(test)]

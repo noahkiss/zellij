@@ -5255,10 +5255,14 @@ own window-title OSC with BEL. `osc8_hyperlinks true`, which is the default, sta
 everywhere it was before.
 
 The two unit tests in `link_handler.rs` build their expected strings from `TERMINATOR`, so they
-follow the constant rather than pinning the old bytes. Proved end to end as well: a pty client
-attached to a scratch session captured 174 OSC 8 sequences, all BEL-terminated and none
-ST-terminated, with the only remaining `ESC \` in the stream belonging to the OSC 10/11 colour
-queries and a kitty graphics probe.
+follow the constant rather than pinning the old bytes. The `zellij-terminal` test models compare
+the server's grid with the client's, and the reference projection reads each link's URI from
+`LinkHandler::uri` rather than parsing it back out of the emitted sequence. Upstream's version
+stripped only `ESC \`, so every hyperlink comparison saw the URI with a trailing BEL.
+
+Proved end to end as well: a pty client attached to a scratch session captured 174 OSC 8
+sequences, all BEL-terminated and none ST-terminated, with the only remaining `ESC \` in the
+stream belonging to the OSC 10/11 colour queries and a kitty graphics probe.
 
 Deliberately unchanged: `zellij-utils/src/setup.rs` still writes ST-terminated links. That is the
 `zellij setup --check` report, printed by the CLI to its own stdout rather than drawn through a
