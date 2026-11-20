@@ -97,4 +97,5 @@ Options {
     mode_hints_when_bars_hidden: None,
     input_while_scrolled: None,
     command_pane_on_clean_exit: None,
+    person_name: None,
 }

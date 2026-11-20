@@ -9218,7 +9218,8 @@ was in that prompt. A person halfway through a sentence there had the message an
 sent as one prompt. The session that owns the pane now owns delivery: it types a message in only
 when that cannot mix with a person's typing, and otherwise holds it.
 
-**`zellij action send-message --to <target> [--reply-to <id>] -- <text>`** (`-` reads stdin).
+**`zellij action send-message --to <target> [--reply-to <id>] [--from-person] -- <text>`** (`-`
+reads stdin).
 
 - **The target** is one word matched against `list-agents`: a pane handle or pane id, a tab name,
   an agent name, or the name of the agent's project directory, compared without case.
@@ -9270,7 +9271,8 @@ when that cannot mix with a person's typing, and otherwise holds it.
   the agent's turn until it reports one. A held message expires after `--expire-s` (1800 by
   default); `0` means deliver now or refuse. A pane is found again by its handle, so a restored
   pane gets its messages. The last 100 settled messages are kept for a week, for `--reply-to`.
-- **The envelope**, one line above the text, marked as another agent's:
+- **The envelope** is one line, marked as another agent's (Claude Code gets it as attributes,
+  below):
 
   ```text
   [message 3 from builder (tab develop, boxa); not from the person. Reply: zellij_send reply_to=3, or to=boxa/work/brisk-heron]
@@ -9284,6 +9286,39 @@ when that cannot mix with a person's typing, and otherwise holds it.
   and sends again without it to a machine whose build does not know the flag; that envelope names
   no tab. Control characters other than newline and tab are stripped from the text and from every
   name, so neither can end the paste or press a key.
+- **The origin.** `--from-person` says the text is the person's own words or request, relayed by
+  the sending agent. The sending CLI names the person from its own config, `person_name "Sam"`
+  (a top-level key; unset, the name is `user`), and the envelope says so in place of "not from
+  the person": `[message 7 from builder (tab develop, boxa); directly from Sam, sent through
+  another session. Reply: ...]` (for Claude Code, `origin` and `note` attributes). The record
+  carries it as `from_person`. `zellij_send` takes it as `from_person: true`; its description
+  says to set it only for words the person asked to relay.
+  A machine whose build refuses the flag is sent the message again without it, as for
+  `--from-tab`, and that envelope says "not from the person". The session never reads
+  `person_name`: it is not in the protobuf `Options`.
+- **The shape follows the receiving agent's kind.** Every kind but Claude Code (codex, opencode,
+  pi, and an agent of unknown kind) gets the envelope line with the text below it. Claude Code
+  gets a cross-session wrapper, with the whole envelope in attributes and the text alone inside:
+
+  ```text
+  <cross-session-message from="zellij:boxa/work/brisk-heron" from-name="builder" from-tab="develop" origin="Sam" note="directly from Sam, sent through another session" message="7" answering="6" reply="zellij_send reply_to=7" reply-to="boxa/work/brisk-heron">
+  Run the tests.
+  </cross-session-message>
+  ```
+
+  Claude Code's UI reads a paste as a message from another session only when the opening tag is
+  the very first thing in it. It collapses a one-line message to "Message from @builder"; a
+  message of several lines shows the raw wrapper, which the model still reads correctly. So the
+  wrapper holds the text and nothing else.
+  - `from` is `zellij:` and the sender's address, or `zellij:command-line` for a sender outside
+    any pane. `from-name` is the name the envelope line gives.
+  - `from-tab` is there when the sender named its tab, `origin` and `note` only with
+    `--from-person`, `answering` only for a reply, and `reply-to` only for a sender in a pane.
+  - The way back is two attributes, `reply` and `reply-to`. An attribute value holding two `=`
+    stops the UI recognising the tag, so `reply_to=7, or to=...` is never one value.
+  - An attribute value loses its newlines, and `"`, `<` and `>` become `&quot;`, `&lt;` and
+    `&gt;`. A `</cross-session-message` in the text, in any case, becomes
+    `&lt;/cross-session-message`, so the text cannot close the wrapper.
 - **Message ids** are a small number counted per receiving session: `1`, `2`, ... `reply_to` is
   resolved by the session that delivered the message, so an id only has to be unique there. The
   counter is saved beside the held messages (`next-id`) before an id is used, so a restart of the
@@ -9306,9 +9341,9 @@ when that cannot mix with a person's typing, and otherwise holds it.
   nothing: the frame is drawn from state the screen does not push for this, and the listing is
   where a supervisor looks.
 
-**`zellij_send`** is the seventh MCP tool: `to`, `text`, `reply_to`, `expire_s`, `wait_s` and
-`session`. `to` may start with a host or its `remote_hosts` alias - `boxa/develop`,
-`boxa/work/develop` - and the tool runs `send-message` on that machine over ssh, so the message is
+**`zellij_send`** is the seventh MCP tool: `to`, `text`, `reply_to`, `expire_s`, `wait_s`,
+`from_person` and `session`. `to` may start with a host or its `remote_hosts` alias -
+`boxa/develop`, `boxa/work/develop` - and the tool runs `send-message` on that machine over ssh, so the message is
 held there. With no session named, every session there is searched. The sender is this server's own
 pane (`host/session/handle` and the agent's name). `reply_to` alone looks the message up in this
 session - the server's own pane's, else the one it was started for, never another - and routes
@@ -9325,7 +9360,9 @@ Contract: two `Action` messages, `SendMessageAction` (tag 900) and `MessageStatu
 in the fork block from 900, clear of upstream's numbering. A stock client
 cannot send them; a fork client against a stock server of the same contract gets nothing for these
 two actions. `SendMessageAction` gained `optional string from_tab = 7`, a field of a message the
-fork owns; a server from before it ignores the field and names no tab. No plugin-API change.
+fork owns; a server from before it ignores the field and names no tab. It gained `optional
+string from_person = 8` the same way; a server from before it ignores the field and says "not
+from the person". No plugin-API change.
 Capability: `agent-send-message`.
 
 Limits:
@@ -9345,8 +9382,9 @@ Files: `zellij-utils/src/agent_mail.rs` (record, envelope, guard, address),
 `program_status.rs`, `panes/grid.rs`, `panes/terminal_pane.rs`, `tab/mod.rs` (`AgentPrompt`),
 `screen.rs` (send, drain, ticker), `route.rs`; `zellij-client/src/agent_send.rs`,
 `cli_client.rs`; `src/commands.rs`; `src/mcp/send.rs`, `mod.rs`, `tools.rs`, `fleet.rs`,
-`invoke.rs`. Tests: the guard table, the envelope and text cleaning, the draft on every key class,
-the mailbox's save, restore, expiry and pruning, the pty writer's held write, target resolution
+`invoke.rs`; `input/options.rs` and `kdl/mod.rs` (`person_name`). Tests: the guard table, the
+envelope and text cleaning, the origin, the Claude wrapper and its escaping, the shape per kind,
+the draft on every key class, the mailbox's save, restore, expiry and pruning, the pty writer's held write, target resolution
 (names, tabs, projects, ambiguity, sessions, a shell pane), the MCP route, sender, command line
 and old-build detection, and on the screen: delivery to an idle agent, a key after it, a draft
 held and left alone then delivered after its turn, a cleared draft, the quiet window, and the

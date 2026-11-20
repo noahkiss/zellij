@@ -401,8 +401,10 @@ pub const TOOLS: &[ToolSpec] = &[
                again each second: status queued, with reason working, blocked, draft, typing or \
                starting. A held message survives a restart of that session and expires after \
                expire_s. Refused means not sent: not_agent, no_state, or a target that named no \
-               agent or several, with the candidates listed. The receiver reads one line above \
-               your text that names you and the message id; it answers with reply_to=<id>. A \
+               agent or several, with the candidates listed. The receiver reads, with your text, \
+               an envelope that names you and the message id; it answers with reply_to=<id>. A \
+               Claude Code receiver gets a cross-session message, shown collapsed when your text \
+               is one line. A \
                machine whose zellij has no send-message is refused, not typed into. Do not wait \
                for the answer: it arrives typed into your own prompt as a new message once you \
                are idle, so end your turn or carry on.",
@@ -432,7 +434,7 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action send-message", "--reply-to")),
-                describe: "The id of a message you received, from its first line. Without `to`, \
+                describe: "The id of a message you received, from its envelope. Without `to`, \
                            the reply goes to that message's sender, wherever it is.",
                 default: None,
             },
@@ -453,6 +455,16 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "Block until a held message is delivered, for at most this many \
                            seconds. It waits for delivery only, never for the answer. Keep it \
                            under your client's own request deadline.",
+                default: None,
+            },
+            ParamSpec {
+                name: "from_person",
+                kind: ParamKind::Bool,
+                required: false,
+                from: Some(("action send-message", "--from-person")),
+                describe: "Set it only when the text is the person's own words or request, which \
+                           you relay for them: the receiver is told it comes directly from that \
+                           person, by name. Never set it for your own messages.",
                 default: None,
             },
         ],

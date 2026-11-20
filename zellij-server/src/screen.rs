@@ -917,6 +917,7 @@ pub enum ScreenInstruction {
         from: String,
         from_name: Option<String>,
         from_tab: Option<String>,
+        from_person: Option<String>,
         reply_to: Option<String>,
         expire_s: u64,
         response_channel: crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>,
@@ -8306,6 +8307,7 @@ impl Screen {
         from: String,
         from_name: Option<String>,
         from_tab: Option<String>,
+        from_person: Option<String>,
         reply_to: Option<String>,
         expire_s: u64,
     ) -> zellij_utils::agent_mail::MessageRecord {
@@ -8329,6 +8331,7 @@ impl Screen {
                 from,
                 from_name,
                 from_tab,
+                from_person,
                 reply_to,
                 queued_at: now_ms,
                 expires_at: now_ms.saturating_add(expire_s.saturating_mul(1000)),
@@ -8532,15 +8535,8 @@ impl Screen {
         if decision != Decision::Deliver {
             return decision;
         }
-        let envelope = agent_mail::envelope(
-            &stored.record.id,
-            &stored.record.from,
-            stored.record.from_name.as_deref(),
-            stored.record.from_tab.as_deref(),
-            stored.record.reply_to.as_deref(),
-        );
         let mut paste = b"\x1b[200~".to_vec();
-        paste.extend_from_slice(agent_mail::wrapped(&envelope, &stored.text).as_bytes());
+        paste.extend_from_slice(agent_mail::pasted(&stored.record, &stored.text).as_bytes());
         paste.extend_from_slice(b"\x1b[201~");
         let sent = self
             .bus
@@ -13887,6 +13883,7 @@ pub(crate) fn screen_thread_main(
                 from,
                 from_name,
                 from_tab,
+                from_person,
                 reply_to,
                 expire_s,
                 response_channel,
@@ -13897,6 +13894,7 @@ pub(crate) fn screen_thread_main(
                     from,
                     from_name,
                     from_tab,
+                    from_person,
                     reply_to,
                     expire_s,
                 );

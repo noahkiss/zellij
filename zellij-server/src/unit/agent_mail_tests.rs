@@ -109,6 +109,7 @@ fn message(id: &str, handle: &str, queued_at: u64, expires_at: u64) -> Stored {
             from: "boxa/work/brisk-heron".into(),
             from_name: Some("builder".into()),
             from_tab: None,
+            from_person: None,
             reply_to: None,
             queued_at,
             expires_at,

@@ -160,6 +160,9 @@ pub fn argv(
     if let Some(tab) = &sender.tab {
         argv.extend([FROM_TAB.to_owned(), tab.clone()]);
     }
+    if flag(args, "from_person") {
+        argv.push(FROM_PERSON.to_owned());
+    }
     if let Some(reply_to) = args.get("reply_to").and_then(Value::as_str) {
         argv.extend(["--reply-to".to_owned(), reply_to.to_owned()]);
     }
@@ -171,25 +174,47 @@ pub fn argv(
 /// message is then sent again without it, and the envelope there names no tab.
 pub const FROM_TAB: &str = "--from-tab";
 
-/// The command line without [`FROM_TAB`], when the receiving build refused that flag and nothing
-/// else. `None` when the refusal was about something else, or the line has no such flag.
-pub fn without_from_tab(argv: &[String], stderr: &str) -> Option<Vec<String>> {
-    let refused = stderr.contains(FROM_TAB)
-        && (stderr.contains("unexpected argument")
-            || stderr.contains("Found argument")
-            || stderr.contains("wasn't expected"));
-    let at = argv.iter().position(|word| word == FROM_TAB)?;
+/// The flag that says the text relays the person's own words. A receiving build from before it
+/// refuses the flag; the message is then sent again without it, and the envelope there says it is
+/// not from the person.
+pub const FROM_PERSON: &str = "--from-person";
+
+/// The flags a receiving build may not know yet, each with whether it takes a value. clap names
+/// one unknown flag per refusal, so a build that knows none of them refuses once for each.
+pub const NEWER_FLAGS: &[(&str, bool)] = &[(FROM_TAB, true), (FROM_PERSON, false)];
+
+/// The command line without the one flag of [`NEWER_FLAGS`] the receiving build refused, when it
+/// refused that flag and nothing else. `None` when the refusal was about something else, or the
+/// line has no such flag.
+pub fn without_refused_flag(argv: &[String], stderr: &str) -> Option<Vec<String>> {
+    // clap names the word it refused first, `unexpected argument '--x' found` (clap 4) or
+    // `Found argument '--x' which wasn't expected` (clap 3); a tip after it may name another flag
+    let refused = ["unexpected argument '", "Found argument '"]
+        .iter()
+        .find_map(|lead| {
+            let rest = &stderr[stderr.find(lead)? + lead.len()..];
+            Some(&rest[..rest.find('\'')?])
+        })?;
+    let (flag, takes_value) = NEWER_FLAGS.iter().find(|(flag, _)| *flag == refused)?;
     // only a flag before the `--` that ends the options is the flag; after it, it is the text
     let end = argv
         .iter()
         .position(|word| word == "--")
         .unwrap_or(argv.len());
-    if !refused || at >= end {
-        return None;
-    }
+    let at = argv[..end].iter().position(|word| word == flag)?;
     let mut argv = argv.to_vec();
-    argv.drain(at..(at + 2).min(argv.len()));
+    let width = if *takes_value { 2 } else { 1 };
+    argv.drain(at..(at + width).min(end));
     Some(argv)
+}
+
+/// A boolean argument: `true`, or the string `"true"`.
+fn flag(args: &Map<String, Value>, name: &str) -> bool {
+    match args.get(name) {
+        Some(Value::Bool(set)) => *set,
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
 }
 
 fn number(args: &Map<String, Value>, name: &str) -> Option<u64> {
@@ -280,6 +305,22 @@ mod tests {
              --json -- \
              --looks like a flag"
         );
+        // the person's own words, relayed
+        let args: Map<String, Value> = serde_json::from_value(json!({
+            "to": "a/develop", "text": "Ship it.", "from_person": true
+        }))
+        .unwrap();
+        assert_eq!(
+            argv(&r, &sender, &args).unwrap().join(" "),
+            "action send-message --to develop --all-sessions \
+             --from here/main/brisk-heron --from-name builder --from-tab develop --from-person \
+             --json -- Ship it."
+        );
+        let args: Map<String, Value> =
+            serde_json::from_value(json!({"text": "hi", "from_person": false})).unwrap();
+        assert!(!argv(&r, &sender, &args)
+            .unwrap()
+            .contains(&FROM_PERSON.to_owned()));
         let r = route("develop", Some("work"), &hosts(), "here").unwrap();
         let args: Map<String, Value> = serde_json::from_value(json!({"text": "hi"})).unwrap();
         assert_eq!(
@@ -325,13 +366,40 @@ mod tests {
         let refused = "error: unexpected argument '--from-tab' found\n\nUsage: zellij action \
                        send-message [OPTIONS] <TEXT>";
         assert_eq!(
-            without_from_tab(&argv, refused).unwrap().join(" "),
+            without_refused_flag(&argv, refused).unwrap().join(" "),
             "action send-message --to develop --from a/b/c --json -- say --from-tab x"
         );
         // any other refusal stands
-        assert!(without_from_tab(&argv, "No agent answers to 'develop'.").is_none());
+        assert!(without_refused_flag(&argv, "No agent answers to 'develop'.").is_none());
         // and the retry is not refused again: it has no flag to drop
-        let again = without_from_tab(&argv, refused).unwrap();
-        assert!(without_from_tab(&again, refused).is_none());
+        let again = without_refused_flag(&argv, refused).unwrap();
+        assert!(without_refused_flag(&again, refused).is_none());
+    }
+
+    #[test]
+    fn a_build_that_refuses_from_person_is_asked_again_without_it_and_then_without_the_tab() {
+        let argv: Vec<String> = "action send-message --to develop --from a/b/c --from-tab dev \
+                                 --from-person --json -- say --from-person"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let refused = "error: unexpected argument '--from-person' found\n\n  tip: a similar \
+                       argument exists: '--from-tab'";
+        let without_person = without_refused_flag(&argv, refused).unwrap();
+        assert_eq!(
+            without_person.join(" "),
+            "action send-message --to develop --from a/b/c --from-tab dev --json -- say \
+             --from-person"
+        );
+        assert!(without_refused_flag(&without_person, refused).is_none());
+        // a build older still refuses the tab first, then the person
+        let tab_refused = "error: unexpected argument '--from-tab' found";
+        let without_tab = without_refused_flag(&argv, tab_refused).unwrap();
+        assert_eq!(
+            without_refused_flag(&without_tab, refused)
+                .unwrap()
+                .join(" "),
+            "action send-message --to develop --from a/b/c --json -- say --from-person"
+        );
     }
 }

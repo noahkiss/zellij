@@ -3179,8 +3179,11 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     /// key reached the pane in the last 5 seconds. The check and the typing happen in one step on
     /// the server, and a key that arrives meanwhile waits behind the Enter. Otherwise the session
     /// holds the message, tries again every second, and drops it when it expires. A held message
-    /// survives a restart of the session. The message goes in under a one-line envelope that names
-    /// the sender and says how to reply.
+    /// survives a restart of the session. The message goes in with an envelope that names the
+    /// sender, says whether it relays the person's own words (--from-person), and says how to
+    /// reply. A Claude Code agent gets the text inside a `<cross-session-message>` wrapper whose
+    /// attributes carry the envelope; its UI collapses a one-line message and shows a longer one
+    /// as the raw wrapper. Every other agent gets a one-line envelope above the text.
     ///
     ///   zellij action send-message --to develop -- 'The build is green; go ahead.'
     ///   zellij action send-message --reply-to 3 -- 'Done.'
@@ -3223,6 +3226,12 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// The sender's tab name, for the envelope. Defaults to this pane's tab
         #[clap(long, value_parser)]
         from_tab: Option<String>,
+
+        /// The text is the person's own words or request, relayed by the sending agent. The
+        /// envelope names that person, by `person_name` in this config (`user` when unset), and
+        /// says the message comes directly from them. Never set it for an agent's own message
+        #[clap(long, value_parser)]
+        from_person: bool,
 
         /// Look for the target in every live session on this machine, not one
         #[clap(long, value_parser)]

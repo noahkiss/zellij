@@ -293,9 +293,13 @@ impl ZellijMcp {
                 return with_host(failed(message, json!({"reason": "not_run"})), &route.target)
             },
         };
-        // a receiving build from before `--from-tab`: the same message, without the tab
-        if outcome.is_error() {
-            if let Some(older) = send::without_from_tab(&argv, &outcome.stderr) {
+        // a receiving build from before `--from-tab` or `--from-person`: the same message, without
+        // the flag it refused, once for each flag it may not know
+        for _ in send::NEWER_FLAGS {
+            if !outcome.is_error() {
+                break;
+            }
+            if let Some(older) = send::without_refused_flag(&argv, &outcome.stderr) {
                 argv = older;
                 outcome = match invoke::run_on(&route.target, &argv).await {
                     Ok(outcome) => outcome,
@@ -306,6 +310,8 @@ impl ZellijMcp {
                         )
                     },
                 };
+            } else {
+                break;
             }
         }
         if outcome.is_error() && send::verb_unknown(&outcome.stderr) {

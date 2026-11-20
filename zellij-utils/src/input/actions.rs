@@ -701,6 +701,9 @@ pub enum Action {
         from_name: Option<String>,
         /// The sender's tab name, for the envelope.
         from_tab: Option<String>,
+        /// The person whose own words the message relays, by name. `None`: the sending agent's
+        /// own message.
+        from_person: Option<String>,
         /// The message this one answers.
         reply_to: Option<String>,
         /// How long a held message waits before it expires.
