@@ -3,14 +3,26 @@
 How the fork's patch series sits on upstream, and how to check a rewrite of it. `AGENTS.md` has the
 short form.
 
-**Rebase onto a newer upstream tag** in two steps. First condense the series on the old base into
-one commit per area; each area commit's body lists its ledger entries, one per line, and the tip
-tree does not change. Then run `git rebase --onto <new-base> <old-base> main` and record the new
-base in `FORK.md`. Between rebases each patch lands as its own commit on top of the area commits.
+**Rebase onto a newer upstream tag** in four steps, on scratch branches. `main` takes only the
+result.
+
+1. **Condense.** Fold the series on the old base into one commit per area. Each area commit's body
+   lists its ledger entries, one per line, and the tip tree does not change.
+2. **Merge.** Merge the condensed tip into the new tag in one merge commit, conflict markers and
+   all.
+3. **Resolve.** Resolve the merge crate by crate, one commit per step, until the whole gate from
+   "Build and test" passes on the tip.
+4. **Carve.** Rebuild the resolved tree as one commit per area on the new tag. `git blame` through
+   the merge's second parent names the area of each line in `git diff <new-tag> <resolved-tip>`. A
+   line the resolution changed goes to the area that owns the rest of its hunk.
+   `git diff <carved-tip> <resolved-tip>` must print nothing.
+
+The carved series becomes `main`, and `FORK.md` names the new base. Keep the resolved merge on a
+backup branch. Between rebases each patch lands as its own commit on top of the area commits.
 
 **Upstream strategy.** The fork is a patch series on top of an upstream
-**tag**, and it stays one. Move the base by condensing and then rebasing, one area commit at a
-time, and name the new base in `FORK.md`. Between tags, take a single upstream commit only when we
+**tag**, and it stays one. Move the base by the merge and carve above, and name the new base in
+`FORK.md`. Between tags, take a single upstream commit only when we
 want that fix now: cherry-pick it with the subject `chore(upstream): <original subject> (<sha>)`,
 and expect it to drop out as empty at the next rebase. Never merge upstream into main, and never let the base become
 "some upstream main commit plus picks" without naming that commit in `FORK.md`. Rebasing onto

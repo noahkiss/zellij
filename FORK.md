@@ -9100,14 +9100,13 @@ fork's `PaneInfo` fields and no `top_only` style; the checked-in plugins are reb
 ## Working on this fork
 
 `upstream` points at `zellij-org/zellij`. Between rebases each patch is its own commit on top of
-the recorded upstream base, currently the **`v0.46.0`** tag. Moving to a newer base first condenses
-the series into one commit per area (`docs/fork-history.md`), then runs
-`git fetch upstream --tags && git rebase --onto <new-tag> v0.46.0`, then records the new base
-here.
+the recorded upstream base, currently the **`v0.46.0`** tag. Moving to a newer base merges the
+series onto the new tag, resolves the merge, and carves the result into one commit per area on the
+tag (`docs/fork-history.md`). Then it records the new base here.
 
 **A moved base is also two consts.** `UPSTREAM_BASE_TAG` and `UPSTREAM_BASE_COMMIT` in
 `zellij-utils/src/consts.rs` are what `zellij --version` prints, and nothing derives them — update
-both in the rebase commit. The commit is `git rev-parse --short '<new-tag>^{commit}'`; upstream
+both when the base moves. The commit is `git rev-parse --short '<new-tag>^{commit}'`; upstream
 tags are annotated, so `--short <new-tag>` gives the tag object instead and is the wrong answer.
 
 The base is the **`v0.46.0`** tag (`aedee21cb`). `v0.45.1` sits on a release branch that v0.46.0

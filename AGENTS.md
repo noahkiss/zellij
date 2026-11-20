@@ -20,9 +20,9 @@ So:
 
 - Keep patches **surgical and additive**. Add a field, add a flag, add a branch. Avoid rewriting an
   upstream function when a new one beside it will do.
-- Keep each patch its **own commit** on top of the upstream tag between rebases. A rebase first
-  condenses the series into one commit per area, then replays the area commits one at a time. A
-  patch that upstream has since fixed is dropped from its area commit.
+- Keep each patch its **own commit** on top of the upstream tag between rebases. A rebase merges
+  the series onto the new tag in one merge, resolves it crate by crate, and carves the result back
+  into one commit per area. A patch that upstream has since fixed is dropped from its area commit.
 - Prefer the cheap surface. A CLI-only struct costs nothing to carry; the protobuf contracts cost a
   lot (see below).
 
@@ -58,8 +58,8 @@ Read the matching file before you change that area.
 ## Branch, RC, squash-merge
 
 One patch, one branch, one commit on main. Between rebases each patch lands as its own commit. A
-rebase onto a new upstream tag first condenses the series into one commit per area, and each area
-commit's body lists its ledger entries, one per line.
+rebase onto a new upstream tag carves the series into one commit per area, and each area commit's
+body lists its ledger entries, one per line.
 
 1. **Branch per patch.** Never commit a patch to main directly.
 2. **Prove it with a release candidate, on the branch.** Tag `v<version>-rc.N` and push the tag by
