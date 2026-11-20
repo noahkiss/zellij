@@ -4,6 +4,8 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    # zellij-nkmk: no bot PRs on the fork; dependency moves arrive with the upstream rebase
+    open-pull-requests-limit: 0
 
   # We want to be more sure in our e2e-test, before committing to
   # update all of our dependencies.
@@ -12,6 +14,8 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    # zellij-nkmk: no bot PRs on the fork; dependency moves arrive with the upstream rebase
+    open-pull-requests-limit: 0
     allow:
       # Allow only direct updates
       - dependency-name: "log"
@@ -19,6 +23,8 @@ updates:
     directory: "/zellij-utils/"
     schedule:
       interval: "monthly"
+    # zellij-nkmk: no bot PRs on the fork; dependency moves arrive with the upstream rebase
+    open-pull-requests-limit: 0
     allow:
       # Allow only direct updates
       - dependency-name: "log"

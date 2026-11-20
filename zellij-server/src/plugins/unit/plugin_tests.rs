@@ -861,6 +861,20 @@ pub(crate) fn e2e_plugin_path(name: &str) -> PathBuf {
         .join(format!("{}.wasm", name))
 }
 
+lazy_static! {
+    static ref PLUGIN_FIXTURE: String = {
+        let fixture = e2e_plugin_path("fixture-plugin-for-tests");
+        // A missing fixture used to reach `wasmtime::Module::from_file` inside the plugin thread,
+        // which fails silently there while the test thread blocks forever on a channel recv that
+        // nothing was ever going to send to - a hang (futex, 0% CPU), not a failure. Panicking here,
+        // before any thread is spawned, turns that into an immediate, readable test failure.
+        assert!(
+            fixture.is_file(),
+            "e2e fixture plugin not found at {}. Run `cargo xtask ci e2e --build` to build it.",
+            fixture.display()
+        );
+        fixture.to_string_lossy().into_owned()
+    };
 }
 
 #[test]

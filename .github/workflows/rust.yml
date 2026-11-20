@@ -1,14 +1,66 @@
 name: Rust
 
+# The Windows Build and Test jobs are deliberately absent. This fork ships two
+# targets - x86_64-unknown-linux-gnu and aarch64-apple-darwin - and upstreaming is
+# not a goal, so nothing here is ever built for or run on Windows. They were also
+# the slowest jobs by a wide margin (~2m50s against ~1m for the rest), so they set
+# the wall-clock floor for the whole workflow while testing a platform that is
+# never shipped. If a rebase brings them back, delete them again.
+
+# Documentation-only pushes are skipped. Verified before adding this: no crate pulls a
+# `.md` into the build (`include_str!`/`#![doc = include_str!]` appear nowhere), so a
+# markdown change cannot affect compilation or tests. Keep this list narrow - anything
+# that can reach the build must NOT be listed here.
+#
+# Consequence for the release pipeline: a docs-only push produces NO run, so
+# "push, wait for Rust green, then tag" has nothing to wait for. The version bump
+# touches Cargo.toml and always runs, so gate the tag on that push's run.
+#
+# Topic branches run too. The flow in AGENTS.md is "branch per patch, prove it with
+# an RC tag from the branch, then squash-merge" - so the branch is where a patch has
+# to go green, and before this the only way to get a run on one was a manual
+# workflow_dispatch. The branch list is the conventional-commit scopes this fork uses
+# for branch names, enumerated rather than `'**'` so that `backup/*` snapshots and
+# `rebase/*` scratch branches do not each burn a full matrix.
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'feat/**'
+      - 'fix/**'
+      - 'ci/**'
+      - 'chore/**'
+      - 'docs/**'
+      - 'perf/**'
+      - 'refactor/**'
+      - 'style/**'
+      - 'test/**'
+      - 'rc/**'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.md'
+      - 'docs/**'
+      - 'assets/**.md'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.md'
+      - 'docs/**'
+      - 'assets/**.md'
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# A superseded push cancels its stale run. This matters more now that every topic
+# branch triggers: without it, a branch pushed three times in a minute holds three
+# full matrices. Same group shape as e2e.yml. A push to main or a tag is never
+# cancelled: the release rule needs a green run on the exact commit that was
+# tagged, and a second push to main must not erase the first one's verdict.
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
@@ -40,37 +92,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-
-      - name: Build
-        run: cargo xtask build
-
-  build-windows:
-    name: Build (Windows)
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Install Protoc
-        shell: bash
-        run: |
-          case "${{ runner.os }}" in
-            Linux)   asset=protoc-23.4-linux-x86_64.zip ;;
-            macOS)   asset=protoc-23.4-osx-universal_binary.zip ;;
-            Windows) asset=protoc-23.4-win64.zip ;;
-          esac
-          curl -sSfL -o "$RUNNER_TEMP/protoc.zip" "https://github.com/protocolbuffers/protobuf/releases/download/v23.4/$asset"
-          unzip -q -o "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
-          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
-
-      - name: Setup toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: wasm32-wasip1
-          rustflags: ""
-
-      - name: Install NASM
-        uses: ilammy/setup-nasm@v1
 
       - name: Build
         run: cargo xtask build
@@ -107,39 +128,6 @@ jobs:
 
       - name: Test
         run: cargo xtask test
-
-  test-windows:
-    name: Test (Windows)
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Install Protoc
-        shell: bash
-        run: |
-          case "${{ runner.os }}" in
-            Linux)   asset=protoc-23.4-linux-x86_64.zip ;;
-            macOS)   asset=protoc-23.4-osx-universal_binary.zip ;;
-            Windows) asset=protoc-23.4-win64.zip ;;
-          esac
-          curl -sSfL -o "$RUNNER_TEMP/protoc.zip" "https://github.com/protocolbuffers/protobuf/releases/download/v23.4/$asset"
-          unzip -q -o "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
-          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
-
-      - name: Setup toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-
-      - name: Test zellij-utils
-        run: cargo test --no-default-features -p zellij-utils --lib
-
-      - name: Test zellij-server
-        run: cargo test --no-default-features -p zellij-server --lib
-
-      - name: Test zellij-client
-        run: cargo test --no-default-features -p zellij-client --lib
 
   integration-test:
     name: Integration Test
