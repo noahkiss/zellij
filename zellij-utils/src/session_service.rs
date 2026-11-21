@@ -286,7 +286,14 @@ pub fn server_exe_for_interactive_launch(
     #[cfg(not(any(target_os = "linux", target_os = "macos", all(unix, test))))]
     let _ = session;
     let current_exe = std::env::current_exe().ok()?;
-    if same_exe_path(&current_exe, &pinned) {
+    // fork addition: a watchdog `up` that has just refreshed the pin it runs from sees its own
+    // file as "<pin> (deleted)" on Linux. That process is still the pin's, and the pin now holds
+    // the newer build it is about to restart the session onto.
+    let replaced_pin = current_exe
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map_or(false, |path| same_exe_path(Path::new(path), &pinned));
+    if replaced_pin || same_exe_path(&current_exe, &pinned) {
         return None;
     }
     match install_pinned_exe(&current_exe, &pinned) {
@@ -1029,6 +1036,10 @@ pub struct SessionServiceOptions {
     /// macOS only. Nothing outside it consults this.
     #[serde(default)]
     pub restart_via_launchd: Option<bool>,
+    /// fork addition: whether the watchdog's `session up` restarts a session nobody is attached to
+    /// onto a newer pinned build. Unset is [`UpgradeRestarts::Clientless`].
+    #[serde(default)]
+    pub upgrade_restarts: Option<UpgradeRestarts>,
     /// Entries in this block that this binary does not know, in the words a human should read.
     ///
     /// A block that parses its own children used to REJECT an unknown one, and a rejection here
@@ -1043,6 +1054,44 @@ pub struct SessionServiceOptions {
     /// configuration, and re-emitting it would make a dump claim otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown_entries: Vec<String>,
+}
+
+/// fork addition: `session_service { upgrade_restarts "clientless" | "never" }`.
+///
+/// After an upgrade refreshes the pin, the watchdog's `session up` restarts a session onto it
+/// only when no client is attached and no agent in it is working. `never` leaves every session on
+/// the build it started with until someone restarts it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpgradeRestarts {
+    #[default]
+    Clientless,
+    Never,
+}
+
+impl UpgradeRestarts {
+    /// The config value, or `None` for one this build does not know.
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value {
+            "clientless" => Some(UpgradeRestarts::Clientless),
+            "never" => Some(UpgradeRestarts::Never),
+            _ => None,
+        }
+    }
+
+    pub fn config_value(&self) -> &'static str {
+        match self {
+            UpgradeRestarts::Clientless => "clientless",
+            UpgradeRestarts::Never => "never",
+        }
+    }
+}
+
+/// [`SessionServiceOptions::upgrade_restarts`] for a caller that may have no `session_service`
+/// block at all.
+pub fn configured_upgrade_restarts(extras: Option<&SessionServiceOptions>) -> UpgradeRestarts {
+    extras
+        .map(|extras| extras.upgrade_restarts())
+        .unwrap_or_default()
 }
 
 /// Literal directive lines, per section of the generated `.service` file.
@@ -1148,6 +1197,7 @@ impl SessionServiceOptions {
             && self.launchd_env.is_empty()
             && self.pin_exe.is_none()
             && self.restart_via_launchd.is_none()
+            && self.upgrade_restarts.is_none()
     }
 
     /// Record an entry of this block that this binary does not know, and say so in the log.
@@ -1194,6 +1244,12 @@ impl SessionServiceOptions {
     /// of them on the broken path.
     pub fn restart_via_launchd(&self) -> bool {
         self.restart_via_launchd.unwrap_or(true)
+    }
+
+    /// fork addition: what the watchdog does with a session left on a superseded build. Unset is
+    /// [`UpgradeRestarts::Clientless`].
+    pub fn upgrade_restarts(&self) -> UpgradeRestarts {
+        self.upgrade_restarts.unwrap_or_default()
     }
 
     /// Add a literal directive line to one section of the generated service file.

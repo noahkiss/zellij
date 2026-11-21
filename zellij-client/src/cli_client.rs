@@ -1826,6 +1826,30 @@ pub fn agents_before_teardown(
     agent_snapshot(make_os_input, session_name, None)
 }
 
+/// fork addition: how many clients are attached to the running session, asked of the server
+/// itself rather than read from the metadata it last wrote. A CLI query is a client of its own
+/// that the list does not include. `Err` when the session does not answer, or answers with
+/// something that is not a client list.
+pub fn clients_attached(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<usize, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::ListClients { output_json: true },
+        "the clients of this session",
+    )?;
+    serde_json::from_str::<Vec<serde_json::Value>>(&lines.join("\n"))
+        .map(|clients| clients.len())
+        .map_err(|e| {
+            format!(
+                "Could not read the client list session '{}' answered with: {}",
+                session_name, e
+            )
+        })
+}
+
 fn agent_snapshot(
     make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
     session_name: &str,
