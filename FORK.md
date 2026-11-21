@@ -1531,6 +1531,11 @@ zellij session down    [NAME] [--wait-timeout SECS] [--force]
 zellij session restart [NAME] [--fresh | --restore ID] [--force | --when-idle [--deadline DUR]] [--dry-run]
 ```
 
+- Every `session` subcommand resolves its session name the same way: the positional `NAME`, else
+  the global `--session`, else the current session (`ZELLIJ_SESSION_NAME`), else the config's
+  `session_name`. A `NAME` and a different `--session` refuse with exit 2 and change nothing.
+  Before this, `zellij --session other session restart` from a pane restarted the current session.
+
 `up` is idempotent, creates the session detached, and then **asserts its own post-condition**:
 exactly one server for the name, on the socket this binary resolved, present and listed. It refuses
 to create a second server when one already serves the name but fails that check.

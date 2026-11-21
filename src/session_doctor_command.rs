@@ -41,7 +41,7 @@ pub(crate) fn session_doctor_command(
     exe: Option<PathBuf>,
     opts: CliArgs,
 ) -> ! {
-    let name = resolve_session_name(session_name, &opts, false);
+    let name = resolve_session_name(session_name, &opts);
     let mode = DoctorMode::from_flags(dry_run, no_fix, no_sign);
     if mode.fix {
         crate::session_commands::refuse_a_scratch_pin(&opts);
