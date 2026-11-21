@@ -426,6 +426,7 @@ pub enum ScreenContext {
     AgentMessageShow,
     AgentMessageCancel,
     DrainAgentMessages,
+    OpenCodeMessagePosted,
     ListTabs,
     GetCurrentTabInfo,
     Reconfigure,

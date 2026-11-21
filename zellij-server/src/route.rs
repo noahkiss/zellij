@@ -2722,7 +2722,9 @@ fn route_action_with_origin(
                     response_channel: response_sender,
                 })
                 .with_context(err_context)?;
-            match response_receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+            // a message for an OpenCode agent is answered once its post comes back: the search
+            // for the agent's server and the post itself, each bounded (`opencode_api`)
+            match response_receiver.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(record) => send_output_to_client(
                     cli_client_id,
                     os_input.as_ref(),

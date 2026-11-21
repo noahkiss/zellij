@@ -949,6 +949,12 @@ pub enum ScreenInstruction {
     /// fork addition: try the held messages again, and expire the overdue ones. Sent once a
     /// second while any are held.
     DrainAgentMessages,
+    /// fork addition: the answer to a message posted to an OpenCode agent's own server: `Ok`
+    /// with the server's port, or why it did not go in. See `crate::opencode_api`.
+    OpenCodeMessagePosted {
+        id: String,
+        outcome: Result<u16, String>,
+    },
     /// fork addition: the pty is about to hand over a reopened pane, which takes back this
     /// handle the moment a tab takes it - before the creation is reported.
     ExpectReopenedPane {
@@ -1652,6 +1658,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::AgentMessageShow { .. } => ScreenContext::AgentMessageShow,
             ScreenInstruction::AgentMessageCancel { .. } => ScreenContext::AgentMessageCancel,
             ScreenInstruction::DrainAgentMessages => ScreenContext::DrainAgentMessages,
+            ScreenInstruction::OpenCodeMessagePosted { .. } => ScreenContext::OpenCodeMessagePosted,
             ScreenInstruction::ExpectReopenedPane { .. } => ScreenContext::ReopenPane,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
@@ -2212,6 +2219,32 @@ impl Drop for RowShiftsWhileRendering {
     }
 }
 
+/// fork addition: how a message reaches an OpenCode agent's own server: the pane's shell, under
+/// which `crate::opencode_api` looks for the server, and the session the agent reported.
+#[derive(Debug, Clone)]
+struct OpenCodeRoute {
+    pane_pid: u32,
+    session_id: String,
+}
+
+/// fork addition: a message posted to an OpenCode agent's server, waiting for the answer.
+#[derive(Debug)]
+enum OpenCodeAttempt {
+    /// A new message, not in the mailbox yet. A failed post gives it its first typed try, and
+    /// the sender its answer then.
+    First {
+        terminal_id: u32,
+        expire_s: u64,
+        reply: Option<crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>>,
+        stored: crate::agent_mail::Stored,
+    },
+    /// A held message, still in the mailbox, tried for the pane that now has this id.
+    Held { pane_id: String },
+}
+
+/// The record's `via` for a message posted to an OpenCode agent's server.
+const OPENCODE_VIA: &str = "opencode-api";
+
 /// fork addition: one pane's agent, as the session saw it start. A message to an agent with no
 /// state is held as `starting` until [`zellij_utils::agent_mail::STARTUP_MS`] after `since`, and
 /// refused as `no_state` after it only if the agent never reported a state at all.
@@ -2449,6 +2482,11 @@ pub(crate) struct Screen {
     agent_mail_ticking: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// fork addition: the guard's quiet window; `agent_mail::QUIET_MS` outside tests.
     agent_mail_quiet_ms: u64,
+    /// fork addition: messages posted to an OpenCode agent's own server whose answer has not come
+    /// back, by id. None of them is typed in while it is here; see `crate::opencode_api`.
+    opencode_in_flight: HashMap<String, OpenCodeAttempt>,
+    /// fork addition: messages whose post to OpenCode failed once; they are typed in from then on.
+    opencode_typed: HashSet<String>,
     /// fork addition: a reopened pane's old handle, waiting for the pane to exist. See
     /// `ScreenInstruction::ExpectReopenedPane`.
     pending_reopen_handles: HashMap<u32, String>,
@@ -2897,6 +2935,8 @@ impl Screen {
             agent_mail: Default::default(),
             agent_mail_ticking: Default::default(),
             agent_mail_quiet_ms: zellij_utils::agent_mail::QUIET_MS,
+            opencode_in_flight: HashMap::new(),
+            opencode_typed: HashSet::new(),
             pending_reopen_handles: HashMap::new(),
             reopen_in_new_tab: HashMap::new(),
             detect_agents: DETECT_AGENTS_DEFAULT,
@@ -8319,6 +8359,10 @@ impl Screen {
     /// fork addition: `send-message`. The message goes in now if the guard passes, is held if the
     /// agent is busy or a person is typing, and is refused if the pane runs no agent that could
     /// take it. An `expire_s` of 0 asks for no holding: what would be held is refused instead.
+    ///
+    /// A message for an OpenCode agent whose server can be found goes in through that server
+    /// instead (`crate::opencode_api`); its record is then still `queued` here, and
+    /// [`Screen::send_agent_message_replying`] answers once the post comes back.
     pub fn send_agent_message(
         &mut self,
         terminal_id: u32,
@@ -8330,10 +8374,38 @@ impl Screen {
         reply_to: Option<String>,
         expire_s: u64,
     ) -> zellij_utils::agent_mail::MessageRecord {
-        use zellij_utils::agent_mail::{Decision, MessageRecord, Reason, Status};
+        self.send_agent_message_replying(
+            terminal_id,
+            text,
+            from,
+            from_name,
+            from_tab,
+            from_person,
+            reply_to,
+            expire_s,
+            None,
+        )
+    }
+
+    /// [`Screen::send_agent_message`], answering on `reply` once the record is final: at once
+    /// for a typed, held or refused message, and when the post comes back for one posted to an
+    /// OpenCode agent's server. Returns the record as it stands now.
+    pub fn send_agent_message_replying(
+        &mut self,
+        terminal_id: u32,
+        text: String,
+        from: String,
+        from_name: Option<String>,
+        from_tab: Option<String>,
+        from_person: Option<String>,
+        reply_to: Option<String>,
+        expire_s: u64,
+        reply: Option<crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>>,
+    ) -> zellij_utils::agent_mail::MessageRecord {
+        use zellij_utils::agent_mail::{MessageRecord, Status};
         let now_ms = crate::program_status::now_ms();
         let pane = self.agent_mail_pane(|info| !info.is_plugin && info.id == terminal_id);
-        let mut stored = crate::agent_mail::Stored {
+        let stored = crate::agent_mail::Stored {
             record: MessageRecord {
                 id: self.agent_mail.new_id(),
                 status: Status::Queued,
@@ -8355,9 +8427,43 @@ impl Screen {
                 queued_at: now_ms,
                 expires_at: now_ms.saturating_add(expire_s.saturating_mul(1000)),
                 delivered_at: None,
+                via: None,
             },
             text,
         };
+        if let Some((_, agent)) = &pane {
+            if let Some(route) = self.opencode_route(terminal_id, agent.as_ref(), &stored) {
+                let record = stored.record.clone();
+                self.start_opencode_post(
+                    route,
+                    &stored,
+                    OpenCodeAttempt::First {
+                        terminal_id,
+                        expire_s,
+                        reply,
+                        stored: stored.clone(),
+                    },
+                );
+                return record;
+            }
+        }
+        let record = self.first_typed_attempt(terminal_id, stored, expire_s);
+        if let Some(reply) = reply {
+            let _ = reply.send(record.clone());
+        }
+        record
+    }
+
+    /// The first try of a new message by typing it in: delivered, held, or refused.
+    fn first_typed_attempt(
+        &mut self,
+        terminal_id: u32,
+        mut stored: crate::agent_mail::Stored,
+        expire_s: u64,
+    ) -> zellij_utils::agent_mail::MessageRecord {
+        use zellij_utils::agent_mail::{Decision, Reason, Status};
+        let now_ms = crate::program_status::now_ms();
+        let pane = self.agent_mail_pane(|info| !info.is_plugin && info.id == terminal_id);
         let decision = match pane {
             Some((_, agent)) => self.try_deliver_agent_message(terminal_id, agent, &stored),
             None => Decision::Refuse(Reason::PaneGone),
@@ -8383,6 +8489,173 @@ impl Screen {
                 stored.record.expires_at = now_ms;
                 stored.record
             },
+        }
+    }
+
+    /// fork addition: where to post `stored` for the agent in `terminal_id` instead of typing it:
+    /// the pane's shell pid and the OpenCode session the agent reported over `OSC 1337`. `None`
+    /// for any other agent, an OpenCode agent with no reported session (stock OpenCode, without
+    /// the agent-session plugin), a pane whose pid is unknown, and a message whose post already
+    /// failed once.
+    fn opencode_route(
+        &self,
+        terminal_id: u32,
+        agent: Option<&PaneAgent>,
+        stored: &crate::agent_mail::Stored,
+    ) -> Option<OpenCodeRoute> {
+        let agent = agent.filter(|agent| agent.kind == "opencode")?;
+        if self.opencode_typed.contains(&stored.record.id) {
+            return None;
+        }
+        let session_id = agent
+            .agent_id
+            .clone()
+            .filter(|_| agent.session_source.as_deref() == Some("osc"));
+        let pane_pid = self
+            .pane_process_info
+            .get(&terminal_id)
+            .and_then(|info| info.pid);
+        match (session_id, pane_pid) {
+            (Some(session_id), Some(pane_pid)) => Some(OpenCodeRoute {
+                pane_pid,
+                session_id,
+            }),
+            (session_id, pane_pid) => {
+                log::debug!(
+                    "message {}: typed into the opencode agent in terminal_{}: {}",
+                    stored.record.id,
+                    terminal_id,
+                    if session_id.is_none() {
+                        "it reported no session over OSC 1337"
+                    } else if pane_pid.is_none() {
+                        "the pane's pid is unknown"
+                    } else {
+                        "no route"
+                    }
+                );
+                None
+            },
+        }
+    }
+
+    /// fork addition: posts `stored` to the OpenCode agent's own server on a short-lived thread,
+    /// and keeps `attempt` until the answer comes back as `OpenCodeMessagePosted`. Nothing is
+    /// typed for the message meanwhile. A thread that cannot start is a failed post: the message
+    /// is typed in instead.
+    fn start_opencode_post(
+        &mut self,
+        route: OpenCodeRoute,
+        stored: &crate::agent_mail::Stored,
+        attempt: OpenCodeAttempt,
+    ) {
+        let id = stored.record.id.clone();
+        let body = zellij_utils::agent_mail::opencode_synthetic(&stored.record, &stored.text);
+        self.opencode_in_flight.insert(id.clone(), attempt);
+        // a unit test drives the answer by hand: it never looks for a real server
+        #[cfg(not(test))]
+        {
+            let senders = self.bus.senders.clone();
+            let thread_id = id.clone();
+            let started = std::thread::Builder::new()
+                .name("opencode_post".to_owned())
+                .spawn(move || {
+                    let outcome =
+                        crate::opencode_api::deliver(route.pane_pid, &route.session_id, &body);
+                    let _ = senders.send_to_screen(ScreenInstruction::OpenCodeMessagePosted {
+                        id: thread_id,
+                        outcome,
+                    });
+                });
+            if let Err(e) = started {
+                self.opencode_message_posted(id, Err(format!("cannot start a thread: {}", e)));
+            }
+        }
+        #[cfg(test)]
+        {
+            let _ = (route.pane_pid, route.session_id, body);
+        }
+    }
+
+    /// fork addition: the answer to a post to an OpenCode agent's server. HTTP 200 delivers the
+    /// message, `via: opencode-api`. Anything else types it in, as if the post had never been
+    /// tried, and every later try of it types too. A message cancelled or expired meanwhile is
+    /// left as it is.
+    pub fn opencode_message_posted(&mut self, id: String, outcome: Result<u16, String>) {
+        use zellij_utils::agent_mail::Status;
+        let now_ms = crate::program_status::now_ms();
+        let Some(attempt) = self.opencode_in_flight.remove(&id) else {
+            return;
+        };
+        if let Err(why) = &outcome {
+            log::debug!(
+                "message {}: the post to opencode failed, typing it in instead: {}",
+                id,
+                why
+            );
+            self.opencode_typed.insert(id.clone());
+        }
+        match (attempt, outcome) {
+            (
+                OpenCodeAttempt::First {
+                    mut stored, reply, ..
+                },
+                Ok(port),
+            ) => {
+                log::info!("message {} posted to opencode on port {}", id, port);
+                stored.record.status = Status::Delivered;
+                stored.record.delivered_at = Some(now_ms);
+                stored.record.via = Some(OPENCODE_VIA.to_owned());
+                let record = stored.record.clone();
+                self.agent_mail.remember(stored);
+                if let Some(reply) = reply {
+                    let _ = reply.send(record);
+                }
+            },
+            (
+                OpenCodeAttempt::First {
+                    terminal_id,
+                    expire_s,
+                    reply,
+                    stored,
+                },
+                Err(_),
+            ) => {
+                let record = self.first_typed_attempt(terminal_id, stored, expire_s);
+                if let Some(reply) = reply {
+                    let _ = reply.send(record);
+                }
+            },
+            (OpenCodeAttempt::Held { pane_id }, Ok(port)) => {
+                if self
+                    .agent_mail
+                    .delivered_via(&id, pane_id, now_ms, OPENCODE_VIA)
+                    .is_some()
+                {
+                    log::info!("message {} posted to opencode on port {}", id, port);
+                } else {
+                    log::info!(
+                        "message {} posted to opencode on port {} after it was settled here",
+                        id,
+                        port
+                    );
+                }
+            },
+            (OpenCodeAttempt::Held { .. }, Err(_)) => {
+                let Some(stored) = self
+                    .agent_mail
+                    .held()
+                    .iter()
+                    .find(|stored| stored.record.id == id)
+                    .cloned()
+                else {
+                    // cancelled or expired while the post ran: it is not typed in
+                    return;
+                };
+                self.retry_held_message(stored, now_ms);
+            },
+        }
+        if self.agent_mail.is_empty() {
+            self.opencode_typed.clear();
         }
     }
 
@@ -8460,11 +8733,15 @@ impl Screen {
 
     /// fork addition: the held messages, tried again in the order they came; the overdue ones
     /// expire. One message per pane per round: a delivered one leaves the agent's prompt
-    /// submitted, and the next waits for the turn it starts to end.
+    /// submitted, and the next waits for the turn it starts to end. A message being posted to an
+    /// OpenCode agent's server is neither tried nor expired, and holds back the pane's others.
     pub fn drain_agent_messages(&mut self) {
-        use zellij_utils::agent_mail::{Decision, Reason};
         let now_ms = crate::program_status::now_ms();
-        for id in self.agent_mail.expire(now_ms) {
+        let in_flight: HashSet<String> = self.opencode_in_flight.keys().cloned().collect();
+        for id in self
+            .agent_mail
+            .expire_except(now_ms, |id| in_flight.contains(id))
+        {
             self.notify_expired_sender(&id);
         }
         let held: Vec<crate::agent_mail::Stored> = self.agent_mail.held().to_vec();
@@ -8473,42 +8750,57 @@ impl Screen {
             if !tried.insert(stored.record.handle.clone()) {
                 continue;
             }
-            let handle = stored.record.handle.clone();
-            let pane = self.agent_mail_pane(|info| !info.is_plugin && info.handle == handle);
-            let Some((info, agent)) = pane else {
-                // a pane a restore is bringing back gets its handle again: wait for it
-                self.agent_mail
-                    .set_reason(&stored.record.id, Reason::PaneGone, None);
+            if in_flight.contains(&stored.record.id) {
                 continue;
-            };
-            let pane_id = format!("terminal_{}", info.id);
-            match self.try_deliver_agent_message(info.id, agent, &stored) {
-                Decision::Deliver => {
-                    self.agent_mail
-                        .delivered(&stored.record.id, pane_id, now_ms);
-                },
-                Decision::Refuse(Reason::NoState) => {
-                    // the agent outlived its startup window without a word: it never will say
-                    // it is idle, so holding the message to its expiry helps nobody
-                    self.agent_mail
-                        .set_reason(&stored.record.id, Reason::NoState, Some(pane_id));
-                    self.agent_mail.settle(
-                        &stored.record.id,
-                        zellij_utils::agent_mail::Status::Refused,
-                        now_ms,
-                    );
-                },
-                Decision::Hold(reason) | Decision::Refuse(reason) => {
-                    // a pane whose agent went away keeps the message until it expires: the agent
-                    // may be started again under the same handle
-                    self.agent_mail
-                        .set_reason(&stored.record.id, reason, Some(pane_id));
-                },
             }
+            self.retry_held_message(stored, now_ms);
         }
         if self.agent_mail.is_empty() {
             self.agent_mail_ticking
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.opencode_typed.clear();
+        }
+    }
+
+    /// fork addition: one more try of a held message: posted to an OpenCode agent's server when
+    /// one can be found, typed in otherwise.
+    fn retry_held_message(&mut self, stored: crate::agent_mail::Stored, now_ms: u64) {
+        use zellij_utils::agent_mail::{Decision, Reason};
+        let handle = stored.record.handle.clone();
+        let pane = self.agent_mail_pane(|info| !info.is_plugin && info.handle == handle);
+        let Some((info, agent)) = pane else {
+            // a pane a restore is bringing back gets its handle again: wait for it
+            self.agent_mail
+                .set_reason(&stored.record.id, Reason::PaneGone, None);
+            return;
+        };
+        let pane_id = format!("terminal_{}", info.id);
+        if let Some(route) = self.opencode_route(info.id, agent.as_ref(), &stored) {
+            self.start_opencode_post(route, &stored, OpenCodeAttempt::Held { pane_id });
+            return;
+        }
+        match self.try_deliver_agent_message(info.id, agent, &stored) {
+            Decision::Deliver => {
+                self.agent_mail
+                    .delivered(&stored.record.id, pane_id, now_ms);
+            },
+            Decision::Refuse(Reason::NoState) => {
+                // the agent outlived its startup window without a word: it never will say
+                // it is idle, so holding the message to its expiry helps nobody
+                self.agent_mail
+                    .set_reason(&stored.record.id, Reason::NoState, Some(pane_id));
+                self.agent_mail.settle(
+                    &stored.record.id,
+                    zellij_utils::agent_mail::Status::Refused,
+                    now_ms,
+                );
+            },
+            Decision::Hold(reason) | Decision::Refuse(reason) => {
+                // a pane whose agent went away keeps the message until it expires: the agent
+                // may be started again under the same handle
+                self.agent_mail
+                    .set_reason(&stored.record.id, reason, Some(pane_id));
+            },
         }
     }
 
@@ -13958,7 +14250,8 @@ pub(crate) fn screen_thread_main(
                 expire_s,
                 response_channel,
             } => {
-                let record = screen.send_agent_message(
+                // answered here, or once a post to an OpenCode agent's server comes back
+                screen.send_agent_message_replying(
                     terminal_id,
                     text,
                     from,
@@ -13967,8 +14260,8 @@ pub(crate) fn screen_thread_main(
                     from_person,
                     reply_to,
                     expire_s,
+                    Some(response_channel),
                 );
-                let _ = response_channel.send(record);
             },
             ScreenInstruction::AgentMessageStatus {
                 id,
@@ -13998,6 +14291,9 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::DrainAgentMessages => {
                 screen.drain_agent_messages();
+            },
+            ScreenInstruction::OpenCodeMessagePosted { id, outcome } => {
+                screen.opencode_message_posted(id, outcome);
             },
             ScreenInstruction::ExpectReopenedPane {
                 terminal_id,

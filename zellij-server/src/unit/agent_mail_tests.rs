@@ -114,6 +114,7 @@ fn message(id: &str, handle: &str, queued_at: u64, expires_at: u64) -> Stored {
             queued_at,
             expires_at,
             delivered_at: None,
+            via: None,
         },
         text: "Run the tests.".into(),
     }

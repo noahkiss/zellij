@@ -350,6 +350,14 @@ impl Mailbox {
         &self.held
     }
 
+    #[cfg(test)]
+    pub fn held_mut_for_test(&mut self, id: &str) -> &mut Stored {
+        self.held
+            .iter_mut()
+            .find(|stored| stored.record.id == id)
+            .expect("a held message")
+    }
+
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }
@@ -456,6 +464,20 @@ impl Mailbox {
         self.settle_in(id, Status::Delivered, now_ms, Some(pane_id))
     }
 
+    /// [`Mailbox::delivered`], for a message that went in by another route than typing: `via`
+    /// names it in the record.
+    pub fn delivered_via(
+        &mut self,
+        id: &str,
+        pane_id: String,
+        now_ms: u64,
+        via: &str,
+    ) -> Option<MessageRecord> {
+        let stored = self.held.iter_mut().find(|s| s.record.id == id)?;
+        stored.record.via = Some(via.to_owned());
+        self.delivered(id, pane_id, now_ms)
+    }
+
     fn settle_in(
         &mut self,
         id: &str,
@@ -496,10 +518,17 @@ impl Mailbox {
 
     /// Settles every held message whose time ran out. Returns their ids.
     pub fn expire(&mut self, now_ms: u64) -> Vec<String> {
+        self.expire_except(now_ms, |_| false)
+    }
+
+    /// [`Mailbox::expire`], leaving alone the messages `busy` names: ones whose delivery is
+    /// under way.
+    pub fn expire_except(&mut self, now_ms: u64, busy: impl Fn(&str) -> bool) -> Vec<String> {
         let overdue: Vec<String> = self
             .held
             .iter()
             .filter(|stored| stored.record.expires_at <= now_ms)
+            .filter(|stored| !busy(&stored.record.id))
             .map(|stored| stored.record.id.clone())
             .collect();
         for id in &overdue {

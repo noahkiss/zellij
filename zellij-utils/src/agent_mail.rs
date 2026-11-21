@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// The keys of the record `send-message` and `message-status` print, for the surface map.
 pub const RECORD_KEYS: &str = "id status reason pane_id handle session agent from from_person \
-                               reply_to queued_at expires_at delivered_at";
+                               reply_to queued_at expires_at delivered_at via";
 
 /// How long the pane must have had no key before a message goes in, in milliseconds.
 ///
@@ -147,6 +147,10 @@ pub struct MessageRecord {
     pub expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<u64>,
+    /// How a delivered message went in when it was not typed: `opencode-api`, posted to the
+    /// OpenCode agent's own server. Absent from a typed message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 impl MessageRecord {
@@ -342,6 +346,12 @@ fn shaped(record: &MessageRecord, text: &str, stub: bool) -> String {
         );
         return wrapped(&line, text);
     }
+    cross_session(record, text, stub)
+}
+
+/// Claude Code's cross-session wrapper around `text`, already sanitized. `stub` adds the `full`
+/// attribute.
+fn cross_session(record: &MessageRecord, text: &str, stub: bool) -> String {
     let sender = Sender::of(&record.from, record.from_name.as_deref());
     let from = match &sender.to {
         Some(to) => format!("zellij:{}", to),
@@ -403,6 +413,54 @@ fn unclosable(text: &str) -> String {
     }
     out.push_str(&text[rest..]);
     out
+}
+
+/// How the OpenCode TUI line for a message is cut: the text's first line, at most this many
+/// characters.
+pub const SYNTHETIC_LINE_CHARS: usize = 80;
+
+/// The body of `POST /api/session/<id>/synthetic` that hands a message to an OpenCode agent
+/// through its own server instead of typing it into the prompt.
+///
+/// - `text` goes to the model as a user message, whole: the same cross-session wrapper Claude
+///   Code gets, envelope in attributes, never a stub, since nothing is pasted.
+/// - `description` is the one line the TUI draws, `from <sender>: <first line>`, with the origin
+///   when the message relays the person.
+/// - `metadata` makes the TUI draw it as `↳ <Sender> finished · <description>`.
+/// - `delivery: queue` waits for a running turn to end; `resume: true` starts a turn on an idle
+///   agent.
+pub fn opencode_synthetic(record: &MessageRecord, text: &str) -> serde_json::Value {
+    let text = sanitize(text);
+    let sender = Sender::of(&record.from, record.from_name.as_deref());
+    serde_json::json!({
+        "text": cross_session(record, &text, false),
+        "description": synthetic_description(record, &text, &sender.name),
+        "metadata": {
+            "source": "subagent",
+            "agent": sender.name,
+            "state": "completed",
+        },
+        "delivery": "queue",
+        "resume": true,
+    })
+}
+
+/// The TUI line for a message: `from builder: Run the tests.`, the first non-blank line cut to
+/// [`SYNTHETIC_LINE_CHARS`], then ` (directly from Sam)` for a message relayed from the person.
+fn synthetic_description(record: &MessageRecord, text: &str, sender: &str) -> String {
+    let first = text
+        .lines()
+        .map(|line| flatten(line).trim().to_owned())
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut line: String = first.chars().take(SYNTHETIC_LINE_CHARS).collect();
+    if first.chars().count() > SYNTHETIC_LINE_CHARS {
+        line = format!("{}…", line.trim_end());
+    }
+    let origin = person(record.from_person.as_deref())
+        .map(|person| format!(" (directly from {})", person))
+        .unwrap_or_default();
+    format!("from {}: {}{}", sender, line, origin)
 }
 
 /// The text without anything that could act as a key: every control character goes except
@@ -854,6 +912,7 @@ mod tests {
             queued_at: 1,
             expires_at: 2,
             delivered_at: None,
+            via: None,
         }
     }
 
@@ -909,6 +968,59 @@ mod tests {
             "[message 7 from builder (tab develop, boxa), answering 6; \
                                      directly from Sam, sent through another session."
         ));
+    }
+
+    #[test]
+    fn opencode_gets_the_whole_wrapper_as_text_and_one_line_as_description() {
+        let body = opencode_synthetic(
+            &record(Some("opencode"), Some("Sam")),
+            "\n  Run the tests.\nThen report.\n",
+        );
+        assert_eq!(
+            body["text"],
+            "<cross-session-message from=\"zellij:boxa/work/brisk-heron\" from-name=\"builder\" \
+             from-tab=\"develop\" origin=\"Sam\" note=\"directly from Sam, sent through another \
+             session\" message=\"7\" answering=\"6\" reply=\"zellij_send reply_to=7\" \
+             reply-to=\"boxa/work/brisk-heron\">\n\
+             \n  Run the tests.\nThen report.\n\
+             </cross-session-message>"
+        );
+        assert_eq!(
+            body["description"],
+            "from builder: Run the tests. (directly from Sam)"
+        );
+        assert_eq!(
+            body["metadata"],
+            serde_json::json!({"source": "subagent", "agent": "builder", "state": "completed"})
+        );
+        assert_eq!(body["delivery"], "queue");
+        assert_eq!(body["resume"], true);
+        // an agent's own message names no origin
+        let own = opencode_synthetic(&record(Some("opencode"), None), "Done.");
+        assert_eq!(own["description"], "from builder: Done.");
+    }
+
+    #[test]
+    fn a_long_message_reaches_opencode_whole_and_its_line_is_cut() {
+        let long = format!("{}\nsecond line", of_len(2000));
+        let body = opencode_synthetic(&record(Some("opencode"), None), &long);
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains(&long), "the whole text, no stub");
+        assert!(!text.contains("message-show"));
+        let description = body["description"].as_str().unwrap();
+        assert_eq!(
+            description,
+            format!("from builder: {}…", "x".repeat(SYNTHETIC_LINE_CHARS))
+        );
+        // characters, not bytes
+        let wide = opencode_synthetic(&record(Some("opencode"), None), &"é".repeat(100));
+        assert_eq!(
+            wide["description"],
+            format!("from builder: {}…", "é".repeat(SYNTHETIC_LINE_CHARS))
+        );
+        // a control character in the text cannot reach the line
+        let sneaky = opencode_synthetic(&record(Some("opencode"), None), "a\x1b[2Jb\tc");
+        assert_eq!(sneaky["description"], "from builder: a[2Jb c");
     }
 
     /// A text of `n` characters on one line.
@@ -1087,6 +1199,7 @@ mod tests {
             queued_at: 1,
             expires_at: 2,
             delivered_at: None,
+            via: None,
         };
         assert!(record
             .line()

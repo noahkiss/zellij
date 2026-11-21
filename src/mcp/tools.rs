@@ -404,7 +404,9 @@ pub const TOOLS: &[ToolSpec] = &[
                agent or several, with the candidates listed. The receiver reads, with your text, \
                an envelope that names you and the message id; it answers with reply_to=<id>. A \
                Claude Code receiver gets a cross-session message, shown collapsed when your text \
-               is one short line. A message whose paste passes 600 characters arrives as a \
+               is one short line. An OpenCode receiver whose server the session finds gets the \
+               message through that server instead, whole and at once (via opencode-api), shown \
+               as one line. A message whose paste passes 600 characters arrives as a \
                one-line stub, its first line and a note; the receiver reads the whole text with \
                `zellij action message-show <id>` in its shell. cancel=<id> takes back a message \
                still queued, with session=<host/session> from its record when that is not your \
