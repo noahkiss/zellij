@@ -1247,7 +1247,14 @@ pub fn start_client(
     switch_context: Option<zellij_utils::session_history::SwitchContext>,
 ) -> Option<ConnectToSession> {
     if start_detached_and_exit {
-        start_server_detached(os_input, cli_args, config, config_options, info);
+        start_server_detached(
+            os_input,
+            cli_args,
+            config,
+            config_options,
+            info,
+            switch_context,
+        );
         return None;
     }
     info!("Starting Zellij client!");
@@ -1890,6 +1897,7 @@ pub fn start_server_detached(
     config: Config,
     config_options: Options,
     info: ClientInfo,
+    switch_context: Option<zellij_utils::session_history::SwitchContext>,
 ) {
     envs::set_zellij("0".to_string());
     config.env.set_vars();
@@ -1918,7 +1926,7 @@ pub fn start_server_detached(
                 cwd,
                 host_terminal_env: host_terminal_env(),
                 initial_panes: None,
-                switch_context: None,
+                switch_context: switch_context.clone(),
                 tty: own_tty(),
             };
 
@@ -1979,7 +1987,7 @@ pub fn start_server_detached(
                 cwd: layout_cwd,
                 host_terminal_env: host_terminal_env(),
                 initial_panes,
-                switch_context: None,
+                switch_context: switch_context.clone(),
                 tty: own_tty(),
             };
 

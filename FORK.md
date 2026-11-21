@@ -5199,6 +5199,35 @@ The cost of the new default is that a `down` followed by an `up` a fortnight lat
 fortnight-old shape. That is the requested semantic — the shape is what the archive is for — and it
 is why the output names the snapshot and how old it is rather than restoring quietly.
 
+### A session `session up` creates never shows the desktop-setup screen
+
+Upstream offers a desktop-setup screen ("Welcome to Zellij!") in a new session on a machine that has
+not resolved it. It comes pre-ticked to copy the binary to a permanent folder and to install a
+desktop app. On this fork's machines Homebrew owns the binary, and `session enable` and
+`session doctor` keep a pinned copy of it. A second copy elsewhere fights both.
+
+The screen appeared after `session up` and `session restart`, from a snapshot or fresh. The server
+skips it only for a session resumed from the in-place cache. A snapshot restore and a fresh `up`
+reach the server as new sessions. The watchdog's `up`, run by the launch agent or the systemd unit,
+took the same path.
+
+`up` now creates the session with the context the welcome screen already sends: no startup card.
+The server reads it as "no person is meeting a new install" and offers no setup screen. The field
+crosses the client/server contract today, so no contract changed. `restart` ends in `up` and is
+covered. The startup card it declines belongs to the background client that creates the session and
+leaves at once; a person who attaches later gets the card the config asks for.
+
+A session serializes the setup pane like any other, so a snapshot or in-place cache taken while it
+was open brings it back. For a session created this way the server also drops every floating pane
+whose plugin carries `is_setup_wizard "true"` from the layout it builds.
+
+Release notes and startup tips are not the setup screen and still follow `show_release_notes` and
+`show_startup_tips`. A restore carries those panes too.
+
+A plain `zellij` typed in a terminal is unchanged. On a machine that should never see the screen,
+press `Ctrl c` ("Don't Show Again") or set `SetupNeverShow` in `desktop_integration.json`. `Esc`
+records only `WizardDismissed`, so the screen returns in the next new session.
+
 ### The server serializes and archives on SIGTERM
 
 A session used to die badly on the ordinary ways a machine ends one. `systemctl --user stop`, a
