@@ -22556,6 +22556,7 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
             agent_name: None,
             agent_session_source: None,
             osc_agent_session: None,
+            claude_record: None,
         },
     );
     let _ = mock_screen
@@ -22686,6 +22687,7 @@ fn pane_list_for_a_claude_pane(detect_agents: bool) -> ListPanesResponse {
             agent_name: None,
             agent_session_source: None,
             osc_agent_session: None,
+            claude_record: None,
         },
     )
 }
@@ -22759,6 +22761,7 @@ pub fn an_agent_row_says_where_its_session_id_came_from() {
             agent_name: None,
             agent_session_source: Some("open-file".to_owned()),
             osc_agent_session: None,
+            claude_record: None,
         },
     );
     let agent = pane_list
@@ -24516,6 +24519,7 @@ pub fn an_agents_own_osc_report_wins_in_the_agent_row() {
             agent_name: None,
             agent_session_source: Some("record".to_owned()),
             osc_agent_session: Some("from-osc".to_owned()),
+            claude_record: None,
         },
     );
     let agent = pane_list
@@ -24698,6 +24702,7 @@ fn reopen_agent_process_info(session_id: &str, cwd: &str) -> crate::pty::PanePro
         agent_name: None,
         agent_session_source: None,
         osc_agent_session: Some(session_id.to_owned()),
+        claude_record: None,
     }
 }
 
@@ -25246,6 +25251,7 @@ fn screen_with_claude(quiet_ms: u64) -> (Screen, PtyWriterReceiver) {
             agent_name: None,
             agent_session_source: None,
             osc_agent_session: None,
+            claude_record: None,
         },
     );
     screen.agent_mail_quiet_ms = quiet_ms;

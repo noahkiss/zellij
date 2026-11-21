@@ -251,3 +251,25 @@ fn a_cancelled_message_leaves_the_held_ones_and_stays_cancelled_after_a_restart(
     assert_eq!(restored.get("1").unwrap().record.status, Status::Cancelled);
     assert_eq!(restored.get("1").unwrap().text, "Run the tests.");
 }
+
+#[test]
+fn an_expired_message_yields_one_notice_and_a_notice_yields_none() {
+    use zellij_utils::agent_mail::expiry_notice;
+    let mut mailbox = Mailbox::default();
+    mailbox.hold(message("3", "sunny-otter", 0, 60_000));
+    let mut notice = message("4", "brisk-heron", 0, 60_000);
+    notice.record.from = "boxa/-/zellij".into();
+    mailbox.hold(notice);
+    let expired = mailbox.expire(60_000);
+    assert_eq!(expired, vec!["3".to_owned(), "4".to_owned()]);
+    // the settled record keeps its last reason, which the notice names
+    let (to, _, text) = expiry_notice(&mailbox.get("3").unwrap().record, "boxa", "work").unwrap();
+    assert_eq!(to, "brisk-heron");
+    assert!(text.contains("the agent stayed busy"), "{text}");
+    assert_eq!(
+        expiry_notice(&mailbox.get("4").unwrap().record, "boxa", "work"),
+        None
+    );
+    // settled once: a later round expires nothing again
+    assert!(mailbox.expire(120_000).is_empty());
+}

@@ -196,6 +196,26 @@ pub fn claude_record_identity(dir: &Path, pid: u32) -> (Option<String>, Option<S
     (session_id, name)
 }
 
+/// fork addition: the `status` in Claude Code's record for `pid`, for `send-message`'s guard:
+/// `busy`, `idle`, `waiting` or `shell` (`zellij_utils::agent_mail::claude_status_free` says what
+/// each means). `None` when there is no record, it names another pid, it was written by an earlier
+/// process with that pid, or it holds no status. One small file read, made at each try of a held
+/// message, so the status is never older than the try.
+pub fn claude_record_status(dir: &Path, pid: u32) -> Option<String> {
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(format!("{}.json", pid))).ok()?).ok()?;
+    if record.get("pid").and_then(|value| value.as_u64()) != Some(pid as u64)
+        || !record_is_for_this_process(&record, pid)
+    {
+        return None;
+    }
+    record
+        .get("status")?
+        .as_str()
+        .filter(|status| !status.is_empty())
+        .map(str::to_owned)
+}
+
 /// Read a name only after the process table verifies the live Claude process.
 #[cfg(test)]
 fn claude_record_name(dir: &Path, pid: u32, live_claude: bool) -> Option<String> {
@@ -1221,6 +1241,27 @@ mod tests {
 #[cfg(test)]
 mod agent_name_tests {
     use super::*;
+    #[test]
+    fn the_message_guard_reads_claude_s_status_from_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        for (pid, body) in [
+            (10, r#"{"pid":10,"status":"shell"}"#),
+            (20, r#"{"pid":21,"status":"busy"}"#),
+            (30, r#"{"pid":30}"#),
+            (40, "not json"),
+        ] {
+            std::fs::write(dir.path().join(format!("{}.json", pid)), body).unwrap();
+        }
+        assert_eq!(
+            claude_record_status(dir.path(), 10).as_deref(),
+            Some("shell")
+        );
+        // a record that names another pid, holds no status, does not parse, or is missing
+        for pid in [20, 30, 40, 50] {
+            assert_eq!(claude_record_status(dir.path(), pid), None, "{pid}");
+        }
+    }
+
     #[test]
     fn retained_records_do_not_hide_a_restarted_claude() {
         let dir = tempfile::tempdir().unwrap();

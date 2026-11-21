@@ -9306,6 +9306,26 @@ reads stdin).
   held as `starting` until it reports again. A state the pane already shows when the session
   first sees the agent counts as one of its reports, so an agent that reported before the first
   process tick is never refused as silent either.
+- **Claude's own status.** A Claude Code turn that ends while background shells or subagents
+  still run keeps its `OSC 7501` report `working` (msg `2 shells still running`) until the last
+  of them ends, though its prompt takes input. So for a `claude` agent the guard also reads the
+  `status` in Claude Code's per-process record, `<pid>.json` under `$CLAUDE_CONFIG_DIR/sessions`
+  or `~/.claude/sessions`, for the claude process the resume path finds in the pane. It reads the
+  file at each try, so the status is never older than the try. Observed meanings:
+
+  | `status` | what Claude Code is doing | guard |
+  |---|---|---|
+  | `busy` | a turn runs | holds as `working`, whatever the report says |
+  | `idle`, `waiting` | at its prompt | counts as idle |
+  | `shell` | the turn ended; background shells or subagents still run | counts as idle |
+
+  Any other status, or no record, leaves the guard to the reported state as above. The record
+  never overrides `blocked`, a missing state (`starting`, `no_state`), a draft or recent typing.
+  A message the session just typed in counts as the agent's turn for up to 10 s, until the agent
+  reports a new turn; a report already stuck at `working` shows none, so after those 10 s the
+  record decides again. A key whose effect is unknown (Up, Tab) leaves a draft unknown until the
+  agent next starts a turn, which a report stuck at `working` never shows; such a draft holds a
+  message until it is cleared (Ctrl c or Ctrl u) or the background work ends.
 - **The draft** is read from the bytes that reach the pane, the same ones that set
   `input_since_state`: characters and pastes add, Backspace and Delete take away, Ctrl c and
   Ctrl u clear, cursor moves change nothing, and a key whose effect cannot be known (Up, Tab, Esc
@@ -9324,6 +9344,14 @@ reads stdin).
   the agent's turn until it reports one. A held message expires after `--expire-s` (1800 by
   default); `0` means deliver now or refuse. A pane is found again by its handle, so a restored
   pane gets its messages. The last 100 settled messages are kept for a week, for `--reply-to`.
+- **An expired message is reported to its sender.** The session sends the sender a message of
+  its own, from `zellij` (address `host/-/zellij`): `message 3 to work/sunny-otter expired
+  undelivered after 30 min: the agent stayed busy. Resend it, or use the agent's harness
+  channel.` The reason follows the message's last hold reason. Only a sender that is an agent's
+  pane in the receiving session, on the same machine, is told. A sender in another session or on
+  another machine, the command line, and a message that expired while no server ran get no
+  notice. The notice is held and expires like any message; a notice that expires is dropped,
+  since its sender is no pane.
 - **The envelope** is one line, marked as another agent's (Claude Code gets it as attributes,
   below):
 
