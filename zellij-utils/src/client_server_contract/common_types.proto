@@ -375,6 +375,8 @@ message Action {
     SendMessageAction send_message = 900;
     MessageStatusAction message_status = 901;
     CloseTabOrConfirmAction close_tab_or_confirm = 907;
+    MessageShowAction message_show = 908;
+    MessageCancelAction message_cancel = 909;
   }
 }
 
@@ -499,6 +501,14 @@ message SendMessageAction {
 }
 message MessageStatusAction {
   optional string id = 1;
+}
+// fork addition: one message's record and its whole text
+message MessageShowAction {
+  string id = 1;
+}
+// fork addition: cancel a held message
+message MessageCancelAction {
+  string id = 1;
 }
 message ListPanesAction {
   bool show_tab = 1;

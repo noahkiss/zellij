@@ -929,6 +929,23 @@ pub enum ScreenInstruction {
         response_channel:
             crossbeam::channel::Sender<Option<Vec<zellij_utils::agent_mail::MessageRecord>>>,
     },
+    /// fork addition: `message-show`: one message and its whole text. `None` answers an id this
+    /// session does not know.
+    AgentMessageShow {
+        id: String,
+        response_channel: crossbeam::channel::Sender<Option<crate::agent_mail::Stored>>,
+    },
+    /// fork addition: `message-cancel`: take a held message out, never to be typed in. See
+    /// `Mailbox::cancel` for the answer.
+    AgentMessageCancel {
+        id: String,
+        response_channel: crossbeam::channel::Sender<
+            Result<
+                zellij_utils::agent_mail::MessageRecord,
+                Option<zellij_utils::agent_mail::MessageRecord>,
+            >,
+        >,
+    },
     /// fork addition: try the held messages again, and expire the overdue ones. Sent once a
     /// second while any are held.
     DrainAgentMessages,
@@ -1632,6 +1649,8 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ListClosedPanes { .. } => ScreenContext::ListClosedPanes,
             ScreenInstruction::SendAgentMessage { .. } => ScreenContext::SendAgentMessage,
             ScreenInstruction::AgentMessageStatus { .. } => ScreenContext::AgentMessageStatus,
+            ScreenInstruction::AgentMessageShow { .. } => ScreenContext::AgentMessageShow,
+            ScreenInstruction::AgentMessageCancel { .. } => ScreenContext::AgentMessageCancel,
             ScreenInstruction::DrainAgentMessages => ScreenContext::DrainAgentMessages,
             ScreenInstruction::ExpectReopenedPane { .. } => ScreenContext::ReopenPane,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
@@ -13912,6 +13931,19 @@ pub(crate) fn screen_thread_main(
                     None => Some(screen.agent_mail.records()),
                 };
                 let _ = response_channel.send(records);
+            },
+            ScreenInstruction::AgentMessageShow {
+                id,
+                response_channel,
+            } => {
+                let _ = response_channel.send(screen.agent_mail.get(&id).cloned());
+            },
+            ScreenInstruction::AgentMessageCancel {
+                id,
+                response_channel,
+            } => {
+                let now_ms = crate::program_status::now_ms();
+                let _ = response_channel.send(screen.agent_mail.cancel(&id, now_ms));
             },
             ScreenInstruction::DrainAgentMessages => {
                 screen.drain_agent_messages();

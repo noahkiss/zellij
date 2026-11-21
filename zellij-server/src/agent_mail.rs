@@ -471,11 +471,27 @@ impl Mailbox {
         stored.record.status = status;
         if status == Status::Delivered {
             stored.record.delivered_at = Some(now_ms);
+        }
+        if matches!(status, Status::Delivered | Status::Cancelled) {
             stored.record.reason = None;
         }
         let record = stored.record.clone();
         self.remember(stored);
         Some(record)
+    }
+
+    /// Cancels a held message, so it is never typed in. `Ok` with its record, now cancelled;
+    /// `Err` with the record of a message that is not held (delivered, expired, refused or
+    /// cancelled before), or `Err(None)` for an id this session does not know.
+    pub fn cancel(
+        &mut self,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<MessageRecord, Option<MessageRecord>> {
+        match self.settle(id, Status::Cancelled, now_ms) {
+            Some(record) => Ok(record),
+            None => Err(self.get(id).map(|stored| stored.record.clone())),
+        }
     }
 
     /// Settles every held message whose time ran out. Returns their ids.

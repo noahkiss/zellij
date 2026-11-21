@@ -9360,9 +9360,9 @@ reads stdin).
   ```
 
   Claude Code's UI reads a paste as a message from another session only when the opening tag is
-  the very first thing in it. It collapses a one-line message to "Message from @builder"; a
-  message of several lines shows the raw wrapper, which the model still reads correctly. So the
-  wrapper holds the text and nothing else.
+  the very first thing in it. It collapses a short one-line message to "Message from @builder"; a
+  message of several lines, or a long one, shows the raw wrapper, which the model still reads
+  correctly. So the wrapper holds the text and nothing else.
   - `from` is `zellij:` and the sender's address, or `zellij:command-line` for a sender outside
     any pane. `from-name` is the name the envelope line gives.
   - `from-tab` is there when the sender named its tab, `origin` and `note` only with
@@ -9372,13 +9372,31 @@ reads stdin).
   - An attribute value loses its newlines, and `"`, `<` and `>` become `&quot;`, `&lt;` and
     `&gt;`. A `</cross-session-message` in the text, in any case, becomes
     `&lt;/cross-session-message`, so the text cannot close the wrapper.
+- **A long message goes in as a stub.** Measured with Claude Code 2.1.330, a one-line paste of
+  about 680 characters still collapsed; about 800 and 1100 did not. Claude Code's own inbox has
+  no such limit, but zellij can only paste. So a message whose whole paste, wrapper or envelope
+  included, would pass `agent_mail::PASTE_COLLAPSE_LIMIT` (600 characters) goes in as one line:
+  the text's first line, cut to fit, then ` … (N chars; read the rest with zellij action
+  message-show <id>)`. The choice is by length, for every kind. Claude Code gets the stub inside
+  the same wrapper, which gains `full="zellij action message-show <id>"`:
+
+  ```text
+  <cross-session-message from="zellij:boxa/work/brisk-heron" from-name="builder" from-tab="develop" message="7" answering="6" reply="zellij_send reply_to=7" reply-to="boxa/work/brisk-heron" full="zellij action message-show 7">
+  Run the full test suite and report every failure. … (673 chars; read the rest with zellij action message-show 7)
+  </cross-session-message>
+  ```
+
+  Every other kind keeps the envelope line first, with the stub below it. A message under the
+  limit is unchanged, several lines or not. The stored text stays whole. The id in the stub is
+  the receiving session's, given before the paste is built, so the receiver's own `message-show`
+  resolves it.
 - **Message ids** are a small number counted per receiving session: `1`, `2`, ... `reply_to` is
   resolved by the session that delivered the message, so an id only has to be unique there. The
   counter is saved beside the held messages (`next-id`) before an id is used, so a restart of the
   server never gives one twice; a lost counter file restarts past the highest id still on disk.
   An id an older build gave (`m3k9x2q`) still resolves.
 - **The answer** is one record (`--json`, or a line): `delivered`, `queued` with a `reason`,
-  `refused`, or `expired`. Exit 0 for delivered and queued, 2 otherwise. `--wait <s>` blocks until
+  `refused`, `expired`, or `cancelled`. Exit 0 for delivered and queued, 2 otherwise. `--wait <s>` blocks until
   a held message goes in. It waits for delivery only, never for an answer.
 - **Do not wait for the answer.** The reply comes back as a message too, typed into the sender's
   own prompt once the sender is idle. A sender that blocks on `zellij_wait_for`, or polls, freezes
@@ -9389,13 +9407,27 @@ reads stdin).
   routes it). "This session" is `--session`, or the replying pane's own `ZELLIJ_SESSION_NAME`,
   never the one session that happens to be running: ids repeat from session to session, so an
   id missing there is a miss (exit 2), not a match in another session.
+- **`zellij action message-show <id>`** prints the whole text of a message this session holds
+  or delivered, with control characters other than newline and tab removed, as in the paste.
+  `--json` prints the record plus `text`. An id this session does not know exits 1 with one line
+  that says so (`message-status` exits 2 for the same miss). It resolves the session as
+  `message-status` does.
+- **`zellij action message-cancel <id>`** cancels a message this session still holds: the record
+  becomes `cancelled` with no `reason`, stays listed as a settled message, and is never typed in.
+  A cancelled message cancelled again answers its record, exit 0. A delivered, expired or
+  refused one exits 1 and says so; `--json` still prints its record. The id is the holding
+  session's, the receiver's, so a sender in another session passes `--session`.
 - **The listings** show held messages: `list-panes --json` rows gain `queued_messages`, and
   `list-agents --json` rows gain `queued`, each only when there are some. The pane frame shows
   nothing: the frame is drawn from state the screen does not push for this, and the listing is
   where a supervisor looks.
 
 **`zellij_send`** is the seventh MCP tool: `to`, `text`, `reply_to`, `expire_s`, `wait_s`,
-`from_person` and `session`. `to` may start with a host or its `remote_hosts` alias -
+`from_person`, `cancel` and `session`. `cancel=<id>` runs `message-cancel` in the session that
+holds the message, and needs `session` (`host/session` from the send's record): ids are counted
+per receiving session, so the tool never guesses one, and a cancel with `to`, `text` or
+`reply_to` is refused. The tips say a long message arrives as a stub and that the receiver reads
+the rest with `zellij action message-show <id>` in its shell; no read tool gained a parameter. `to` may start with a host or its `remote_hosts` alias -
 `boxa/develop`, `boxa/work/develop` - and the tool runs `send-message` on that machine over ssh, so the message is
 held there. With no session named, every session there is searched. The sender is this server's own
 pane (`host/session/handle` and the agent's name). `reply_to` alone looks the message up in this
@@ -9409,14 +9441,16 @@ so the tool's output schema lists those values beside the failure kinds and `rem
 queued message once failed the schema check, and the caller read a delivered-later message as an
 error.
 
-Contract: two `Action` messages, `SendMessageAction` (tag 900) and `MessageStatusAction` (tag 901),
-in the fork block from 900, clear of upstream's numbering. A stock client
+Contract: four `Action` messages, `SendMessageAction` (tag 900), `MessageStatusAction` (tag 901),
+`MessageShowAction` (tag 908) and `MessageCancelAction` (tag 909), in the fork block from 900,
+clear of upstream's numbering. A stock client
 cannot send them; a fork client against a stock server of the same contract gets nothing for these
-two actions. `SendMessageAction` gained `optional string from_tab = 7`, a field of a message the
+actions. `SendMessageAction` gained `optional string from_tab = 7`, a field of a message the
 fork owns; a server from before it ignores the field and names no tab. It gained `optional
 string from_person = 8` the same way; a server from before it ignores the field and says "not
 from the person". No plugin-API change.
-Capability: `agent-send-message`.
+Capabilities: `agent-send-message`; `agent-message-show-cancel` for the stub, `message-show`,
+`message-cancel` and `zellij_send cancel`.
 
 Limits:
 
@@ -9428,17 +9462,19 @@ Limits:
 - An agent that never reports again (a codex whose hooks were removed) keeps a held message until
   it expires.
 
-Files: `zellij-utils/src/agent_mail.rs` (record, envelope, guard, address),
+Files: `zellij-utils/src/agent_mail.rs` (record, envelope, stub, guard, address),
 `input/actions.rs`, `cli.rs`, `cli_surface.rs`, `capabilities.rs`, `data.rs`
 (`queued_messages`), `client_server_contract/common_types.proto`, `ipc/protobuf_conversion.rs`;
 `zellij-server/src/agent_mail.rs` (`Draft`, `Mailbox`), `pty_writer.rs` (`WriteNotBefore`),
 `program_status.rs`, `panes/grid.rs`, `panes/terminal_pane.rs`, `tab/mod.rs` (`AgentPrompt`),
-`screen.rs` (send, drain, ticker), `route.rs`; `zellij-client/src/agent_send.rs`,
+`screen.rs` (send, drain, ticker, show, cancel), `route.rs`; `zellij-client/src/agent_send.rs`,
 `cli_client.rs`; `src/commands.rs`; `src/mcp/send.rs`, `mod.rs`, `tools.rs`, `fleet.rs`,
 `invoke.rs`; `input/options.rs` and `kdl/mod.rs` (`person_name`). Tests: the guard table, the
 envelope and text cleaning, the origin, the Claude wrapper and its escaping, the shape per kind,
+the stub at and over the limit for Claude and another kind, show and cancel of a held and a
+delivered message (a cancelled one is never typed), the client's exit for each answer,
 the draft on every key class, the mailbox's save, restore, expiry and pruning, the pty writer's held write, target resolution
-(names, tabs, projects, ambiguity, sessions, a shell pane), the MCP route, sender, command line
+(names, tabs, projects, ambiguity, sessions, a shell pane), the MCP route, sender, cancel, command line
 and old-build detection, and on the screen: delivery to an idle agent, a key after it, a draft
 held and left alone then delivered after its turn, a cleared draft, the quiet window, and the
 working, blocked, shell and no-wait cases.
@@ -9513,6 +9549,7 @@ stay small: no upstream message shares their numbering.
 | client/server `Action`: `move_tab_to_index` | 172, then 904 | reserved: `move-tab --to-index` maps onto upstream's `MoveTabToPosition` |
 | client/server `Action`: `send_message`, `message_status` | 900, 901 | unchanged |
 | client/server `Action`: `close_tab_or_confirm` | new | 907 |
+| client/server `Action`: `message_show`, `message_cancel` | new | 908, 909 |
 | `ClientToServerMsg.fork_subscribe_to_session_events` | 28 | 900 |
 | `ServerToClientMsg.fork_session_event` | 20 | 900 |
 | `ListClientsAction.output_json`, `FocusPaneByPaneIdAction.no_focus`, `GoToTabNameAction.no_focus` | 1, 2, 3 | 900 |

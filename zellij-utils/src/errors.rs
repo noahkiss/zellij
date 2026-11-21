@@ -423,6 +423,8 @@ pub enum ScreenContext {
     ListClosedPanes,
     SendAgentMessage,
     AgentMessageStatus,
+    AgentMessageShow,
+    AgentMessageCancel,
     DrainAgentMessages,
     ListTabs,
     GetCurrentTabInfo,

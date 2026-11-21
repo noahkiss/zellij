@@ -170,6 +170,37 @@ pub fn argv(
     Ok(argv)
 }
 
+/// The session a `cancel` acts in: the `session` argument, `host/session` or bare. A cancel
+/// carries nothing else: a `to`, `text` or `reply_to` with it is two requests in one call.
+pub fn cancel_session(args: &Map<String, Value>) -> Result<&str, String> {
+    if let Some(other) = ["to", "text", "reply_to"]
+        .iter()
+        .find(|name| args.contains_key(**name))
+    {
+        return Err(format!(
+            "`cancel` takes back a queued message and sends nothing: pass it without `{}`.",
+            other
+        ));
+    }
+    args.get("session")
+        .and_then(Value::as_str)
+        .filter(|session| !session.is_empty())
+        .ok_or_else(|| {
+            "`cancel` needs `session`: the host/session from the message's record (its `session`, \
+             and `host` for another machine). Ids are counted per receiving session, so the \
+             session is never guessed."
+                .to_owned()
+        })
+}
+
+/// The command line that cancels message `id` in `session`, on the machine that holds it.
+pub fn cancel_argv(id: &str, session: &str) -> Vec<String> {
+    ["-s", session, "action", "message-cancel", id, "--json"]
+        .iter()
+        .map(|word| word.to_string())
+        .collect()
+}
+
 /// The flag that names the sender's tab. A receiving build from before it refuses the flag; the
 /// message is then sent again without it, and the envelope there names no tab.
 pub const FROM_TAB: &str = "--from-tab";
@@ -327,6 +358,28 @@ mod tests {
             argv(&r, &sender, &args).unwrap()[..5].join(" "),
             "-s work action send-message --to"
         );
+    }
+
+    #[test]
+    fn a_cancel_names_its_session_and_carries_nothing_else() {
+        let args: Map<String, Value> =
+            serde_json::from_value(json!({"cancel": "3", "session": "boxa/work"})).unwrap();
+        assert_eq!(cancel_session(&args).unwrap(), "boxa/work");
+        assert_eq!(
+            cancel_argv("3", "work").join(" "),
+            "-s work action message-cancel 3 --json"
+        );
+        // no session: refused, never this server's own session by default
+        let args: Map<String, Value> = serde_json::from_value(json!({"cancel": "3"})).unwrap();
+        assert!(cancel_session(&args)
+            .unwrap_err()
+            .contains("needs `session`"));
+        let args: Map<String, Value> =
+            serde_json::from_value(json!({"cancel": "3", "session": "work", "text": "hi"}))
+                .unwrap();
+        assert!(cancel_session(&args)
+            .unwrap_err()
+            .contains("without `text`"));
     }
 
     #[test]

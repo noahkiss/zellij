@@ -2681,6 +2681,8 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::ResolvePaneTarget { .. }
             | Action::SendMessage { .. }
             | Action::MessageStatus { .. }
+            | Action::MessageShow { .. }
+            | Action::MessageCancel { .. }
             | Action::StackPanes { pane_ids: _ }
             | Action::ChangeFloatingPaneCoordinates {
                 pane_id: _,

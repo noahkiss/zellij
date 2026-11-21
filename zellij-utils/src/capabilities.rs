@@ -94,6 +94,8 @@ pub const CAPABILITIES: &[&str] = &[
     "session-restart-when-idle",
     // action send-message / message-status, zellij_send: guarded, queued agent messages
     "agent-send-message",
+    // a long message goes in as a stub; action message-show / message-cancel, zellij_send cancel
+    "agent-message-show-cancel",
     // send-message starts the config's default_harness in a target tab or pane with no agent
     "send-default-harness",
 ];

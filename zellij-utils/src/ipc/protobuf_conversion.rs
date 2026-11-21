@@ -1573,6 +1573,8 @@ impl From<crate::input::actions::Action>
             ListTreeAction,
             MarkAllSeenAction,
             MarkPaneSeenAction,
+            MessageCancelAction,
+            MessageShowAction,
             MessageStatusAction,
             MouseEventAction,
             MoveFocusAction,
@@ -2602,6 +2604,12 @@ impl From<crate::input::actions::Action>
             }),
             crate::input::actions::Action::MessageStatus { id } => {
                 ActionType::MessageStatus(MessageStatusAction { id })
+            },
+            crate::input::actions::Action::MessageShow { id } => {
+                ActionType::MessageShow(MessageShowAction { id })
+            },
+            crate::input::actions::Action::MessageCancel { id } => {
+                ActionType::MessageCancel(MessageCancelAction { id })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -3748,6 +3756,12 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             }),
             ActionType::MessageStatus(a) => {
                 Ok(crate::input::actions::Action::MessageStatus { id: a.id })
+            },
+            ActionType::MessageShow(a) => {
+                Ok(crate::input::actions::Action::MessageShow { id: a.id })
+            },
+            ActionType::MessageCancel(a) => {
+                Ok(crate::input::actions::Action::MessageCancel { id: a.id })
             },
             ActionType::ListPanes(list_panes_action) => {
                 Ok(crate::input::actions::Action::ListPanes {

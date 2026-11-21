@@ -1307,6 +1307,17 @@ fn test_client_messages() {
             is_cli_client: true,
         });
     }
+    for action in [
+        Action::MessageShow { id: "7".to_owned() },
+        Action::MessageCancel { id: "7".to_owned() },
+    ] {
+        test_client_roundtrip!(ClientToServerMsg::Action {
+            action,
+            terminal_id: None,
+            client_id: Some(100),
+            is_cli_client: true,
+        });
+    }
     for (handle, list, output_json) in [
         (None, false, false),
         (Some("sunny-otter".to_owned()), false, false),

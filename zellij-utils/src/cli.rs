@@ -3182,8 +3182,10 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     /// survives a restart of the session. The message goes in with an envelope that names the
     /// sender, says whether it relays the person's own words (--from-person), and says how to
     /// reply. A Claude Code agent gets the text inside a `<cross-session-message>` wrapper whose
-    /// attributes carry the envelope; its UI collapses a one-line message and shows a longer one
-    /// as the raw wrapper. Every other agent gets a one-line envelope above the text.
+    /// attributes carry the envelope; its UI collapses a short one-line message and shows a longer
+    /// one as the raw wrapper. Every other agent gets a one-line envelope above the text. A
+    /// message whose paste would pass 600 characters goes in as a one-line stub that names
+    /// `zellij action message-show <id>`, which prints the whole text.
     ///
     ///   zellij action send-message --to develop -- 'The build is green; go ahead.'
     ///   zellij action send-message --reply-to 3 -- 'Done.'
@@ -3249,6 +3251,44 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// One message id
         #[clap(value_parser)]
         id: Option<String>,
+
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
+    /// Print the whole text of a message this session holds or delivered
+    ///
+    /// A message longer than a short paste goes into the agent's prompt as a one-line stub that
+    /// names this command; this prints the rest. The id is the one in the message's envelope, and
+    /// it is looked up in this session: ids are counted per receiving session.
+    ///
+    ///   zellij action message-show 7
+    ///
+    /// Returns: the text as sent; with --json, the record `message-status` prints plus `text`.
+    /// Exit 1 when the id names no message this session knows.
+    MessageShow {
+        /// The message id
+        #[clap(value_parser)]
+        id: String,
+
+        /// Output as JSON: the record plus `text`
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
+    /// Cancel a message this session still holds, so it is never typed in
+    ///
+    /// Only a held (queued) message can be cancelled. Its record becomes `cancelled` and stays
+    /// listed by `message-status`. The id is looked up in the session that holds the message,
+    /// the receiver's: pass `--session` from another one.
+    ///
+    ///   zellij --session work action message-cancel 7
+    ///
+    /// Returns: the record, now cancelled. Exit 1 when the message was already delivered, expired
+    /// or refused, or when the id names no message this session knows.
+    MessageCancel {
+        /// The message id
+        #[clap(value_parser)]
+        id: String,
 
         /// Output as JSON
         #[clap(short, long, value_parser)]
@@ -3621,6 +3661,8 @@ impl CliAction {
             | CliAction::LastReply { json, .. }
             | CliAction::SendMessage { json, .. }
             | CliAction::MessageStatus { json, .. }
+            | CliAction::MessageShow { json, .. }
+            | CliAction::MessageCancel { json, .. }
             | CliAction::CurrentTabInfo { json, .. } => {
                 *json = true;
                 true
