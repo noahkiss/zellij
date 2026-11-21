@@ -56,7 +56,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             restore,
             fresh,
         } => {
-            let name = resolve_session_name(session_name, &opts, false);
+            let name = resolve_session_name(session_name, &opts);
             refuse_a_scratch_pin(&opts);
             process::exit(match up(&name, up_shape(fresh, restore), &opts) {
                 Ok(()) => 0,
@@ -68,7 +68,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             wait_timeout,
             force,
         } => {
-            let name = resolve_session_name(session_name, &opts, false);
+            let name = resolve_session_name(session_name, &opts);
             refuse_from_inside(&name);
             refuse_if_agents_are_working("down", &name, force, None);
             process::exit(match down(&name, wait_timeout, &opts) {
@@ -86,7 +86,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             deadline,
             dry_run,
         } => {
-            let name = resolve_session_name(session_name, &opts, true);
+            let name = resolve_session_name(session_name, &opts);
             if dry_run {
                 process::exit(restart_dry_run(&name, force, &opts));
             }
@@ -122,7 +122,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             force,
             dry_run,
         } => {
-            let name = resolve_session_name(session_name, &opts, false);
+            let name = resolve_session_name(session_name, &opts);
             if !dry_run {
                 refuse_a_scratch_pin(&opts);
             }
@@ -137,14 +137,14 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             });
         },
         SessionLifecycleCli::Disable { session_name } => {
-            let name = resolve_session_name(session_name, &opts, false);
+            let name = resolve_session_name(session_name, &opts);
             process::exit(match disable(&name) {
                 Ok(()) => 0,
                 Err(()) => 1,
             });
         },
         SessionLifecycleCli::Status { session_name, exe } => {
-            let name = resolve_session_name(session_name, &opts, false);
+            let name = resolve_session_name(session_name, &opts);
             process::exit(status(&name, exe, &opts));
         },
         SessionLifecycleCli::Doctor {
@@ -1272,41 +1272,59 @@ fn print_configured_extras<W: Write + ?Sized>(
     Ok(())
 }
 
-/// The name to act on: what was asked for, else the session this shell is in (for `restart`, which
-/// is the one command that means "this one"), else `--session`, else the `session_name` config
-/// option. There is no built-in default: a lifecycle command that guesses the name is a lifecycle
-/// command that eventually kills the wrong session.
-pub(crate) fn resolve_session_name(
-    session_name: Option<String>,
-    opts: &CliArgs,
-    prefer_current_session: bool,
-) -> String {
-    let name = session_name
-        .or_else(|| {
-            if prefer_current_session {
-                envs::get_session_name().ok()
-            } else {
-                None
-            }
-        })
-        .or_else(|| opts.session.clone())
-        .or_else(|| {
+/// The name to act on: the positional name, else the global `--session`, else the session this
+/// shell is in, else the `session_name` config option. A positional name and a `--session` that
+/// disagree refuse with exit 2, before anything is touched. There is no built-in default: a
+/// lifecycle command that guesses the name is a lifecycle command that eventually kills the wrong
+/// session.
+pub(crate) fn resolve_session_name(session_name: Option<String>, opts: &CliArgs) -> String {
+    let name = choose_session_name(
+        session_name,
+        opts.session.clone(),
+        || envs::get_session_name().ok(),
+        || {
             get_config_options_from_cli_args(opts)
                 .ok()
                 .and_then(|options| options.session_name)
-        });
-    let Some(name) = name else {
-        eprintln!(
-            "No session name given, and no `session_name` is set in the config. \
-             Name the session to act on."
-        );
-        process::exit(2);
+        },
+    );
+    let name = match name {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            eprintln!(
+                "No session name given, and no `session_name` is set in the config. \
+                 Name the session to act on."
+            );
+            process::exit(2);
+        },
+        Err(conflict) => {
+            eprintln!("{}", conflict);
+            process::exit(2);
+        },
     };
     if let Err(e) = validate_session_name(&name) {
         eprintln!("{}", e);
         process::exit(2);
     }
     name
+}
+
+/// The precedence behind `resolve_session_name`, apart from the environment and the config so it
+/// can be tested. `current` and `config` are asked only when nothing before them answered.
+fn choose_session_name(
+    positional: Option<String>,
+    global: Option<String>,
+    current: impl FnOnce() -> Option<String>,
+    config: impl FnOnce() -> Option<String>,
+) -> Result<Option<String>, String> {
+    match (positional, global) {
+        (Some(positional), Some(global)) if positional != global => Err(format!(
+            "Two session names given: '{}' as the argument and '{}' as --session. Give one.",
+            positional, global
+        )),
+        (Some(name), _) | (None, Some(name)) => Ok(Some(name)),
+        (None, None) => Ok(current().or_else(config)),
+    }
 }
 
 /// Tearing a session down kills every pane shell in it, including the one running the command, so a
@@ -2718,6 +2736,75 @@ fn down_then_up(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn choose(
+        positional: Option<&str>,
+        global: Option<&str>,
+        current: Option<&str>,
+        config: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        choose_session_name(
+            positional.map(str::to_owned),
+            global.map(str::to_owned),
+            || current.map(str::to_owned),
+            || config.map(str::to_owned),
+        )
+    }
+
+    #[test]
+    fn the_positional_name_wins_over_everything_else() {
+        let name = choose(Some("a"), None, Some("current"), Some("config"));
+        assert_eq!(name, Ok(Some("a".to_owned())));
+    }
+
+    #[test]
+    fn the_global_session_wins_over_the_current_session_and_the_config() {
+        let name = choose(None, Some("rounds"), Some("current"), Some("config"));
+        assert_eq!(name, Ok(Some("rounds".to_owned())));
+    }
+
+    #[test]
+    fn the_current_session_wins_over_the_config() {
+        let name = choose(None, None, Some("current"), Some("config"));
+        assert_eq!(name, Ok(Some("current".to_owned())));
+    }
+
+    #[test]
+    fn the_config_name_is_the_last_resort() {
+        assert_eq!(
+            choose(None, None, None, Some("config")),
+            Ok(Some("config".to_owned()))
+        );
+        assert_eq!(choose(None, None, None, None), Ok(None));
+    }
+
+    #[test]
+    fn a_positional_name_and_a_different_global_session_refuse() {
+        let refusal = choose(Some("a"), Some("b"), Some("current"), Some("config")).unwrap_err();
+        assert!(
+            refusal.contains("'a'") && refusal.contains("'b'"),
+            "{}",
+            refusal
+        );
+        assert!(!refusal.contains('\n'), "{}", refusal);
+    }
+
+    #[test]
+    fn a_positional_name_and_the_same_global_session_agree() {
+        let name = choose(Some("a"), Some("a"), None, None);
+        assert_eq!(name, Ok(Some("a".to_owned())));
+    }
+
+    #[test]
+    fn a_named_session_reads_neither_the_environment_nor_the_config() {
+        let name = choose_session_name(
+            None,
+            Some("rounds".to_owned()),
+            || panic!("read the current session"),
+            || panic!("read the config"),
+        );
+        assert_eq!(name, Ok(Some("rounds".to_owned())));
+    }
 
     #[test]
     fn an_up_with_no_server_names_the_saved_layout_that_does_not_load() {

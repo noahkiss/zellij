@@ -1403,13 +1403,15 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
 /// The lifecycle of one named session: create it, remove it, replace it.
 ///
 /// Each of these states a post-condition and checks it, rather than reporting what it asked for.
-/// The session name defaults to the `session_name` config option where one is set, so a machine
-/// that runs a single named session can say `zellij session up` and mean it.
+/// The session name is the positional name, else the global `--session`, else the current session,
+/// else the `session_name` config option, so a machine that runs a single named session can say
+/// `zellij session up` and mean it. A positional name and a different `--session` refuse.
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum SessionLifecycleCli {
     /// Create the session in the background if it is not already up, then assert that it is
     Up {
-        /// Name of the session, defaults to the `session_name` config option
+        /// Name of the session, defaults to --session, then the current session, then the
+        /// `session_name` config option
         #[clap(value_parser)]
         session_name: Option<String>,
 
@@ -1434,7 +1436,8 @@ pub enum SessionLifecycleCli {
 
     /// Remove the session, archiving a snapshot of its shape first, then assert that it is gone
     Down {
-        /// Name of the session, defaults to the `session_name` config option
+        /// Name of the session, defaults to --session, then the current session, then the
+        /// `session_name` config option
         #[clap(value_parser)]
         session_name: Option<String>,
 
@@ -1450,8 +1453,8 @@ pub enum SessionLifecycleCli {
 
     /// Take the session down and bring it back, from inside it or from anywhere else
     Restart {
-        /// Name of the session, defaults to the current session, then to the `session_name`
-        /// config option
+        /// Name of the session, defaults to --session, then the current session, then the
+        /// `session_name` config option
         #[clap(value_parser)]
         session_name: Option<String>,
 
@@ -1492,7 +1495,8 @@ pub enum SessionLifecycleCli {
     /// launchd on macOS, both in the user's own domain. Running it again over an unchanged
     /// install changes nothing and says so
     Enable {
-        /// Name of the session, defaults to the `session_name` config option
+        /// Name of the session, defaults to --session, then the current session, then the
+        /// `session_name` config option
         #[clap(value_parser)]
         session_name: Option<String>,
 
@@ -1515,7 +1519,8 @@ pub enum SessionLifecycleCli {
     /// Unload the init-system unit and remove it. Removing the file without unloading the job
     /// first is the mistake this exists to prevent
     Disable {
-        /// Name of the session, defaults to the `session_name` config option
+        /// Name of the session, defaults to --session, then the current session, then the
+        /// `session_name` config option
         #[clap(value_parser)]
         session_name: Option<String>,
     },
@@ -1524,7 +1529,8 @@ pub enum SessionLifecycleCli {
     /// whether the session is actually running. The three come apart, and which one is missing is
     /// the diagnosis
     Status {
-        /// Name of the session, defaults to the `session_name` config option
+        /// Name of the session, defaults to --session, then the current session, then the
+        /// `session_name` config option
         #[clap(value_parser)]
         session_name: Option<String>,
 
@@ -1538,7 +1544,8 @@ pub enum SessionLifecycleCli {
     /// what changed, what was already correct, and what needs you - and exits non-zero only when
     /// something is waiting on you
     Doctor {
-        /// Name of the session, defaults to the `session_name` config option
+        /// Name of the session, defaults to --session, then the current session, then the
+        /// `session_name` config option
         #[clap(value_parser)]
         session_name: Option<String>,
 
