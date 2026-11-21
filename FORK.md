@@ -1942,18 +1942,27 @@ over SSH created a `Background`-domain session past a loaded agent.
 
 So the job is now identified by what it **does**. Both platforms enumerate every directory the init
 system loads from — the user's own first, then the read-only system ones: `/Library/LaunchAgents`
-and `/System/Library/LaunchAgents` on macOS, `/etc/systemd/user`, `/run/systemd/user` and the two
+on macOS, `/etc/systemd/user`, `/run/systemd/user` and the two
 `lib/systemd/user` paths on Linux. A job a package or an MDM profile installed keeps a session up
 exactly as a hand-written one does, and scanning only the user's directory called it absent. A
 nearer directory shadows a file of the same name, which is the init systems' own precedence.
 **Only the user's directory is ever written to** — installing anywhere else would need root and
 would be somebody else's file.
 
-`/System/Library/LaunchAgents` holds several hundred of Apple's agents, most in the binary plist
-format, so converting each one would fork `plutil` hundreds of times per pass — on a command a
-watchdog runs every minute. A plist whose raw bytes never contain `session` cannot match however it
-is parsed, because the subcommand *is* the identity and both plist formats store strings literally.
-That check costs a read and runs before any conversion.
+A plist in the binary format is converted with `plutil`, a process per file, on a command a
+watchdog runs every 15 seconds. So a plist whose raw bytes never contain `session` is skipped
+unread: it cannot match however it is parsed, because the subcommand *is* the identity and both
+plist formats store strings literally. That check costs a read and runs before any conversion.
+`/System/Library/LaunchAgents` is not scanned at all. System Integrity Protection keeps it to
+Apple's own agents, so nothing there can run `session up`, but several of them contain the word
+`session` (`nsurlsessiond`, `parsecd`). The filter passed them, and every tick forked `plutil` a
+dozen times for nothing.
+
+On macOS the session commands run `ps`, `launchctl` and `plutil` by absolute path (`/bin/ps`,
+`/bin/launchctl`, `/usr/bin/plutil`; `session_lifecycle::{PS, LAUNCHCTL, PLUTIL}`). By bare name,
+each spawn failed once per PATH directory before the one holding the tool. With `/usr/bin` 17th in a
+unit's PATH, one watchdog `session up` made about 240 forks; with both changes it makes about 3.
+Linux still finds them on PATH, where distributions place them differently.
 
 Each file is then read for `Label` and `ProgramArguments`, or for `ExecStart`, and matches when its
 arguments run `session up <name>` for this session. argv[0] is not looked at: a unit may exec zellij through a wrapper, and a renamed or
