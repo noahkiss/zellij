@@ -1540,6 +1540,16 @@ fn session_name_in_opts(opts: &CliArgs) -> Option<String> {
 }
 
 pub(crate) fn start_client(opts: CliArgs) {
+    start_client_with_context(opts, None)
+}
+
+/// fork: `start_client` with a context for the first connection only. `session up` uses it to tell
+/// the server that the lifecycle commands, not a person, created the session. A reconnect carries
+/// its own context and never sees this one.
+pub(crate) fn start_client_with_context(
+    opts: CliArgs,
+    mut initial_switch_context: Option<zellij_utils::session_history::SwitchContext>,
+) {
     let (
         config,
         client_layout_info,
@@ -1618,9 +1628,10 @@ pub(crate) fn start_client(opts: CliArgs) {
             config_options = config_options_without_layout.clone();
             is_a_reconnect = true;
         }
-        let switch_context = reconnect_to_session
-            .as_ref()
-            .and_then(|r| r.switch_context.clone());
+        let switch_context = match &reconnect_to_session {
+            Some(r) => r.switch_context.clone(),
+            None => initial_switch_context.take(),
+        };
 
         let start_client_plan = |session_name: std::string::String| {
             assert_session_ne(&session_name);

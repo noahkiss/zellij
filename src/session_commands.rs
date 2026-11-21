@@ -30,7 +30,9 @@ use zellij_utils::session_service::{
 };
 use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
-use crate::commands::{get_config_options_from_cli_args, snapshot_settings, start_client};
+use crate::commands::{
+    get_config_options_from_cli_args, snapshot_settings, start_client_with_context,
+};
 
 /// How long to wait for a freshly requested server to appear before calling the creation a failure.
 /// `attach --create-background` returns as soon as the spawn is requested, not once it has happened.
@@ -2351,7 +2353,7 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
         },
         create_background: true,
     }));
-    start_client(opts);
+    start_client_with_context(opts, Some(created_by_the_lifecycle_commands()));
 
     let facts = wait_for_server(name);
     if let Err(reason) = facts.assert_up() {
@@ -2370,6 +2372,17 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
         (None, None) => {},
     }
     Ok(())
+}
+
+/// The context `up` creates a session with. The creating client asks for no startup card, the
+/// same signal a session made from the welcome screen sends, so the server never offers the
+/// desktop-setup screen: its "copy Zellij to a permanent folder" fights the package manager's
+/// install and the pin. The creator is a background client that leaves at once, so the card it
+/// declines is one nobody would see; a person who attaches later sends a context of their own.
+fn created_by_the_lifecycle_commands() -> zellij_utils::session_history::SwitchContext {
+    zellij_utils::session_history::SwitchContext::with_startup_card(
+        zellij_utils::input::attention::StartupCard::Never,
+    )
 }
 
 /// Why no server came up, when the session's saved layout is the reason: the parse error, read by
@@ -2883,6 +2896,15 @@ mod tests {
         // `Fresh` rather than "no snapshot named" is the whole point of the enum - a bare `up`
         // resumes, so "nothing named" would now mean "resume from the newest snapshot".
         assert_eq!(restart_restore_target(true, None), UpShape::Fresh);
+    }
+
+    #[test]
+    fn a_session_up_creates_declines_the_startup_card() {
+        // the server reads this as "not a person meeting a new install" and offers no setup screen
+        assert_eq!(
+            created_by_the_lifecycle_commands().startup_card,
+            Some(zellij_utils::input::attention::StartupCard::Never)
+        );
     }
 
     #[test]

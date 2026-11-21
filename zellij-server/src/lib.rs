@@ -4416,8 +4416,7 @@ pub fn start_server_impl(
                             &cli_assets.config_file_path,
                         )
                     };
-                let created_from_welcome_screen = switch_context.startup_card
-                    == Some(zellij_utils::input::attention::StartupCard::Never);
+                let created_from_welcome_screen = creator_declined_onboarding(&switch_context);
                 let should_launch_setup_wizard = session_may_show_setup(
                     is_resumed_session,
                     layout_is_welcome_screen,
@@ -4594,6 +4593,9 @@ pub fn start_server_impl(
                     {
                         let should_focus_tab = tab_index == focused_tab_index;
                         let mut floating_panes_layout = floating_panes_layout.clone();
+                        if created_from_welcome_screen {
+                            floating_panes_layout.retain(|p| !is_setup_screen_pane(p));
+                        }
                         if should_focus_tab {
                             if let Some(pane) = onboarding_pane.take() {
                                 floating_panes_layout.push(pane);
@@ -4613,6 +4615,9 @@ pub fn start_server_impl(
                 } else {
                     let mut floating_panes =
                         layout.template.map(|t| t.1).clone().unwrap_or_default();
+                    if created_from_welcome_screen {
+                        floating_panes.retain(|p| !is_setup_screen_pane(p));
+                    }
                     if let Some(pane) = onboarding_pane.take() {
                         floating_panes.push(pane);
                     }
@@ -6437,6 +6442,31 @@ fn init_session(
     }
 }
 
+/// Whether the creating client asked for no startup card. The welcome screen sends it, and so does
+/// the fork's `session up` (and the `restart` that ends in it): neither creator is a person meeting
+/// a new install, so neither may be shown the desktop-setup screen.
+fn creator_declined_onboarding(
+    switch_context: &zellij_utils::session_history::SwitchContext,
+) -> bool {
+    switch_context.startup_card == Some(zellij_utils::input::attention::StartupCard::Never)
+}
+
+/// The desktop-setup screen, as the server opens it or as a snapshot brings it back. A session
+/// serializes the pane like any other, so a snapshot taken while it was open restores it.
+fn is_setup_screen_pane(pane: &FloatingPaneLayout) -> bool {
+    let Some(Run::Plugin(plugin)) = &pane.run else {
+        return false;
+    };
+    let alias_configuration = match plugin {
+        RunPluginOrAlias::Alias(alias) => alias.configuration.clone(),
+        RunPluginOrAlias::RunPlugin(_) => None,
+    };
+    alias_configuration
+        .into_iter()
+        .chain(plugin.get_configuration())
+        .any(|c| c.inner().get("is_setup_wizard").map(String::as_str) == Some("true"))
+}
+
 fn session_may_show_setup(
     is_resumed_session: bool,
     layout_is_welcome_screen: bool,
@@ -7257,7 +7287,14 @@ mod adopted_history_tests {
 
 #[cfg(test)]
 mod setup_screen_session_tests {
-    use super::session_may_show_setup;
+    use super::{
+        creator_declined_onboarding, is_setup_screen_pane, plugin_floating_pane,
+        session_may_show_setup,
+    };
+    use std::collections::BTreeMap;
+    use zellij_utils::input::attention::StartupCard;
+    use zellij_utils::input::layout::Layout;
+    use zellij_utils::session_history::SwitchContext;
 
     #[test]
     fn only_a_plain_new_session_may_show_the_setup_screen() {
@@ -7266,5 +7303,75 @@ mod setup_screen_session_tests {
         assert!(!session_may_show_setup(false, true, false, false));
         assert!(!session_may_show_setup(false, false, true, false));
         assert!(!session_may_show_setup(false, false, false, true));
+    }
+
+    #[test]
+    fn a_session_the_lifecycle_commands_create_may_not_show_the_setup_screen() {
+        // what `session up` sends; fresh or restored from a snapshot, it is not a resumed session
+        let from_session_up = SwitchContext::with_startup_card(StartupCard::Never);
+        assert!(creator_declined_onboarding(&from_session_up));
+        assert!(!session_may_show_setup(
+            false,
+            false,
+            creator_declined_onboarding(&from_session_up),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_setup_screen_is_found_as_opened_and_as_a_snapshot_restores_it() {
+        let opened = plugin_floating_pane(
+            "configuration",
+            BTreeMap::from([("is_setup_wizard".to_owned(), "true".to_owned())]),
+        );
+        assert!(is_setup_screen_pane(&opened));
+        let other = plugin_floating_pane(
+            "about",
+            BTreeMap::from([("is_release_notes".to_owned(), "true".to_owned())]),
+        );
+        assert!(!is_setup_screen_pane(&other));
+
+        // the floating pane as a 0.46 session-layout.kdl writes it
+        let snapshot = r#"
+            layout {
+                tab name="Tab #1" {
+                    pane
+                    floating_panes {
+                        pane name="Welcome to Zellij" {
+                            plugin location="zellij:configuration" {
+                                is_setup_wizard "true"
+                            }
+                        }
+                        pane name="Release Notes" {
+                            plugin location="zellij:about" {
+                                is_release_notes "true"
+                            }
+                        }
+                    }
+                }
+            }
+        "#;
+        let layout = Layout::from_kdl(snapshot, None, None, None).unwrap();
+        let floating = &layout.tabs()[0].2;
+        let found: Vec<bool> = floating.iter().map(is_setup_screen_pane).collect();
+        assert_eq!(found, vec![true, false]);
+    }
+
+    #[test]
+    fn a_person_starting_zellij_may_still_be_shown_the_setup_screen() {
+        // a plain `zellij` sends no context; one that asks for a card is a person too
+        for context in [
+            SwitchContext::default(),
+            SwitchContext::with_startup_card(StartupCard::Attention),
+            SwitchContext::with_startup_card(StartupCard::Always),
+        ] {
+            assert!(!creator_declined_onboarding(&context));
+            assert!(session_may_show_setup(
+                false,
+                false,
+                creator_declined_onboarding(&context),
+                false
+            ));
+        }
     }
 }
