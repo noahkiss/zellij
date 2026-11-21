@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use crate::session_doctor_grants::{parse_grant, Grant, GrantState};
+use crate::session_doctor_grants::{parse_grant, parse_microphone, Grant, GrantState, MicState};
 
 /// How long to wait for the pane to prove it is alive.
 ///
@@ -39,9 +39,11 @@ pub(crate) const PROBE_POLL: Duration = Duration::from_millis(100);
 pub(crate) struct PaneAnswer {
     pub(crate) manager: Option<String>,
     pub(crate) full_disk_access: FullDiskAccess,
-    /// fork addition: the `a11y=` and `screen=` lines the grant probe writes between the two above.
+    /// fork addition: the `a11y=`, `screen=` and `mic=` lines the grant probe writes between the
+    /// two above.
     pub(crate) accessibility: GrantState,
     pub(crate) screen_recording: GrantState,
+    pub(crate) microphone: MicState,
 }
 
 /// What the probe was able to say about Full Disk Access.
@@ -130,6 +132,7 @@ pub(crate) fn parse_pane_answer(written: &str) -> PaneAnswer {
         },
         accessibility: parse_grant(written, Grant::Accessibility),
         screen_recording: parse_grant(written, Grant::ScreenRecording),
+        microphone: parse_microphone(written),
     }
 }
 
@@ -148,6 +151,14 @@ mod tests {
         let answer = parse_pane_answer(written);
         assert_eq!(answer.manager.as_deref(), Some("Aqua"));
         assert_eq!(answer.full_disk_access, FullDiskAccess::Granted);
+    }
+
+    #[test]
+    fn the_grant_lines_between_the_two_are_read_into_the_answer() {
+        let answer = parse_pane_answer("manager=Aqua\na11y=yes\nscreen=no\nmic=ask\nfda=yes\n");
+        assert_eq!(answer.accessibility, GrantState::Granted);
+        assert_eq!(answer.screen_recording, GrantState::Missing);
+        assert_eq!(answer.microphone, MicState::NotAsked);
     }
 
     #[test]

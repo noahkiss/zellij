@@ -6,7 +6,7 @@
 //! answers it prints are the server's. Run from a terminal, the same probe answers for the
 //! terminal instead.
 //!
-//! Four grants, and macOS treats each one differently:
+//! Five grants, and macOS treats each one differently:
 //!
 //! | grant | check | request |
 //! |---|---|---|
@@ -14,9 +14,14 @@
 //! | Accessibility | `AXIsProcessTrusted` | `AXIsProcessTrustedWithOptions`, prompt on |
 //! | Screen Recording | `CGPreflightScreenCaptureAccess` | `CGRequestScreenCaptureAccess` |
 //! | App Management | none: unknown | none: Settings only |
+//! | Microphone | `+[AVCaptureDevice authorizationStatusForMediaType:]` | none: information only |
 //!
 //! A request call lists the server in its Settings pane and shows macOS's own dialog. It never
 //! turns the grant on: only a person can, in System Settings.
+//!
+//! The Microphone line is information only. The server does not need the grant: a program in a
+//! pane that wants the microphone asks for it itself, and macOS prompts for it from a pane. So the
+//! line never needs a person, never changes doctor's exit code, and `--fix` never asks for it.
 //!
 //! The parsing and the choice of which grant to act on are compiled everywhere so their tests run
 //! everywhere; only macOS calls them.
@@ -25,7 +30,7 @@
 
 use std::time::Duration;
 
-use zellij_utils::session_doctor::DoctorMode;
+use zellij_utils::session_doctor::{DoctorMode, Finding};
 
 use crate::session_doctor_probe::finished_line;
 
@@ -45,6 +50,8 @@ pub(crate) enum Grant {
     Accessibility,
     ScreenRecording,
     AppManagement,
+    /// Information only: never in [`Grant::FIXABLE`].
+    Microphone,
 }
 
 impl Grant {
@@ -62,6 +69,7 @@ impl Grant {
             Grant::Accessibility => "a11y",
             Grant::ScreenRecording => "screen",
             Grant::AppManagement => "appmgmt",
+            Grant::Microphone => "mic",
         }
     }
 
@@ -72,6 +80,7 @@ impl Grant {
             Grant::Accessibility => "Accessibility",
             Grant::ScreenRecording => "Screen Recording",
             Grant::AppManagement => "App Management",
+            Grant::Microphone => "Microphone",
         }
     }
 
@@ -104,6 +113,9 @@ impl Grant {
             Grant::AppManagement => {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles"
             },
+            Grant::Microphone => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+            },
         }
     }
 
@@ -112,7 +124,7 @@ impl Grant {
         match self {
             Grant::Accessibility => Some("request-accessibility"),
             Grant::ScreenRecording => Some("request-screen-recording"),
-            Grant::FullDiskAccess | Grant::AppManagement => None,
+            Grant::FullDiskAccess | Grant::AppManagement | Grant::Microphone => None,
         }
     }
 
@@ -121,7 +133,8 @@ impl Grant {
         match self {
             Grant::Accessibility => Some("a11y="),
             Grant::ScreenRecording => Some("screen="),
-            Grant::FullDiskAccess | Grant::AppManagement => None,
+            // read by `parse_microphone`, which has four answers
+            Grant::FullDiskAccess | Grant::AppManagement | Grant::Microphone => None,
         }
     }
 }
@@ -144,6 +157,68 @@ pub(crate) fn parse_grant(written: &str, grant: Grant) -> GrantState {
         Some("yes") => GrantState::Granted,
         Some("no") => GrantState::Missing,
         _ => GrantState::Unknown,
+    }
+}
+
+/// What the probe said about the Microphone: the four `AVAuthorizationStatus` answers that matter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MicState {
+    /// `mic=yes`: authorized.
+    Granted,
+    /// `mic=ask`: macOS has never asked, so the first program that asks gets its prompt.
+    NotAsked,
+    /// `mic=no`: denied, or restricted by policy.
+    Denied,
+    /// No answer: no line, a line it does not know, or a call that did not return.
+    Unknown,
+}
+
+/// The key the probe prints the Microphone answer under.
+const MIC_KEY: &str = "mic=";
+
+/// The `mic=` value for an `AVAuthorizationStatus`, as
+/// `+[AVCaptureDevice authorizationStatusForMediaType:]` returns it.
+pub(crate) fn av_status_answer(status: isize) -> &'static str {
+    match status {
+        0 => "ask",    // notDetermined
+        1 | 2 => "no", // restricted, denied
+        3 => "yes",    // authorized
+        _ => "unknown",
+    }
+}
+
+/// Read the Microphone answer from the pane probe's answer file.
+pub(crate) fn parse_microphone(written: &str) -> MicState {
+    match finished_line(written, MIC_KEY) {
+        Some("yes") => MicState::Granted,
+        Some("ask") => MicState::NotAsked,
+        Some("no") => MicState::Denied,
+        _ => MicState::Unknown,
+    }
+}
+
+/// The Microphone line. Always `Already correct`: it informs, and asks nothing of a person.
+pub(crate) fn microphone_finding(state: MicState) -> Finding {
+    let grant = Grant::Microphone;
+    match state {
+        MicState::Granted => Finding::ok(
+            grant.check(),
+            "granted: programs in panes can use the microphone",
+        ),
+        MicState::NotAsked => Finding::ok(
+            grant.check(),
+            "not asked yet: the first program that asks gets the macOS prompt",
+        ),
+        MicState::Denied => Finding::ok(
+            grant.check(),
+            "denied: programs in panes cannot use the microphone; turn the server on in",
+        )
+        .note(format!(
+            "System Settings > Privacy & Security > {} ({})",
+            grant.settings_name(),
+            grant.settings_url()
+        )),
+        MicState::Unknown => Finding::ok(grant.check(), "unknown"),
     }
 }
 
@@ -212,7 +287,8 @@ fn fix_description(grant: Grant) -> String {
 
 /// `zellij session doctor --grant-probe <what>`: print the states, or make one request.
 ///
-/// `check` prints `a11y=` and `screen=` lines, each `yes`, `no` or `unknown`. A request prints
+/// `check` prints `a11y=` and `screen=` lines, each `yes`, `no` or `unknown`, then a `mic=` line,
+/// `yes`, `ask` (never asked), `no` or `unknown`. A request prints
 /// `requested=<check>` once the call returns. Exit 0, or 2 for a value it does not know or a
 /// platform with no such grants.
 pub(crate) fn run_grant_probe(what: &str) -> i32 {
@@ -230,6 +306,8 @@ pub(crate) fn run_grant_probe(what: &str) -> i32 {
             CHECK => {
                 line("a11y=", bounded(ffi::accessibility));
                 line("screen=", bounded(ffi::screen_recording));
+                let mic = bounded(ffi::microphone_status).flatten();
+                println!("{}{}", MIC_KEY, mic.map_or("unknown", av_status_answer));
                 0
             },
             "request-accessibility" => {
@@ -257,7 +335,7 @@ pub(crate) fn run_grant_probe(what: &str) -> i32 {
 
 /// One framework call, given [`GRANT_CALL_TIMEOUT`] to return. `None` when it did not.
 #[cfg(target_os = "macos")]
-fn bounded(call: fn() -> bool) -> Option<bool> {
+fn bounded<T: Send + 'static>(call: fn() -> T) -> Option<T> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(call());
@@ -267,7 +345,10 @@ fn bounded(call: fn() -> bool) -> Option<bool> {
 
 #[cfg(target_os = "macos")]
 mod ffi {
-    use std::ffi::c_void;
+    use std::ffi::{c_void, CStr};
+
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
 
     type CFTypeRef = *const c_void;
 
@@ -341,6 +422,30 @@ mod ffi {
     /// not granted yet.
     pub(super) fn request_screen_recording() -> bool {
         unsafe { CGRequestScreenCaptureAccess() }
+    }
+
+    const AV_FOUNDATION: &CStr = c"/System/Library/Frameworks/AVFoundation.framework/AVFoundation";
+
+    /// `+[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]`, the responsible
+    /// process's `AVAuthorizationStatus`. `None` when AVFoundation, the constant or the class is
+    /// missing.
+    ///
+    /// AVFoundation is opened here, at run time, so that no other launch of zellij loads it.
+    pub(super) fn microphone_status() -> Option<isize> {
+        unsafe {
+            // never closed: the probe exits right after, and the class lives in the image
+            let handle = libc::dlopen(AV_FOUNDATION.as_ptr(), libc::RTLD_LAZY);
+            if handle.is_null() {
+                return None;
+            }
+            // the symbol is the address of an `NSString *const`
+            let symbol =
+                libc::dlsym(handle, c"AVMediaTypeAudio".as_ptr()) as *const *const AnyObject;
+            let audio = symbol.as_ref()?.as_ref()?;
+            let class = AnyClass::get(c"AVCaptureDevice")?;
+            let status: isize = msg_send![class, authorizationStatusForMediaType: audio];
+            Some(status)
+        }
     }
 }
 
@@ -478,12 +583,82 @@ mod tests {
     }
 
     #[test]
+    fn the_mic_line_has_four_answers() {
+        let written = "manager=Aqua\na11y=yes\nscreen=yes\nmic=ask\nfda=yes\n";
+        assert_eq!(parse_microphone(written), MicState::NotAsked);
+        assert_eq!(parse_microphone("mic=yes\n"), MicState::Granted);
+        assert_eq!(parse_microphone("mic=no\n"), MicState::Denied);
+        assert_eq!(parse_microphone("mic=unknown\n"), MicState::Unknown);
+        // an older binary in the pane prints no mic line at all
+        assert_eq!(
+            parse_microphone("a11y=yes\nscreen=yes\n"),
+            MicState::Unknown
+        );
+        // half a line is not an answer
+        assert_eq!(parse_microphone("mic=ye"), MicState::Unknown);
+        // the Microphone is not read as a grant
+        assert_eq!(parse_grant(written, Grant::Microphone), GrantState::Unknown);
+    }
+
+    #[test]
+    fn every_av_status_maps_to_a_mic_answer() {
+        // notDetermined, restricted, denied, authorized
+        let answers: Vec<_> = (0..=3).map(av_status_answer).collect();
+        assert_eq!(answers, ["ask", "no", "no", "yes"]);
+        assert_eq!(av_status_answer(4), "unknown");
+        assert_eq!(av_status_answer(-1), "unknown");
+        // every defined status prints a line the doctor reads back as an answer
+        for status in 0..=3 {
+            let line = format!("{}{}\n", MIC_KEY, av_status_answer(status));
+            assert_ne!(parse_microphone(&line), MicState::Unknown, "{}", status);
+        }
+    }
+
+    #[test]
+    fn the_mic_line_is_information_and_never_needs_a_person() {
+        use zellij_utils::session_doctor::Status;
+        for state in [
+            MicState::Granted,
+            MicState::NotAsked,
+            MicState::Denied,
+            MicState::Unknown,
+        ] {
+            let finding = microphone_finding(state);
+            assert_eq!(finding.check, "mic");
+            assert_eq!(finding.status, Status::AlreadyCorrect, "{:?}", state);
+        }
+        assert_eq!(
+            microphone_finding(MicState::Granted).message,
+            "granted: programs in panes can use the microphone"
+        );
+        assert_eq!(
+            microphone_finding(MicState::NotAsked).message,
+            "not asked yet: the first program that asks gets the macOS prompt"
+        );
+        let denied = microphone_finding(MicState::Denied);
+        assert!(denied
+            .message
+            .starts_with("denied: programs in panes cannot use the microphone"));
+        assert!(denied.notes[0].contains("Privacy & Security > Microphone"));
+        assert!(denied.notes[0].contains("Privacy_Microphone"));
+        assert_eq!(microphone_finding(MicState::Unknown).message, "unknown");
+        // and --fix never acts on it
+        assert!(!Grant::FIXABLE.contains(&Grant::Microphone));
+        assert_eq!(Grant::Microphone.request_arg(), None);
+        assert_eq!(
+            grant_to_fix(&[(Grant::Microphone, GrantState::Missing)]),
+            None
+        );
+    }
+
+    #[test]
     fn every_grant_names_its_own_settings_pane() {
         for (grant, anchor) in [
             (Grant::FullDiskAccess, "Privacy_AllFiles"),
             (Grant::Accessibility, "Privacy_Accessibility"),
             (Grant::ScreenRecording, "Privacy_ScreenCapture"),
             (Grant::AppManagement, "Privacy_AppBundles"),
+            (Grant::Microphone, "Privacy_Microphone"),
         ] {
             assert!(grant.settings_url().ends_with(anchor), "{:?}", grant);
             assert!(
