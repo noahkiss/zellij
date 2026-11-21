@@ -521,6 +521,11 @@ pub struct PaneProcessInfo {
     /// apart from `agent_env` because the pane may be detected as an agent from the line it was
     /// STARTED with while its live argv is something else, and the report belongs to the pane.
     pub osc_agent_session: Option<String>,
+    /// fork addition: where the pane's claude keeps its per-process record, as the identity walk
+    /// found it: the claude's pid and the sessions directory. `send-message`'s guard reads the
+    /// record's `status` at each try; carried as a place, not a status, so it stays unchanged
+    /// from tick to tick.
+    pub claude_record: Option<(u32, PathBuf)>,
 }
 
 pub(crate) struct Pty {
@@ -3320,6 +3325,12 @@ impl Pty {
                     })
                     .map(|live| live.source().as_str().to_owned());
                 let osc_agent_session = self.osc_agent_session(terminal_id).map(str::to_owned);
+                let claude_record = self.agent_env_probes.get(&terminal_id).and_then(|probe| {
+                    match probe.live_session.as_ref() {
+                        Some(LiveSession::ClaudeRecord { pid, dir }) => Some((*pid, dir.clone())),
+                        _ => None,
+                    }
+                });
                 (
                     terminal_id,
                     PaneProcessInfo {
@@ -3333,6 +3344,7 @@ impl Pty {
                             .and_then(|cache| cache.name.clone()),
                         agent_session_source,
                         osc_agent_session,
+                        claude_record,
                     },
                 )
             })
@@ -3352,6 +3364,7 @@ impl Pty {
                     agent_name: None,
                     agent_session_source: held.agent_session_source.clone(),
                     osc_agent_session: held.osc_agent_session.clone(),
+                    claude_record: None,
                 },
             );
         }

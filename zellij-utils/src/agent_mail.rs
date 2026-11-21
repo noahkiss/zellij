@@ -444,6 +444,26 @@ pub struct GuardFacts<'a> {
     /// Milliseconds since a key last reached the pane, when one ever did.
     pub since_input_ms: Option<u64>,
     pub quiet_ms: u64,
+    /// What the harness's own record says of its main loop, when it keeps one and the session
+    /// could read it: `Some(true)` free for input, `Some(false)` mid-turn. Claude Code's
+    /// per-process record, read through [`claude_status_free`]. It speaks over a `working` state,
+    /// never over `blocked` or a missing state.
+    pub harness_free: Option<bool>,
+}
+
+/// What a `status` in Claude Code's per-process session record (`$CLAUDE_CONFIG_DIR/sessions/
+/// <pid>.json`) says about its main loop, for the guard.
+///
+/// `busy` runs while a turn runs. `idle` and `waiting` sit at the prompt. `shell` is a turn that
+/// ended while background shells or subagents still run: the prompt takes input, though the
+/// agent's `OSC 7501` report still says `working` until the last of them ends. Any other value is
+/// not known, and leaves the guard to the reported state.
+pub fn claude_status_free(status: &str) -> Option<bool> {
+    match status {
+        "idle" | "waiting" | "shell" => Some(true),
+        "busy" => Some(false),
+        _ => None,
+    }
 }
 
 /// The guard's answer.
@@ -459,7 +479,9 @@ pub enum Decision {
 /// It goes in only when the agent is idle - it reported `idle`, `done` or `error`, so its turn is
 /// over and it waits for input - and no person's text is waiting in its prompt, and no key
 /// reached the pane in the quiet window. `error` counts as idle: the turn ended and the agent
-/// waits at its prompt, the same reading `wait --for agent-idle` gives it.
+/// waits at its prompt, the same reading `wait --for agent-idle` gives it. A harness whose own
+/// record says its main loop is free ([`GuardFacts::harness_free`]) counts as idle whatever else
+/// it reported, short of `blocked`; one whose record says it is mid-turn is held as working.
 ///
 /// The order says which reason a held message reports: the agent's own state first, since it
 /// moves on its own, then the person's draft, then their typing.
@@ -475,6 +497,10 @@ pub fn guard(facts: &GuardFacts) -> Decision {
         },
         None => return Decision::Refuse(Reason::NoState),
         Some("blocked") => return Decision::Hold(Reason::Blocked),
+        // the harness's own record knows its main loop better than a report that stays
+        // `working` while background work runs
+        Some(_) if facts.harness_free == Some(false) => return Decision::Hold(Reason::Working),
+        Some(_) if facts.harness_free == Some(true) => {},
         Some("idle" | "done" | "error") => {},
         // `working`, and any state a newer agent invents: not known to be idle
         Some(_) => return Decision::Hold(Reason::Working),
@@ -533,6 +559,55 @@ impl std::fmt::Display for Address {
     }
 }
 
+/// The name a notice from the session itself goes out under, and the handle in its address.
+pub const SESSION_SENDER: &str = "zellij";
+
+/// The notice that tells a sender its message expired undelivered: the sender's handle in this
+/// session, the notice's `from` address, and its text. `None` for a record that did not expire,
+/// or whose sender is not a pane in `session` on `host`: another session, another machine, the
+/// command line, or the session itself. A notice is sent from `host/-/zellij`, which is no pane,
+/// so a notice that expires in turn is dropped and never starts another.
+pub fn expiry_notice(
+    record: &MessageRecord,
+    host: &str,
+    session: &str,
+) -> Option<(String, String, String)> {
+    if record.status != Status::Expired {
+        return None;
+    }
+    let sender = Address::parse(&record.from)?;
+    let same_host = sender.host.is_empty()
+        || sender.host == host
+        || sender.host.split('.').next() == Some(host);
+    if sender.session == "-" || sender.session != session || !same_host {
+        return None;
+    }
+    let held_s = record.expires_at.saturating_sub(record.queued_at) / 1000;
+    let held = if held_s >= 60 {
+        format!("{} min", (held_s + 30) / 60)
+    } else {
+        format!("{} s", held_s)
+    };
+    let why = match record.reason {
+        Some(Reason::Working) | None => "the agent stayed busy",
+        Some(Reason::Blocked) => "the agent stayed blocked on a permission or a question",
+        Some(Reason::Draft) => "a person's unsent text stayed in its prompt",
+        Some(Reason::Typing) => "someone kept typing in its pane",
+        Some(Reason::Starting) | Some(Reason::NoState) => "the agent never reported a state",
+        Some(Reason::PaneGone) | Some(Reason::NotAgent) => "its pane was gone",
+    };
+    let text = format!(
+        "message {} to {}/{} expired undelivered after {}: {}. Resend it, or use the agent's \
+         harness channel.",
+        record.id, record.session, record.handle, held, why
+    );
+    Some((
+        sender.handle,
+        format!("{}/-/{}", host, SESSION_SENDER),
+        text,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +621,7 @@ mod tests {
             draft_pending: false,
             since_input_ms: None,
             quiet_ms: QUIET_MS,
+            harness_free: None,
         }
     }
 
@@ -622,6 +698,73 @@ mod tests {
         let mut working = idle;
         working.state = Some("working");
         assert_eq!(guard(&working), Decision::Hold(Reason::Working));
+    }
+
+    #[test]
+    fn the_guard_takes_claude_s_own_record_over_a_working_report() {
+        // a turn that ended while background shells run: the report stays `working`
+        let mut shell = facts(Some("claude"), Some("working"));
+        shell.harness_free = claude_status_free("shell");
+        assert_eq!(guard(&shell), Decision::Deliver);
+        for status in ["idle", "waiting"] {
+            assert_eq!(claude_status_free(status), Some(true), "{status}");
+        }
+        // a turn running holds, whatever the report says
+        let mut busy = facts(Some("claude"), Some("idle"));
+        busy.harness_free = claude_status_free("busy");
+        assert_eq!(guard(&busy), Decision::Hold(Reason::Working));
+        // no record, or a status this build does not know: the reported state decides
+        assert_eq!(claude_status_free("compacting"), None);
+        let none = facts(Some("claude"), Some("working"));
+        assert_eq!(guard(&none), Decision::Hold(Reason::Working));
+        // a draft, typing, an open prompt and a missing state still hold when the record is free
+        let mut draft = shell;
+        draft.draft_pending = true;
+        assert_eq!(guard(&draft), Decision::Hold(Reason::Draft));
+        let mut typing = shell;
+        typing.since_input_ms = Some(QUIET_MS - 1);
+        assert_eq!(guard(&typing), Decision::Hold(Reason::Typing));
+        let mut blocked = shell;
+        blocked.state = Some("blocked");
+        assert_eq!(guard(&blocked), Decision::Hold(Reason::Blocked));
+        let mut starting = shell;
+        starting.state = None;
+        assert_eq!(guard(&starting), Decision::Hold(Reason::Starting));
+    }
+
+    #[test]
+    fn an_expired_message_gets_one_notice_addressed_to_its_sender() {
+        let mut expired = record(Some("claude"), None);
+        expired.from = "boxa/work/brisk-heron".into();
+        expired.status = Status::Expired;
+        expired.reason = Some(Reason::Working);
+        expired.queued_at = 1_000;
+        expired.expires_at = 1_000 + DEFAULT_EXPIRE_S * 1000;
+        let (to, from, text) = expiry_notice(&expired, "boxa", "work").unwrap();
+        assert_eq!(to, "brisk-heron");
+        assert_eq!(from, "boxa/-/zellij");
+        assert_eq!(
+            text,
+            "message 7 to work/sunny-otter expired undelivered after 30 min: the agent stayed \
+             busy. Resend it, or use the agent's harness channel."
+        );
+        // the notice itself, expired in turn, has nobody to tell
+        let mut notice = expired.clone();
+        notice.from = from;
+        notice.handle = to;
+        assert_eq!(expiry_notice(&notice, "boxa", "work"), None);
+        // only an expired message, and only a sender in this session on this machine
+        let mut held = expired.clone();
+        held.status = Status::Queued;
+        assert_eq!(expiry_notice(&held, "boxa", "work"), None);
+        assert_eq!(expiry_notice(&expired, "boxb", "work"), None);
+        assert_eq!(expiry_notice(&expired, "boxa", "other"), None);
+        let mut cli = expired.clone();
+        cli.from = "boxa/-/cli".into();
+        assert_eq!(expiry_notice(&cli, "boxa", "work"), None);
+        let mut no_host = expired;
+        no_host.from = "/work/brisk-heron".into();
+        assert!(expiry_notice(&no_host, "boxa", "work").is_some());
     }
 
     #[test]

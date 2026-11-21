@@ -8464,7 +8464,9 @@ impl Screen {
     pub fn drain_agent_messages(&mut self) {
         use zellij_utils::agent_mail::{Decision, Reason};
         let now_ms = crate::program_status::now_ms();
-        self.agent_mail.expire(now_ms);
+        for id in self.agent_mail.expire(now_ms) {
+            self.notify_expired_sender(&id);
+        }
         let held: Vec<crate::agent_mail::Stored> = self.agent_mail.held().to_vec();
         let mut tried = HashSet::new();
         for stored in held {
@@ -8510,6 +8512,40 @@ impl Screen {
         }
     }
 
+    /// fork addition: tells the sender of message `id`, which just expired, that it never went
+    /// in. Only a sender that is an agent's pane in this session is told; see
+    /// `agent_mail::expiry_notice`. The notice is a message like any other, from the session.
+    fn notify_expired_sender(&mut self, id: &str) {
+        let Some(record) = self.agent_mail.get(id).map(|stored| stored.record.clone()) else {
+            return;
+        };
+        let host = zellij_utils::shared::short_hostname();
+        let Some((handle, from, text)) =
+            zellij_utils::agent_mail::expiry_notice(&record, host, &self.session_name)
+        else {
+            return;
+        };
+        let sender = self.agent_mail_pane(|info| !info.is_plugin && info.handle == handle);
+        let Some((info, Some(_))) = sender else {
+            log::info!(
+                "message {} expired; its sender {} runs no agent here to tell",
+                id,
+                record.from
+            );
+            return;
+        };
+        self.send_agent_message(
+            info.id,
+            text,
+            from,
+            Some(zellij_utils::agent_mail::SESSION_SENDER.to_owned()),
+            None,
+            None,
+            None,
+            zellij_utils::agent_mail::DEFAULT_EXPIRE_S,
+        );
+    }
+
     /// fork addition: the guard and the write, in one step on this thread. A key a person presses
     /// is handled on this same thread, so none can be read between the look and the paste; one
     /// pressed after it is queued behind the Enter by the pty writer.
@@ -8538,6 +8574,20 @@ impl Screen {
                 .and_then(|prompt| prompt.program_status.as_ref())
                 .map(|status| status.state.clone())
         };
+        // Claude's own record says whether its main loop takes input, which its report does not
+        // while background work runs. A message just typed in is the agent's turn whatever the
+        // record says yet.
+        let harness_free = if prompt.as_ref().is_some_and(|prompt| prompt.message_pending) {
+            None
+        } else {
+            agent
+                .as_ref()
+                .filter(|agent| agent.kind == "claude")
+                .and_then(|_| self.pane_process_info.get(&terminal_id))
+                .and_then(|info| info.claude_record.as_ref())
+                .and_then(|(pid, dir)| crate::resurrect_hints::claude_record_status(dir, *pid))
+                .and_then(|status| agent_mail::claude_status_free(&status))
+        };
         let facts = GuardFacts {
             agent_kind: agent.as_ref().map(|agent| agent.kind.as_str()),
             state: state.as_deref(),
@@ -8549,6 +8599,7 @@ impl Screen {
                 .and_then(|prompt| prompt.since_input)
                 .map(|since| since.as_millis() as u64),
             quiet_ms: self.agent_mail_quiet_ms,
+            harness_free,
         };
         let decision = agent_mail::guard(&facts);
         if decision != Decision::Deliver {
