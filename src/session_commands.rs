@@ -278,11 +278,12 @@ fn pin_before_writing_the_unit(pinned: &PathBuf) -> Result<(), ()> {
 /// is the ordinary configuration, and in it there is nothing to do:
 /// [`install_pinned_exe`](zellij_utils::session_lifecycle::install_pinned_exe) recognises a source
 /// that is its own target and returns without touching the pin or its stamp. Nothing is wrong with
-/// that - the process has not seen the package and has nothing to compare against - but it means
-/// the watchdog is not what notices an upgrade. What does is any zellij run off another path: an interactive launch,
-/// which resolves the server binary through here on the way past, or `session up`, `session doctor
-/// --fix` or `session enable` typed in a shell, where `PATH` leads to the new build. See FORK.md,
-/// "Once the launcher runs the pin".
+/// that - the process has not seen the package and has nothing to compare against - so the
+/// watchdog notices an upgrade elsewhere: `upgrade_clientless_session` looks up the installed build
+/// on `PATH` and refreshes the pin from it. Any zellij run off another path refreshes it here as
+/// well: an interactive launch, which resolves the server binary through here on the way past, or
+/// `session up`, `session doctor --fix` or `session enable` typed in a shell. See FORK.md, "Once
+/// the launcher runs the pin" and "An upgrade reaches a session nobody is attached to".
 #[cfg(unix)]
 fn pin_this_build_at(pinned: &PathBuf) -> Result<PinHolds, String> {
     use zellij_utils::session_lifecycle::{install_pinned_exe, PinOutcome};
@@ -2129,9 +2130,12 @@ fn warning_to_print(
 }
 
 /// Say that the healthy session `name` is served by a superseded build, if it is.
-fn warn_about_a_superseded_build(name: &str, as_the_unit: bool) {
+fn warn_about_a_superseded_build(
+    name: &str,
+    as_the_unit: bool,
+    theirs: Option<ExecutableIdentity>,
+) {
     let ours = own_executable();
-    let theirs = server_executable(name);
     // `up` is how a caller gets OUT of skew, so strict mode never refuses it: exempt, it warns
     let warning = match skew_decision(
         name,
@@ -2150,12 +2154,286 @@ fn warn_about_a_superseded_build(name: &str, as_the_unit: bool) {
     }
 }
 
+/// Set while the watchdog restarts a session onto a new build, so the restart's own `up` never
+/// starts another. That `up` creates the session rather than finding it healthy, so this is a
+/// second fence, not the first.
+static UPGRADE_RESTARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How long the watchdog's upgrade restart waits for the old server to exit: the `--wait-timeout`
+/// default of `session restart`.
+const UPGRADE_RESTART_WAIT_TIMEOUT: u64 = 10;
+
+/// An upgrade reaches a session nobody is attached to. Two steps, on the healthy path of an `up`
+/// that IS the pin - the watchdog, once the launcher runs the pin.
+///
+/// 1. The installed build: the first `zellij` on `PATH` outside the pin's directory. When it is not
+///    the file the pin was last made from, its version is read once (`--version`), and a release
+///    of this fork refreshes the pin through the pin's one writer. A candidate or a foreign build
+///    is left alone, and said once.
+/// 2. The session: when its server is proven to be another build than the pin, no client is
+///    attached and no agent is working, it is restarted in place, as `session restart` does.
+///
+/// A healthy tick costs a few `stat`s. A session with a client attached is never restarted, and
+/// that case prints nothing; the build warning still says it once.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn upgrade_clientless_session(name: &str, opts: &CliArgs, theirs: Option<&ExecutableIdentity>) {
+    use std::sync::atomic::Ordering;
+    if UPGRADE_RESTARTING.load(Ordering::SeqCst) {
+        return;
+    }
+    let extras = configured_extras(opts);
+    let Some(configured) = configured_pinned_exe(extras.as_ref()) else {
+        return;
+    };
+    let installed = session_service::installed_session_exe(name);
+    let pin = match session_service::pin_state(&configured, installed.as_deref()) {
+        PinState::Recorded(path) | PinState::Unrecorded(path) => path,
+        // already warned about by `assert_pinned_exe`; the launcher does not run the pin
+        PinState::Mismatch { .. } => return,
+    };
+    // Only the pin's own `up` looks for an upgrade. Any other binary refreshed the pin from itself
+    // in `assert_pinned_exe`, and a build run on purpose from elsewhere must not be undone here.
+    let this_is_the_pin = std::env::current_exe().map_or(false, |own| {
+        zellij_utils::session_lifecycle::is_the_same_file(&own, &pin)
+    });
+    if !this_is_the_pin {
+        return;
+    }
+    refresh_the_pin_from_the_installed_build(name, &pin);
+    let mode = session_service::configured_upgrade_restarts(extras.as_ref());
+    restart_onto_the_pin(name, &pin, theirs, mode, opts);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn upgrade_clientless_session(_name: &str, _opts: &CliArgs, _theirs: Option<&ExecutableIdentity>) {}
+
+/// Where the watchdog records the installed build it last looked at for `session`, so a build it
+/// will not pin costs one `--version` and one line, not one per tick.
+fn upgrade_seen_stamp(session: &str) -> PathBuf {
+    zellij_utils::consts::ZELLIJ_STATE_DIR
+        .join("upgrade-seen")
+        .join(session)
+}
+
+/// Where the watchdog records the pinned build it last restarted `session` onto. A restart that
+/// does not land on it is tried once, never every tick.
+fn upgrade_restart_stamp(session: &str) -> PathBuf {
+    zellij_utils::consts::ZELLIJ_STATE_DIR
+        .join("upgrade-restarted")
+        .join(session)
+}
+
+fn write_stamp(stamp: &Path, contents: &str) {
+    if let Some(dir) = stamp.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(stamp, contents);
+}
+
+/// Step 1 of [`upgrade_clientless_session`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refresh_the_pin_from_the_installed_build(name: &str, pin: &Path) {
+    use zellij_utils::session_lifecycle::{
+        file_fingerprint, install_pinned_exe, installed_build_on_path, installed_build_verdict,
+        pin_was_made_from, version_from_version_output, InstalledBuild, PinOutcome,
+    };
+    let Some(source) = installed_build_on_path(pin, &path_dirs()) else {
+        return;
+    };
+    // the ordinary tick: the pin was made from this file, and the file has not changed
+    if pin_was_made_from(&source, pin) {
+        return;
+    }
+    let Some(fingerprint) = file_fingerprint(&source) else {
+        return;
+    };
+    let seen = format!("{}\n{}\n", source.display(), fingerprint);
+    let stamp = upgrade_seen_stamp(name);
+    if std::fs::read_to_string(&stamp).map_or(false, |last| last == seen) {
+        return;
+    }
+    write_stamp(&stamp, &seen);
+    // One process per installed build, not per tick: the stamp above keeps it to the first tick
+    // that sees this file.
+    let version = preflight_run(&source, &["--version".into()])
+        .ok()
+        .and_then(|output| version_from_version_output(&output));
+    match installed_build_verdict(zellij_utils::consts::VERSION, version.as_deref()) {
+        InstalledBuild::Foreign => {
+            eprintln!(
+            "warning: {} on PATH is not a release of this build of zellij ({}), so the pin at {} \
+             was left alone.",
+            source.display(),
+            version.as_deref().unwrap_or("its version could not be read"),
+            pin.display()
+        )
+        },
+        InstalledBuild::Candidate => eprintln!(
+            "warning: {} on PATH is a release candidate ({}), and a candidate never becomes the \
+             pin; {} was left alone.",
+            source.display(),
+            version.as_deref().unwrap_or_default(),
+            pin.display()
+        ),
+        InstalledBuild::Pin => match install_pinned_exe(&source, pin) {
+            Ok(PinOutcome::Installed(path)) | Ok(PinOutcome::Refreshed(path)) => println!(
+                "      refreshed the pinned copy at {} from {} ({})",
+                path.display(),
+                source.display(),
+                version.as_deref().unwrap_or_default()
+            ),
+            Ok(PinOutcome::AsReleased(path)) => println!(
+                "      refreshed the pinned copy with the release's own signature at {} from {}",
+                path.display(),
+                source.display()
+            ),
+            // `Kept` and `Candidate` were reported by the writer; `UpToDate` is the same build
+            Ok(_) => {},
+            Err(reason) => eprintln!("warning: {}", reason),
+        },
+    }
+}
+
+/// Step 2 of [`upgrade_clientless_session`]. Ends the process when it restarts the session.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restart_onto_the_pin(
+    name: &str,
+    pin: &Path,
+    theirs: Option<&ExecutableIdentity>,
+    mode: session_service::UpgradeRestarts,
+    opts: &CliArgs,
+) {
+    use std::sync::atomic::Ordering;
+    use zellij_utils::session_lifecycle::{
+        compare_builds, identify_executable, upgrade_restart_allowed, upgrade_restart_wanted,
+    };
+    let pinned = identify_executable(pin.to_path_buf());
+    let build = compare_builds(Some(&pinned), theirs);
+    let stamp = upgrade_restart_stamp(name);
+    let attempt = build_pair(Some(&pinned), None);
+    let tried = std::fs::read_to_string(&stamp).map_or(false, |last| last == attempt);
+    if !upgrade_restart_wanted(mode, build, tried) {
+        return;
+    }
+    // The gate, cheapest first. Every miss returns without a word and is asked again next tick.
+    if !upgrade_restart_allowed(attached_clients(name), Some(0)) {
+        return;
+    }
+    if !upgrade_restart_allowed(Some(0), working_agents(name)) {
+        return;
+    }
+    // Recorded before the pre-flight and the teardown: a build that fails its pre-flight, or a
+    // restart that does not land on the pin, is tried once for this pin and not every 15 seconds.
+    write_stamp(&stamp, &attempt);
+    if let Err(reason) = preflight(pin, opts) {
+        eprintln!(
+            "warning: '{}' runs an older build than the pin, and was not restarted onto it: {}",
+            name, reason
+        );
+        return;
+    }
+    // The pre-flight took a moment, and somebody may have attached in it.
+    if attached_clients(name) != Some(0) {
+        let _ = std::fs::remove_file(&stamp);
+        return;
+    }
+    println!(
+        "upgrade: restarting '{}' onto the build pinned at {}: no client is attached and no agent \
+         is working",
+        name,
+        pin.display()
+    );
+    UPGRADE_RESTARTING.store(true, Ordering::SeqCst);
+    let restored = restart_in_place(
+        name,
+        restart_restore_target(false, None),
+        UPGRADE_RESTART_WAIT_TIMEOUT,
+        opts,
+    );
+    process::exit(match restored {
+        Ok(()) => 0,
+        Err(()) => 1,
+    });
+}
+
+/// How many clients are attached to `name`, or `None` when it does not answer.
+fn attached_clients(name: &str) -> Option<usize> {
+    let os_input = zellij_client::os_input_output::get_cli_client_os_input().ok()?;
+    zellij_client::cli_client::clients_attached(Box::new(os_input), name).ok()
+}
+
+/// How many agents in `name` are working, by the teardown guard's rule plus Claude Code's own
+/// record, or `None` when the session does not answer. Never asked of a session that is down.
+fn working_agents(name: &str) -> Option<usize> {
+    let agents = match poll_agents(name) {
+        AgentPoll::Agents(agents) => agents,
+        AgentPoll::NotRunning | AgentPoll::NoAnswer(_) => return None,
+    };
+    let busy = agents
+        .iter()
+        .filter(|agent| busy_reason(agent).is_some() || claude_record_is_working(agent))
+        .count();
+    Some(busy)
+}
+
+/// Whether Claude Code's own record says the claude in `agent`'s pane is mid-turn or has background
+/// work running. Its `OSC 7501` report counts background subagents but not background shells, and
+/// a turn that ended with one running reports `done`; the record says `shell`.
+fn claude_record_is_working(agent: &AgentListEntry) -> bool {
+    use zellij_utils::session_lifecycle::{claude_record_says_working, claude_sessions_dir};
+    if agent.agent.kind != "claude" {
+        return false;
+    }
+    let (Some(session_id), Some(dir)) = (agent.agent.agent_id.as_deref(), claude_sessions_dir())
+    else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            return false;
+        }
+        let Some(record) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        else {
+            return false;
+        };
+        claude_record_says_working(&record, session_id)
+            && record
+                .get("pid")
+                .and_then(|pid| pid.as_u64())
+                .map_or(false, |pid| process_is_alive(pid as u32))
+    })
+}
+
+/// Whether a process with this pid exists. A record left by a claude that has exited says nothing.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // signal 0 checks for the process without signalling it; EPERM still means it exists
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    alive || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Create the session if it is not there, then prove that it is.
 fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
-    // First, and on every `up` including the one that finds the session already healthy: an upgrade
-    // reaches the pinned copy through this pass and no other, and the pass that returns early is
-    // exactly the one an upgraded machine takes every minute.
-    assert_pinned_exe(name, configured_extras(opts).as_ref());
+    // First, and on every `up` including the one that finds the session already healthy: an `up`
+    // run off another path brings the pin up to this build. The watchdog runs the pin itself, so
+    // for it this finds nothing to do; `upgrade_clientless_session` on the healthy path below is
+    // how an upgrade reaches the pin there. Not inside that restart: it has just written the pin,
+    // and on Linux this process's own file now reads "<pin> (deleted)", which nothing can copy.
+    if !UPGRADE_RESTARTING.load(std::sync::atomic::Ordering::SeqCst) {
+        assert_pinned_exe(name, configured_extras(opts).as_ref());
+    }
     // Same pass, same reason: a config edit does not reach a unit nobody rewrote, and the `up` that
     // returns early is exactly the one a machine with a stale unit takes every minute.
     warn_if_unit_drifted(name, opts);
@@ -2183,9 +2461,15 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
         if !as_the_unit {
             println!("ok    session '{}' already running", name);
         }
+        // Asked once and shared: each read of the server's build costs a process scan.
+        let theirs = server_executable(name);
+        // An upgrade reaches the pin, and a session nobody is attached to, from here. The watchdog
+        // takes this path every 15 seconds, so everything in it is a `stat` until something has
+        // actually changed. See `upgrade_clientless_session`.
+        upgrade_clientless_session(name, opts, theirs.as_ref());
         // "already running" is exactly the answer that hides a superseded build: an `up` after an
         // upgrade reports success and leaves the old server serving the session.
-        warn_about_a_superseded_build(name, as_the_unit);
+        warn_about_a_superseded_build(name, as_the_unit, theirs);
         return Ok(());
     }
     if (healthy || facts.listed) && named_snapshot {
@@ -2682,18 +2966,29 @@ fn restart(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
 /// own teardown had just archived, and said it had succeeded. The marker is how the shape reaches
 /// that job, and its absence afterwards is how this knows the shape was honoured.
 fn down_then_up(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
+    process::exit(match restart_in_place(name, shape, wait_timeout, opts) {
+        Ok(()) => 0,
+        Err(()) => 1,
+    });
+}
+
+/// [`down_then_up`], returning instead of exiting, for the watchdog's upgrade restart.
+fn restart_in_place(
+    name: &str,
+    shape: UpShape,
+    wait_timeout: u64,
+    opts: &CliArgs,
+) -> Result<(), ()> {
     let pending = pending_shape_path(name);
     let marked = write_pending_shape_at(&pending, &shape);
     if down(name, wait_timeout, opts).is_err() {
         let _ = std::fs::remove_file(&pending);
         eprintln!("teardown failed; NOT recreating the session.");
-        process::exit(1);
+        return Err(());
     }
     // the TTL runs from here, not from before a teardown of unbounded `--wait-timeout`
     let marked = marked && write_pending_shape_at(&pending, &shape);
-    if up(name, shape.clone(), opts).is_err() {
-        process::exit(1);
-    }
+    up(name, shape.clone(), opts)?;
     if marked && pending.exists() {
         // Nobody that created the session took the request: a launch agent or unit running a
         // build from before this marker existed, or a session already up when this came to
@@ -2707,12 +3002,12 @@ fn down_then_up(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -
             describe_shape(&shape),
             name
         );
-        process::exit(1);
+        return Err(());
     }
     if marked {
         println!("ok    '{}' came back {}", name, describe_shape(&shape));
     }
-    process::exit(0);
+    Ok(())
 }
 
 #[cfg(all(test, unix))]

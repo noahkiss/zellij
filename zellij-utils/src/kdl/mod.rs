@@ -43,7 +43,7 @@ use crate::resurrect_command_hints::{
 };
 #[cfg(test)]
 use crate::session_service::LaunchdKey;
-use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions};
+use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions, UpgradeRestarts};
 use kdl_layout_parser::KdlLayoutParser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -4730,6 +4730,20 @@ impl Options {
                             )
                         })?);
                 },
+                // fork addition: what the watchdog does with a session left on an older build.
+                // A value this build does not know warns and keeps the default, like an unknown
+                // key, so a new value can reach a shared config ahead of the binary that reads it.
+                "upgrade_restarts" => {
+                    let value = kdl_first_entry_as_string!(init_system);
+                    match value.and_then(UpgradeRestarts::from_config_value) {
+                        Some(mode) => session_service.upgrade_restarts = Some(mode),
+                        None => session_service.note_unknown_entry(format!(
+                            "unknown upgrade_restarts value {:?} in session_service, ignored \
+                             (expected \"clientless\" or \"never\"; the default is \"clientless\")",
+                            value.unwrap_or_default()
+                        )),
+                    }
+                },
                 "systemd" => {
                     for section in kdl_children_nodes_or_error!(init_system, "empty systemd block")
                     {
@@ -4811,7 +4825,7 @@ impl Options {
                 other => {
                     session_service.note_unknown_entry(format!(
                         "unknown session_service entry {:?}, ignored (expected systemd, launchd, \
-                         pin_exe or restart_via_launchd)",
+                         pin_exe, restart_via_launchd or upgrade_restarts)",
                         other
                     ));
                 },
@@ -4844,6 +4858,12 @@ impl Options {
         if let Some(via_launchd) = session_service.restart_via_launchd {
             let mut node = KdlNode::new("restart_via_launchd");
             node.push(KdlValue::Bool(via_launchd));
+            init_systems.nodes_mut().push(node);
+        }
+
+        if let Some(mode) = session_service.upgrade_restarts {
+            let mut node = KdlNode::new("upgrade_restarts");
+            node.push(KdlValue::String(mode.config_value().to_owned()));
             init_systems.nodes_mut().push(node);
         }
 
@@ -14149,6 +14169,66 @@ fn the_launchd_block_names_env_among_what_it_accepts() {
         format!("{:?}", error).contains("ZELLIJ_SOCKET_DIR"),
         "{:?}",
         error
+    );
+}
+
+/// fork addition: `upgrade_restarts` is "clientless" unless the config says "never", and a value
+/// this build does not know warns and keeps the default rather than failing the config.
+#[test]
+fn upgrade_restarts_is_clientless_unless_the_config_says_never() {
+    use crate::session_service::{configured_upgrade_restarts, UpgradeRestarts};
+
+    let options = |kdl: &str| Config::from_kdl(kdl, None).unwrap().options.session_service;
+    assert_eq!(
+        configured_upgrade_restarts(None),
+        UpgradeRestarts::Clientless
+    );
+    assert_eq!(
+        configured_upgrade_restarts(options("session_service {\n    pin_exe true\n}").as_ref()),
+        UpgradeRestarts::Clientless
+    );
+    let never = options("session_service {\n    upgrade_restarts \"never\"\n}");
+    assert_eq!(
+        configured_upgrade_restarts(never.as_ref()),
+        UpgradeRestarts::Never
+    );
+    assert_eq!(
+        configured_upgrade_restarts(
+            options("session_service {\n    upgrade_restarts \"clientless\"\n}").as_ref()
+        ),
+        UpgradeRestarts::Clientless
+    );
+
+    // an unknown value, or one that is not a string, warns and falls back to the default
+    for kdl in [
+        "session_service {\n    upgrade_restarts \"always\"\n}",
+        "session_service {\n    upgrade_restarts true\n}",
+    ] {
+        let parsed = options(kdl).unwrap();
+        assert_eq!(parsed.upgrade_restarts, None, "{}", kdl);
+        assert_eq!(parsed.upgrade_restarts(), UpgradeRestarts::Clientless);
+        assert_eq!(
+            parsed.unknown_entries.len(),
+            1,
+            "{:?}",
+            parsed.unknown_entries
+        );
+        assert!(
+            parsed.unknown_entries[0].contains("upgrade_restarts"),
+            "{}",
+            parsed.unknown_entries[0]
+        );
+    }
+
+    // it survives a round trip through the config dump
+    let mut config =
+        Config::from_kdl("session_service {\n    upgrade_restarts \"never\"\n}", None).unwrap();
+    let dumped = config.to_string(false);
+    assert!(dumped.contains("upgrade_restarts \"never\""), "{}", dumped);
+    config = Config::from_kdl(&dumped, None).unwrap();
+    assert_eq!(
+        config.options.session_service.unwrap().upgrade_restarts,
+        Some(UpgradeRestarts::Never)
     );
 }
 

@@ -92,6 +92,9 @@ pub const CAPABILITIES: &[&str] = &[
     "session-agent-guard",
     // session restart --when-idle/--deadline/--dry-run, the pre-flight, and the `restart` line
     "session-restart-when-idle",
+    // the watchdog refreshes the pin from the installed build and restarts a clientless, idle
+    // session onto it; session_service { upgrade_restarts }
+    "session-upgrade-restarts",
     // action send-message / message-status, zellij_send: guarded, queued agent messages
     "agent-send-message",
     // a long message goes in as a stub; action message-show / message-cancel, zellij_send cancel

@@ -2891,15 +2891,14 @@ Two consequences worth stating.
   and `zellij session doctor --fix` then settles it. An upgrade is caught the ordinary way, because
   an unpacked build is a new file and a new file has a new inode however its mtime was preserved.
 
-**Once the launcher runs the pin, the watchdog cannot be what notices an upgrade.** This is the
-ordinary configuration — it is what `pin_exe` is for — and the consequence is easy to read past.
+**Once the launcher runs the pin, refreshing from this binary cannot notice an upgrade.** This is
+the ordinary configuration — it is what `pin_exe` is for — and the consequence is easy to read past.
 `session up` refreshes the pin from the binary it is itself running. Started by the launcher, that
 binary IS the pin, so the stamp is compared against the file it was taken from and always agrees.
-Every pass of the minutely watchdog therefore says the pin is current, however old it is, and it is
-right to: nothing in that process has ever seen the package.
+So the watchdog looks for the package itself: see [An upgrade reaches a session nobody is attached
+to](#an-upgrade-reaches-a-session-nobody-is-attached-to).
 
-An upgrade reaches the pin from **any zellij run off another path**, which in practice means it
-reaches it quickly:
+An upgrade also reaches the pin from **any zellij run off another path**:
 
 - an interactive `zellij` — the launch resolves the server binary through the pin and refreshes it
   on the way past, which is the common case and needs nobody to remember anything;
@@ -2907,11 +2906,9 @@ reaches it quickly:
   is the new one;
 - `zellij session enable`, which installs the copy before it writes the unit.
 
-The refreshed copy still does not reach the **running** server, which keeps the build it started
-with until `zellij session restart`. So the honest summary of `pin_exe` on an upgraded machine is:
-the package is new, the pin becomes new the next time a shell runs zellij, and the session becomes
-new when it is restarted. Nothing here detects an upgrade on its own; every step is driven by
-something the user did.
+The refreshed copy does not reach the **running** server by itself, which keeps the build it
+started with until it is restarted. The watchdog restarts a session onto it only when nobody is
+attached and no agent is working (same link); any other session waits for `zellij session restart`.
 
 **A source that is the target is refused outright**, and on macOS that is not a nicety. The pin is
 signed there, so it deliberately differs from the source the stamp was taken from. Allowed through,
@@ -5870,8 +5867,9 @@ Exit status 4: a caller that started this in a pane that closes on exit must che
 - **`--force`** goes ahead as before. `--yes` is not an override, and neither verb takes one.
 - **Exit code 4.** 1 is an error, 2 is a refusal that changed nothing, and 3 is the strict-version
   refusal. A caller must be able to tell "wait for the agents" from all three.
-- **Only the explicit verbs are guarded.** `session up`, the watchdog tick and the launchd and
-  systemd units never tear a session down, so they are unchanged.
+- **Only the explicit verbs are guarded.** The one teardown `session up` makes, the watchdog's
+  restart onto an upgraded pin, has a stricter gate of its own: see [An upgrade reaches a session
+  nobody is attached to](#an-upgrade-reaches-a-session-nobody-is-attached-to).
 - **A session that does not answer goes ahead**, with a warning, after a second try half a second
   later. A wedged server is what a restart is for. A session that is not running is not asked.
 - With `detect_agents false` there are no agent rows, so nothing refuses.
@@ -5985,6 +5983,82 @@ line, the agents a restart would refuse on, and each build's pre-flight. Exit 0 
 go ahead, 4 when an agent would stop it, 2 when a build fails its pre-flight.
 
 Capability: `session-restart-when-idle`.
+
+### An upgrade reaches a session nobody is attached to
+
+```kdl
+session_service {
+    upgrade_restarts "clientless"   // the default
+    upgrade_restarts "never"        // leave every session on its build until someone restarts it
+}
+```
+
+After `brew upgrade`, a session nobody attaches to kept the old build for hours. The watchdog runs
+`session up` with the pinned binary, so the pin was compared with itself and never saw the package.
+Even with a fresh pin, a healthy session's server kept the build it started with.
+
+`session up` now takes two steps on its healthy path, only when the process IS the pin (the watchdog,
+once the launcher runs the pin) and the launcher runs the pin or no launcher is installed.
+
+**1. The pin follows the installed build.** The installed build is the first `zellij` on the
+process's `PATH` outside the pin's own directory, which the unit's `PATH` leads with. It is skipped
+when it is the pin under another name.
+
+- **The cheap compare.** The pin's `<pin>.source-key` records the source's device, inode, size and
+  mtime. When the installed file still matches, the tick ends there: two `stat`s and two small
+  reads, no hash, no process.
+- **A changed file is read once.** Its version comes from one `--version` run. The installed file's
+  identity goes to `<state-dir>/upgrade-seen/<session>`, so a build that is not pinned costs one run
+  and one line, not one per tick.
+- **What is pinned.** A release of the same fork refreshes the pin through its one writer, with the
+  same as-is signature path on macOS. A release candidate is never pinned. A build of another fork,
+  or a stock zellij, is never pinned: it has no `session up`, and the unit would fail at every
+  tick. Each refusal is said once.
+
+**2. A session nobody is attached to is restarted onto the pin.** The watchdog restarts the
+session in place, as `session restart` does: snapshot, teardown, and back from the snapshot. The
+gate, in order:
+
+| Check | Not met |
+|---|---|
+| `upgrade_restarts` is not `never` | nothing |
+| the server is PROVEN another build than the pin (`compare_builds` says `Different`) | nothing; "cannot tell" never restarts |
+| no restart was tried for this pin build yet (`<state-dir>/upgrade-restarted/<session>`) | nothing |
+| the server answers that 0 clients are attached (`ListClients`, asked live) | asked again next tick |
+| the server answers, and no agent is working by the teardown guard's rule | asked again next tick |
+| no Claude agent's own record (`~/.claude/sessions/<pid>.json`) says `busy` or `shell` | asked again next tick |
+| the pin passes the restart pre-flight (`--version`, `setup --check`) | a warning, once per pin build |
+| still 0 clients after the pre-flight | asked again next tick |
+
+- **A session with a client attached is never restarted.** A teardown kills every pane, and a
+  person at a terminal loses whatever was in it, with no warning and no way to say no. The client
+  count is asked of the server, not read from the metadata it last wrote. A session that does not
+  answer is not restarted: nobody typed this restart.
+- **`shell` counts as working here.** A Claude turn that ends while a background shell runs reports
+  `done`, and its `OSC 7501` records count subagents, not shells. Its per-process record says
+  `shell`, and a teardown would kill that shell. The record is matched by the agent's session id,
+  and a record whose process has exited says nothing.
+- **It cannot loop.** The attempt is recorded before the teardown, once per pin build, so a restart
+  that does not land on the pin is not tried again every 15 seconds. The restart's own `up` creates
+  the session, so it never reaches the healthy path, and a flag fences it besides. The up-lock is
+  the one the tick already holds; `down` and the inner `up` re-enter it.
+- **The restart runs from the old process onto the new pin.** On Linux that process's own file
+  now reads `<pin> (deleted)`. The server binary is chosen through the pin, and a replaced pin still
+  counts as the pin there, so the inner `up` starts the new build without trying to copy the
+  deleted file.
+- **Quiet.** A tick that changes nothing prints nothing. A client-attached session prints only the
+  build-mismatch warning, once per build pair. A refresh and a restart each print a line to the
+  journal or the job's log.
+
+**The limit.** The watchdog process is the old build, so it cannot read the new build's
+[`SERVER_UNCHANGED`](#session-restart---when-idle-a-pre-flight-and-whether-a-restart-is-needed).
+A release that left the server unchanged still restarts a clientless, idle session once.
+
+**An older binary ignores the key.** From nkmk.18 an unknown `session_service` entry warns and is
+skipped (see `docs/config-compatibility.md`). A value this build does not know warns the same way and
+keeps `clientless`. No `Action`, protobuf tag or client/server message is added.
+
+Capability: `session-upgrade-restarts`.
 
 ### A pin the launcher does not run is inert everywhere, not only in the message
 

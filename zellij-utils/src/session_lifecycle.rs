@@ -2472,7 +2472,7 @@ impl SourceIdentity {
 /// A symlink, a hard link and a second spelling of the same directory all reach the pin under a
 /// name that is not the pin's, and every one of them is still the pin.
 #[cfg(unix)]
-fn is_the_same_file(one: &Path, other: &Path) -> bool {
+pub fn is_the_same_file(one: &Path, other: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     let (Ok(one), Ok(other)) = (std::fs::metadata(one), std::fs::metadata(other)) else {
@@ -6114,5 +6114,271 @@ dev.zellij.session.mysession = {
                   0::/user.slice/user-1000.slice/user@1000.service/zellij-session-x.service\n";
         assert!(cgroup_says_systemd_unit(v1, "zellij-session-x.service"));
         assert!(!cgroup_says_systemd_unit("", "zellij-session-x.service"));
+    }
+}
+
+// fork addition: an upgrade reaches a session nobody is attached to.
+//
+// Once the launcher runs the pin, the watchdog's `session up` is the pin, so the pin is never stale
+// against the process asking. These are the pure halves of the two steps `session up` now takes on
+// its healthy path: find the installed build the pin was made from and refresh the pin from it, then
+// restart a session that nobody is attached to onto the refreshed pin. The machine halves live in
+// `src/session_commands.rs`.
+
+/// The installed `zellij` the pin is refreshed from: the first entry of `path_dirs` named like the
+/// pin that is a file and is not the pin, skipping the pin's own directory. The generated unit's
+/// `PATH` leads with that directory, so without the skip every lookup would find the pin itself.
+///
+/// `None` when the first such entry IS the pin under another name, or when there is none.
+#[cfg(unix)]
+pub fn installed_build_on_path(pin: &Path, path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let name = pin.file_name()?;
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let pin_dir = pin.parent().map(canonical);
+    path_dirs
+        .iter()
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| pin_dir.as_deref() != Some(canonical(dir).as_path()))
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .filter(|candidate| !is_the_same_file(candidate, pin))
+}
+
+/// Whether the pin's recorded source key names `source` as it looks now: two `stat`s and two small
+/// reads, no hash. `true` means the pin was made from this very file and nothing has changed.
+#[cfg(unix)]
+pub fn pin_was_made_from(source: &Path, target: &Path) -> bool {
+    pin_hash_can_be_skipped(target, source_identity(source).as_ref())
+}
+
+/// What a file looks like to `stat`: device, inode, size and mtime. A new install is a new file,
+/// so an upgrade always changes it.
+#[cfg(unix)]
+pub fn file_fingerprint(path: &Path) -> Option<String> {
+    source_identity(path).map(|identity| identity.encode())
+}
+
+/// The version on the first line of `zellij --version`: `zellij 0.46.0-nkmk.43`.
+pub fn version_from_version_output(output: &str) -> Option<String> {
+    let first = output.lines().next()?.trim();
+    let version = first.strip_prefix("zellij ")?.trim();
+    (!version.is_empty() && !version.contains(char::is_whitespace)).then(|| version.to_owned())
+}
+
+/// What the watchdog does with the installed build it found on `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledBuild {
+    /// A release of the same fork: refresh the pin from it. The pin's writer still decides whether
+    /// the bytes differ.
+    Pin,
+    /// A release candidate. A candidate never becomes the pin.
+    Candidate,
+    /// Not a build of this fork, or a version that could not be read. A stock zellij has no
+    /// `session up`, and a unit that execs it fails at every tick.
+    Foreign,
+}
+
+/// Decide [`InstalledBuild`] for an installed build that reports `installed`, against this build's
+/// version `ours`. The fork name has to match, so a stock `zellij` further along `PATH` never
+/// replaces the fork's pin.
+pub fn installed_build_verdict(ours: &str, installed: Option<&str>) -> InstalledBuild {
+    use crate::capabilities::VersionInfo;
+    let Some(installed) = installed else {
+        return InstalledBuild::Foreign;
+    };
+    let fork = |version: &str| VersionInfo::from_version_string(version).fork;
+    let theirs = fork(installed);
+    if theirs.is_none() || theirs != fork(ours) {
+        return InstalledBuild::Foreign;
+    }
+    if version_is_a_release_candidate(installed) {
+        return InstalledBuild::Candidate;
+    }
+    InstalledBuild::Pin
+}
+
+/// Whether the watchdog looks any further at restarting a session onto the pin: the config allows
+/// it, the running server is PROVEN to be another build than the pin, and no restart has already
+/// been tried for this pin. Only `Different` counts: "cannot tell" never restarts a session.
+pub fn upgrade_restart_wanted(
+    mode: crate::session_service::UpgradeRestarts,
+    build: BuildMatch,
+    already_tried: bool,
+) -> bool {
+    mode == crate::session_service::UpgradeRestarts::Clientless
+        && build == BuildMatch::Different
+        && !already_tried
+}
+
+/// The gate itself: no attached client, and an answer that no agent is working. A question the
+/// session did not answer is `None`, and `None` never restarts - unlike `session restart`, which
+/// nobody typed here.
+pub fn upgrade_restart_allowed(clients: Option<usize>, busy_agents: Option<usize>) -> bool {
+    clients == Some(0) && busy_agents == Some(0)
+}
+
+/// Whether one of Claude Code's per-process records (`<sessions dir>/<pid>.json`) says the claude
+/// running session `session_id` is still at work: `busy` mid-turn, or `shell`, a turn that ended
+/// while background shells or subagents still run. Its `OSC 7501` report can read `done` over
+/// background work the report does not count, and a teardown kills that work too.
+pub fn claude_record_says_working(record: &serde_json::Value, session_id: &str) -> bool {
+    record.get("sessionId").and_then(|id| id.as_str()) == Some(session_id)
+        && matches!(
+            record.get("status").and_then(|status| status.as_str()),
+            Some("busy") | Some("shell")
+        )
+}
+
+/// Where Claude Code keeps those records: `$CLAUDE_CONFIG_DIR/sessions`, or `~/.claude/sessions`.
+/// The same rule the server's agent detection reads them by.
+pub fn claude_sessions_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ZELLIJ_CLAUDE_SESSIONS_DIR").filter(|dir| !dir.is_empty())
+    {
+        return Some(PathBuf::from(dir));
+    }
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir).join("sessions")),
+        None => std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| PathBuf::from(home).join(".claude").join("sessions")),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod upgrade_tests {
+    use super::*;
+    use crate::session_service::UpgradeRestarts;
+
+    #[test]
+    fn the_installed_build_skips_the_pin_directory_and_the_pin_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let pin_dir = root.path().join("pin");
+        let installed_dir = root.path().join("installed");
+        let other_dir = root.path().join("other");
+        for dir in [&pin_dir, &installed_dir, &other_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let pin = pin_dir.join("zellij");
+        std::fs::write(&pin, b"pin").unwrap();
+        let installed = installed_dir.join("zellij");
+        std::fs::write(&installed, b"new").unwrap();
+        // the unit's PATH leads with the pin directory; a directory with no zellij is passed over
+        let dirs = vec![pin_dir.clone(), other_dir.clone(), installed_dir.clone()];
+        assert_eq!(
+            installed_build_on_path(&pin, &dirs),
+            Some(installed.clone())
+        );
+        // nothing outside the pin directory
+        assert_eq!(installed_build_on_path(&pin, &[pin_dir.clone()]), None);
+        // a relative entry is never trusted
+        assert_eq!(
+            installed_build_on_path(&pin, &[PathBuf::from("installed")]),
+            None
+        );
+        // the first zellij outside the pin directory is the pin under another name: no source
+        std::os::unix::fs::symlink(&pin, other_dir.join("zellij")).unwrap();
+        assert_eq!(installed_build_on_path(&pin, &dirs), None);
+    }
+
+    #[test]
+    fn the_pin_was_made_from_a_source_until_the_source_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("zellij-installed");
+        let pin = root.path().join("pin").join("zellij");
+        std::fs::write(&source, vec![7u8; 4096]).unwrap();
+        // nothing recorded yet
+        assert!(!pin_was_made_from(&source, &pin));
+        install_pinned_exe(&source, &pin).unwrap();
+        assert!(pin_was_made_from(&source, &pin));
+        let before = file_fingerprint(&source).unwrap();
+        // an upgrade is a new file at the installed path
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, vec![8u8; 8192]).unwrap();
+        assert_ne!(file_fingerprint(&source).unwrap(), before);
+        assert!(!pin_was_made_from(&source, &pin));
+    }
+
+    #[test]
+    fn the_version_is_the_first_line_of_version_output() {
+        assert_eq!(
+            version_from_version_output("zellij 0.46.0-nkmk.43\nupstream v0.46.0 @ aedee21cb\n")
+                .as_deref(),
+            Some("0.46.0-nkmk.43")
+        );
+        assert_eq!(
+            version_from_version_output("zellij 0.44.1\n").as_deref(),
+            Some("0.44.1")
+        );
+        for garbage in ["", "something else 1.0", "zellij \n"] {
+            assert_eq!(version_from_version_output(garbage), None, "{:?}", garbage);
+        }
+    }
+
+    #[test]
+    fn only_a_release_of_the_same_fork_becomes_the_pin() {
+        let ours = "0.46.0-nkmk.43";
+        assert_eq!(
+            installed_build_verdict(ours, Some("0.46.0-nkmk.44")),
+            InstalledBuild::Pin
+        );
+        // a different upstream base of the same fork is still the fork
+        assert_eq!(
+            installed_build_verdict(ours, Some("0.47.0-nkmk.1")),
+            InstalledBuild::Pin
+        );
+        assert_eq!(
+            installed_build_verdict(ours, Some("0.46.0-nkmk.44-rc.1")),
+            InstalledBuild::Candidate
+        );
+        // stock zellij, another fork, or no version at all
+        for installed in [Some("0.46.0"), Some("0.46.0-other.3"), None] {
+            assert_eq!(
+                installed_build_verdict(ours, installed),
+                InstalledBuild::Foreign,
+                "{:?}",
+                installed
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_is_wanted_only_for_a_proven_mismatch_not_yet_tried() {
+        use BuildMatch::*;
+        let on = UpgradeRestarts::Clientless;
+        assert!(upgrade_restart_wanted(on, Different, false));
+        assert!(!upgrade_restart_wanted(on, Different, true));
+        assert!(!upgrade_restart_wanted(on, Same, false));
+        assert!(!upgrade_restart_wanted(on, Unknown, false));
+        assert!(!upgrade_restart_wanted(
+            UpgradeRestarts::Never,
+            Different,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_session_with_a_client_or_a_working_agent_is_never_restarted() {
+        assert!(upgrade_restart_allowed(Some(0), Some(0)));
+        assert!(!upgrade_restart_allowed(Some(1), Some(0)));
+        assert!(!upgrade_restart_allowed(Some(0), Some(1)));
+        // no answer is no restart
+        assert!(!upgrade_restart_allowed(None, Some(0)));
+        assert!(!upgrade_restart_allowed(Some(0), None));
+    }
+
+    #[test]
+    fn a_claude_record_saying_shell_or_busy_counts_as_working() {
+        let record =
+            |status: &str| serde_json::json!({"pid": 10, "sessionId": "abc", "status": status});
+        assert!(claude_record_says_working(&record("busy"), "abc"));
+        assert!(claude_record_says_working(&record("shell"), "abc"));
+        assert!(!claude_record_says_working(&record("idle"), "abc"));
+        assert!(!claude_record_says_working(&record("waiting"), "abc"));
+        // another session's record says nothing about this one
+        assert!(!claude_record_says_working(&record("busy"), "xyz"));
+        assert!(!claude_record_says_working(
+            &serde_json::json!({"sessionId": "abc"}),
+            "abc"
+        ));
     }
 }
