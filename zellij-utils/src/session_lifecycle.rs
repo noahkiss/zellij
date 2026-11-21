@@ -75,13 +75,36 @@ pub fn parse_server_processes(ps_output: &str) -> Vec<ServerProcess> {
 /// healthy session, `session status` print `running no`, and the guard that refuses to create a
 /// second server for a name stop guarding.
 ///
+/// fork addition: the system tools the session commands run, by absolute path on macOS.
+///
+/// Spawned by bare name, each tool cost one failed spawn per PATH directory before the one that
+/// holds it: the watchdog's `session up` ran 14 helpers every 15 seconds, and with `/usr/bin` 17th
+/// in a unit's PATH that was about 230 forks a run, each inspected by an endpoint scanner. macOS
+/// keeps these three at fixed paths. Linux distributions place them differently, so there they are
+/// still found on PATH.
+#[cfg(target_os = "macos")]
+pub const PS: &str = "/bin/ps";
+#[cfg(not(target_os = "macos"))]
+pub const PS: &str = "ps";
+#[cfg(target_os = "macos")]
+pub const LAUNCHCTL: &str = "/bin/launchctl";
+#[cfg(not(target_os = "macos"))]
+pub const LAUNCHCTL: &str = "launchctl";
+#[cfg(target_os = "macos")]
+pub const PLUTIL: &str = "/usr/bin/plutil";
+#[cfg(not(target_os = "macos"))]
+pub const PLUTIL: &str = "plutil";
+
 /// Accepted by procps and by BSD `ps` alike, which the test below asserts by running it.
 #[cfg(unix)]
 const PS_ARGS: &[&str] = &["-ww", "-eo", "pid=,command="];
 
 #[cfg(unix)]
 pub fn running_servers() -> Vec<ServerProcess> {
-    let output = match std::process::Command::new("ps").args(PS_ARGS).output() {
+    let output = match std::process::Command::new(crate::session_lifecycle::PS)
+        .args(PS_ARGS)
+        .output()
+    {
         Ok(output) => output,
         Err(e) => {
             log::debug!("Could not list processes: {}", e);
@@ -680,7 +703,10 @@ pub mod launchctl {
     /// The session domain this process is in. `None` when launchctl will not say - an answer we do
     /// not have is not one to act on.
     pub fn manager_name() -> Option<String> {
-        let output = Command::new("launchctl").arg("managername").output().ok()?;
+        let output = Command::new(crate::session_lifecycle::LAUNCHCTL)
+            .arg("managername")
+            .output()
+            .ok()?;
         if !output.status.success() {
             return None;
         }
@@ -706,7 +732,7 @@ pub mod launchctl {
     /// is has no bearing on the domain the job runs in, which is the point.
     pub fn kickstart(label: &str) -> Result<(), String> {
         let target = format!("{}/{}", gui_domain(), label);
-        match Command::new("launchctl")
+        match Command::new(crate::session_lifecycle::LAUNCHCTL)
             .args(["kickstart", &target])
             .output()
         {
@@ -722,7 +748,7 @@ pub mod launchctl {
 
     /// What `launchctl print` says about a target, or `None` when it will not say.
     pub fn print(target: &str) -> Option<String> {
-        let output = Command::new("launchctl")
+        let output = Command::new(crate::session_lifecycle::LAUNCHCTL)
             .args(["print", target])
             .output()
             .ok()?;
@@ -3684,7 +3710,7 @@ mod tests {
     #[cfg(unix)]
     fn the_process_scan_asks_ps_for_untruncated_lines() {
         assert_eq!(PS_ARGS[0], "-ww");
-        let output = std::process::Command::new("ps")
+        let output = std::process::Command::new(crate::session_lifecycle::PS)
             .args(PS_ARGS)
             .output()
             .expect("ps is on every unix this builds for");

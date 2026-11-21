@@ -837,14 +837,19 @@ fn installed_jobs(kind: ServiceKind, extension: &str) -> Vec<InstalledJob> {
         .collect()
 }
 
-/// The read-only directories launchd also loads agents from into a user's graphical domain.
+/// The read-only directory launchd also loads agents from into a user's graphical domain.
 ///
 /// An agent here is as loaded, and as much in the way, as one in the user's own directory - which
 /// is the whole point of looking: a job installed by a package or by an MDM profile keeps a session
 /// up exactly as a hand-written one does, and a scan that could not see it reported "nothing
 /// installed" for a machine with a launcher on it.
+///
+/// `/System/Library/LaunchAgents` is not scanned. System Integrity Protection keeps it to Apple's
+/// own agents, so no job there can run `session up`. Several of them still contain the word
+/// "session" (`nsurlsessiond`, `parsecd`), so the byte filter passed them and every watchdog tick
+/// converted each with `plutil`: a dozen processes every 15 seconds per session, for nothing.
 #[cfg(any(target_os = "macos", all(unix, test)))]
-const LAUNCHD_SYSTEM_DIRS: &[&str] = &["/Library/LaunchAgents", "/System/Library/LaunchAgents"];
+const LAUNCHD_SYSTEM_DIRS: &[&str] = &["/Library/LaunchAgents"];
 
 /// The read-only directories the systemd USER manager also reads units from, in its own order of
 /// preference. `/etc` is the administrator's, `/run` is generated, the two `lib` paths are what
@@ -940,9 +945,8 @@ fn read_installed_job(kind: ServiceKind, path: &Path) -> Option<InstalledJob> {
 
 /// Whether a plist could possibly be a job that runs `session up`, judged on its raw bytes.
 ///
-/// `/System/Library/LaunchAgents` holds several hundred of Apple's own agents and most are saved in
-/// the binary format, so converting each one would fork `plutil` several hundred times on every
-/// `session up` - which a watchdog runs every minute. This is the cheap half of that question,
+/// Most launch agents are saved in the binary format, and converting one forks `plutil`, on every
+/// `session up` - which a watchdog runs every 15 seconds. This is the cheap half of that question,
 /// asked before any conversion.
 ///
 /// It is exactly as precise as the parser it stands in front of. What identifies the job is the
@@ -966,7 +970,7 @@ fn launch_agent_xml(path: &Path) -> Option<String> {
     if !bytes.starts_with(b"bplist") {
         return String::from_utf8(bytes).ok();
     }
-    let converted = std::process::Command::new("plutil")
+    let converted = std::process::Command::new(crate::session_lifecycle::PLUTIL)
         .args(["-convert", "xml1", "-o", "-"])
         .arg(path)
         .output()
@@ -3695,7 +3699,7 @@ pub mod launchctl {
     }
 
     pub fn job_is_loaded(label: &str) -> bool {
-        Command::new("launchctl")
+        Command::new(crate::session_lifecycle::LAUNCHCTL)
             .args(["print", &format!("{}/{}", gui_domain(), label)])
             .output()
             .map(|output| output.status.success())
@@ -3711,7 +3715,7 @@ pub mod launchctl {
     }
 
     fn run(args: &[&str]) -> Result<(), String> {
-        let output = Command::new("launchctl")
+        let output = Command::new(crate::session_lifecycle::LAUNCHCTL)
             .args(args)
             .output()
             .map_err(|e| format!("could not run launchctl: {}", e))?;
@@ -3792,13 +3796,16 @@ mod tests {
         assert!(agents
             .iter()
             .any(|dir| dir == Path::new("/Library/LaunchAgents")));
+        // SIP keeps it to Apple's agents: scanning it only forked plutil every watchdog tick
+        assert!(!agents
+            .iter()
+            .any(|dir| dir == Path::new("/System/Library/LaunchAgents")));
     }
 
     #[test]
     #[cfg(unix)]
     fn a_plist_that_never_says_session_is_not_converted() {
-        // the cheap half of the question, asked before plutil is forked over several hundred of
-        // Apple's own agents on every pass
+        // the cheap half of the question, asked before plutil is forked for an agent on every pass
         assert!(!could_run_session_up(
             b"bplist00\x00com.apple.somethingelse"
         ));
