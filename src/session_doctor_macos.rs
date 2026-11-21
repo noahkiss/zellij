@@ -261,6 +261,9 @@ fn check_from_inside_a_pane(
         notes_for(Grant::ScreenRecording),
     ));
     report.push(app_management_finding());
+    report.push(crate::session_doctor_grants::microphone_finding(
+        answer.microphone,
+    ));
     // Automation (Apple Events) is asked per target app, by macOS's own dialog at first use, and
     // no target is configured anywhere, so there is nothing to check.
 }
@@ -495,8 +498,9 @@ fn run_pane_probe(name: &str) -> Result<PaneAnswer, ProbeFailure> {
     // A directory that is not there is not a refusal, and the two are reported apart rather than
     // guessed at. `[ -d ]` is safe to ask: TCC gates the open, not the stat.
     //
-    // fork addition: between the two, this binary asks the server's Accessibility and Screen
-    // Recording grants (`a11y=`, `screen=`). It runs in the pane, so its answers are the server's.
+    // fork addition: between the two, this binary asks the server's Accessibility, Screen
+    // Recording and Microphone grants (`a11y=`, `screen=`, `mic=`). It runs in the pane, so its
+    // answers are the server's.
     // Each call is bounded well inside the Full Disk Access deadline.
     let zellij = std::env::current_exe()
         .map_err(|e| ProbeFailure::CouldNotSpawn(format!("cannot find this binary: {}", e)))?;

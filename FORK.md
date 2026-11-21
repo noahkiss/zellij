@@ -3111,8 +3111,8 @@ From nkmk.41 the pane probe also asks the server's other privacy grants. A grant
 responsible process, the server, and a program started in a pane is judged against the server's
 grants. So the probe runs doctor's own binary in the pane as `zellij session doctor --grant-probe
 check` (a hidden flag), between the `manager=` and `fda=` lines. It writes `a11y=` and `screen=`,
-each `yes`, `no` or `unknown`. Each framework call gets two seconds, so a stalled call never
-reads as a Full Disk Access refusal.
+each `yes`, `no` or `unknown`, then `mic=`. Each framework call gets two seconds, so a stalled call
+never reads as a Full Disk Access refusal.
 
 | Line | Grant | Check | Request |
 |---|---|---|---|
@@ -3120,6 +3120,7 @@ reads as a Full Disk Access refusal.
 | `a11y` | Accessibility | `AXIsProcessTrusted` | `AXIsProcessTrustedWithOptions`, prompt on |
 | `screen` | Screen Recording | `CGPreflightScreenCaptureAccess` | `CGRequestScreenCaptureAccess` |
 | `appmgmt` | App Management | none | none |
+| `mic` | Microphone | `+[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]` | none: information only |
 
 - **A missing grant is `Needs you`**, with the Settings path and its
   `x-apple.systempreferences:com.apple.preference.security?Privacy_*` link. A request never turns
@@ -3127,6 +3128,17 @@ reads as a Full Disk Access refusal.
 - **An unknown grant is `Already correct`** with the reason, as an undetermined Full Disk Access
   is. App Management is always unknown: macOS has no check for it, and the only probe is a write
   into another app's bundle, which doctor never tries. Its line names the pane to look at.
+- **The Microphone line is information only.** The server does not need the grant: a program in
+  a pane that wants the microphone asks for it itself, and macOS shows that prompt from a pane (see
+  [Panes can ask for the microphone](#panes-can-ask-for-the-microphone-macos-only)). So the line
+  is always `Already correct`, never changes the exit code, and `--fix` never asks for it. It
+  reads `granted`, `not asked yet` (the first program that asks gets the prompt), `denied` (with
+  the Settings path and link: the server is turned on there), or `unknown`. The probe writes
+  `mic=yes`, `ask`, `no` or `unknown`; restricted reads as denied.
+- **The Microphone check opens AVFoundation only when it runs.** `--grant-probe check` calls
+  `dlopen` on the framework, `dlsym` for `AVMediaTypeAudio`, and sends the class message through
+  `objc2` 0.6, a macOS-only dependency that `Cargo.lock` already carried for other crates. No other
+  launch of zellij loads the framework. Any failure along the way prints `mic=unknown`.
 - **Automation (Apple Events) is not checked.** macOS asks for it per target app at first use,
   and no target is configured anywhere.
 - **`--fix` acts on one grant per run**: the first missing one in the order of the table. Where
@@ -3141,15 +3153,17 @@ reads as a Full Disk Access refusal.
   terminal opens a missing grant's pane.
 - **Newer macOS renamed two panes.** macOS 27 shows Accessibility as Device Control & Data Access,
   and Screen Recording as Screen & System Audio Recording. The Settings line names both, and each
-  link opens the pane on either version. All four links were checked on macOS 27.
+  link opens the pane on either version. The first four links were checked on macOS 27; the
+  Microphone link was not.
 - **What was proved live, and what was not.** On a macOS 27 Mac, each check answered as the TCC
   database says for three responsible processes: an ssh session, Terminal, and a scratch server
   through `doctor --dry-run`. `--grant-probe request-screen-recording`, run in Terminal there,
   showed macOS's dialog, so `CGRequestScreenCaptureAccess` works on macOS 27. The Accessibility
   request and a full `--fix` run in a server pane were not fired live. Unit tests cover which grant
-  a run acts on and what it says.
+  a run acts on and what it says. The Microphone check was not run live: a release candidate on
+  a Mac proves it.
 - A call that does not return in time prints `unknown`. A binary that cannot run in the pane prints
-  no grant lines, and both grants read as unknown.
+  no grant lines, and every grant reads as unknown.
 
 #### Signing the pinned copy (macOS)
 
@@ -5575,7 +5589,8 @@ Settings has no "+" to add the grant by hand. Two things were missing.
 
 Neither changes the signing identifier or team, so the designated requirement every existing grant
 records is unchanged: no re-grant is owed. The first program that asks gets the system prompt once;
-after that every pane inherits the answer.
+after that every pane inherits the answer. `zellij session doctor` shows the answer on its `mic`
+line, as information only; see [The privacy grants](#the-privacy-grants-macos).
 
 ### `connect_to_server` gives up on a session that answers to no server
 

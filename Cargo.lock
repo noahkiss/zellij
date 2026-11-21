@@ -6635,6 +6635,7 @@ dependencies = [
  "log",
  "miette 7.6.0",
  "names",
+ "objc2 0.6.4",
  "rand 0.10.2",
  "regex",
  "rmcp",

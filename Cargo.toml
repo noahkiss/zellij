@@ -47,6 +47,10 @@ rmcp = { version = "3.1.2", default-features = false, features = ["server", "tra
 daemonize = { workspace = true }
 libc = { workspace = true }
 
+# `session doctor` reads the Microphone grant from AVFoundation; already resolved via other crates
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
 
