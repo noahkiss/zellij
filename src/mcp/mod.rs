@@ -70,7 +70,7 @@ zellij_overview with scope=agents answers which panes are running a coding agent
 each one is, including its live messaging name. Refresh the list before addressing another agent.
 To message another agent, on this machine or another, use zellij_send: it finds the agent by host,
 tab, handle, name or project, and types the message in only when that agent is idle and nobody is
-typing there. Do not wait for the answer: it arrives typed into your own prompt as a new message
+typing there (an OpenCode agent gets it through its own server instead). Do not wait for the answer: it arrives typed into your own prompt as a new message
 once you are idle, so end your turn or carry on. Use zellij_write_input for a pane that runs no
 agent.
 The agents prompt and zellij://agents resource return the same live list.

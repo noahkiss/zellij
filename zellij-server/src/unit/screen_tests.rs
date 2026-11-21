@@ -25312,6 +25312,169 @@ fn pty_writes(receiver: &PtyWriterReceiver) -> Vec<String> {
         .collect()
 }
 
+/// Pane 1 runs an OpenCode agent; `session` is the session it reported over `OSC 1337`, the
+/// agent-session plugin's report.
+fn screen_with_opencode(session: Option<&str>) -> (Screen, PtyWriterReceiver) {
+    let (mut screen, writes) = screen_with_claude(0);
+    let info = screen.pane_process_info.get_mut(&1).unwrap();
+    info.command = Some(vec!["opencode".to_owned()]);
+    info.osc_agent_session = session.map(str::to_owned);
+    (screen, writes)
+}
+
+fn opencode_reports(screen: &mut Screen, state: &str) {
+    let report = format!("\x1b]7501;state={}:app=opencode\x07", state);
+    screen
+        .get_active_tab_mut(1)
+        .unwrap()
+        .handle_pty_bytes(1, report.into_bytes())
+        .unwrap();
+}
+
+#[test]
+fn a_message_to_opencode_is_posted_not_typed_and_answered_when_the_post_succeeds() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, writes) = screen_with_opencode(Some("ses_abc"));
+    // a person's draft and a working agent do not matter: nothing is typed
+    opencode_reports(&mut screen, "working");
+    person_types(&mut screen, b"half a tho");
+    let _ = pty_writes(&writes);
+    let (reply, answer) = crossbeam::channel::unbounded();
+    let record = screen.send_agent_message_replying(
+        1,
+        "Run the tests.".to_owned(),
+        "boxa/work/brisk-heron".to_owned(),
+        Some("builder".to_owned()),
+        None,
+        None,
+        None,
+        60,
+        Some(reply),
+    );
+    assert_eq!(record.status, Status::Queued, "{record:?}");
+    assert!(answer.try_recv().is_err(), "no answer before the post");
+    assert!(screen.opencode_in_flight.contains_key(&record.id));
+    // a drain meanwhile types nothing
+    screen.drain_agent_messages();
+    screen.opencode_message_posted(record.id.clone(), Ok(55121));
+    let answered = answer.try_recv().expect("answered once the post came back");
+    assert_eq!(answered.status, Status::Delivered, "{answered:?}");
+    assert_eq!(answered.via.as_deref(), Some("opencode-api"));
+    assert!(pty_writes(&writes).is_empty());
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+    // a second answer for the same message does nothing
+    screen.opencode_message_posted(record.id.clone(), Err("late".to_owned()));
+    assert!(pty_writes(&writes).is_empty());
+}
+
+#[test]
+fn a_failed_post_to_opencode_types_the_message_in_once_through_the_guard() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    let (mut screen, writes) = screen_with_opencode(Some("ses_abc"));
+    opencode_reports(&mut screen, "idle");
+    let (reply, answer) = crossbeam::channel::unbounded();
+    let record = screen.send_agent_message_replying(
+        1,
+        "Ping.".to_owned(),
+        "boxa/work/brisk-heron".to_owned(),
+        Some("builder".to_owned()),
+        None,
+        None,
+        None,
+        60,
+        Some(reply),
+    );
+    assert!(pty_writes(&writes).is_empty());
+    screen.opencode_message_posted(record.id.clone(), Err("no serve".to_owned()));
+    let answered = answer.try_recv().unwrap();
+    assert_eq!(answered.status, Status::Delivered, "{answered:?}");
+    assert_eq!(answered.via, None);
+    let sent = pty_writes(&writes);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].starts_with("w:\x1b[200~[message "), "{sent:?}");
+    assert!(sent[0].ends_with("\nPing.\x1b[201~"), "{sent:?}");
+
+    // a second message to a busy agent: posted again (its own first try), fails, and is held by
+    // the guard; later tries type it and never post it again
+    opencode_reports(&mut screen, "working");
+    let second = send(&mut screen, "Pong.");
+    assert!(screen.opencode_in_flight.contains_key(&second.id));
+    screen.opencode_message_posted(second.id.clone(), Err("no serve".to_owned()));
+    let held = screen.agent_mail.get(&second.id).unwrap().record.clone();
+    assert_eq!(held.status, Status::Queued);
+    assert_eq!(held.reason, Some(Reason::Working));
+    opencode_reports(&mut screen, "idle");
+    screen.drain_agent_messages();
+    assert!(!screen.opencode_in_flight.contains_key(&second.id));
+    assert_eq!(pty_writes(&writes).len(), 2);
+    assert_eq!(
+        screen.agent_mail.get(&second.id).unwrap().record.status,
+        Status::Delivered
+    );
+}
+
+#[test]
+fn a_held_message_for_opencode_is_posted_on_a_later_try_and_skipped_while_in_flight() {
+    use zellij_utils::agent_mail::Status;
+    // no session reported yet: the first try types, and the guard holds it as `starting`
+    let (mut screen, writes) = screen_with_opencode(None);
+    let record = send(&mut screen, "Run the tests.");
+    assert_eq!(record.status, Status::Queued);
+    assert!(screen.opencode_in_flight.is_empty());
+    // the plugin reports the session: the next round posts it
+    screen
+        .pane_process_info
+        .get_mut(&1)
+        .unwrap()
+        .osc_agent_session = Some("ses_abc".to_owned());
+    screen.drain_agent_messages();
+    assert!(screen.opencode_in_flight.contains_key(&record.id));
+    // in flight past its expiry: neither typed nor expired
+    screen
+        .agent_mail
+        .held_mut_for_test(&record.id)
+        .record
+        .expires_at = 0;
+    opencode_reports(&mut screen, "idle");
+    screen.drain_agent_messages();
+    assert!(pty_writes(&writes).is_empty());
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Queued
+    );
+    screen.opencode_message_posted(record.id.clone(), Ok(55121));
+    let settled = screen.agent_mail.get(&record.id).unwrap().record.clone();
+    assert_eq!(settled.status, Status::Delivered);
+    assert_eq!(settled.via.as_deref(), Some("opencode-api"));
+    assert!(pty_writes(&writes).is_empty());
+}
+
+#[test]
+fn a_message_cancelled_while_its_post_runs_is_not_typed_when_the_post_fails() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, writes) = screen_with_opencode(None);
+    let record = send(&mut screen, "Run the tests.");
+    screen
+        .pane_process_info
+        .get_mut(&1)
+        .unwrap()
+        .osc_agent_session = Some("ses_abc".to_owned());
+    screen.drain_agent_messages();
+    assert!(screen.opencode_in_flight.contains_key(&record.id));
+    let now_ms = crate::program_status::now_ms();
+    assert!(screen.agent_mail.cancel(&record.id, now_ms).is_ok());
+    opencode_reports(&mut screen, "idle");
+    screen.opencode_message_posted(record.id.clone(), Err("timeout".to_owned()));
+    assert!(pty_writes(&writes).is_empty());
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Cancelled
+    );
+}
+
 #[test]
 fn a_message_to_an_idle_agent_goes_in_as_one_paste_and_a_held_enter() {
     use zellij_utils::agent_mail::Status;

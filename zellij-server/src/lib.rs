@@ -29,6 +29,7 @@ mod logging_pipe;
 mod mobile_web;
 pub mod nested_guest;
 pub mod notifications;
+mod opencode_api;
 mod pane_groups;
 pub mod pane_mirror;
 mod plugins;

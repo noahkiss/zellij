@@ -9378,7 +9378,8 @@ reads stdin).
   `--from-tab`, and that envelope says "not from the person". The session never reads
   `person_name`: it is not in the protobuf `Options`.
 - **The shape follows the receiving agent's kind.** Every kind but Claude Code (codex, opencode,
-  pi, and an agent of unknown kind) gets the envelope line with the text below it. Claude Code
+  pi, and an agent of unknown kind) gets the envelope line with the text below it; an OpenCode
+  agent gets it only when its server cannot be reached (below). Claude Code
   gets a cross-session wrapper, with the whole envelope in attributes and the text alone inside:
 
   ```text
@@ -9418,13 +9419,61 @@ reads stdin).
   limit is unchanged, several lines or not. The stored text stays whole. The id in the stub is
   the receiving session's, given before the paste is built, so the receiver's own `message-show`
   resolves it.
+- **An OpenCode agent gets the message through its own server**, not typed into its prompt.
+  OpenCode's TUI then draws one line, and the model reads the whole message:
+
+  ```text
+  ↳ Builder finished · from builder: Run the tests. (directly from Sam)
+  ```
+
+  - **The route.** The session posts `POST /api/session/<id>/synthetic` with this body:
+
+    ```json
+    {"text": "<cross-session-message from=... message=\"7\" ...>\nRun the tests.\n</cross-session-message>",
+     "description": "from builder: Run the tests. (directly from Sam)",
+     "metadata": {"source": "subagent", "agent": "builder", "state": "completed"},
+     "delivery": "queue", "resume": true}
+    ```
+
+    `text` is the Claude wrapper above with the text whole: never a stub, since nothing is
+    pasted. `description` is the TUI line: `from <sender>: ` and the text's first line, cut to 80
+    characters, then ` (directly from <person>)` with `--from-person`. `agent` is the sender's
+    name; the TUI capitalises it. `queue` waits for a running turn to end, and `resume` starts a
+    turn on an idle agent. So the post skips the guard: no idle, draft or typing check.
+  - **Discovery.** A plain `opencode` TUI starts a private server child, `opencode serve --stdio
+    --port 0`, that also listens on a random loopback TCP port. Nothing on disk names the port or
+    the password. The session finds them from the pane: the descendant of the pane's shell whose
+    argv is `opencode serve --stdio ...`, then its listening port. Linux matches the socket
+    inodes in `/proc/<pid>/fd` against the LISTEN rows of `/proc/<pid>/net/tcp` and `tcp6`,
+    in-process. macOS runs `/usr/sbin/lsof -nP -a -p <pid> -iTCP -sTCP:LISTEN -Fn`, by absolute
+    path. The session id is the pane's `agent_id` when the agent reported it over `OSC 1337`
+    (`session_source: osc`), which the agent-session plugin from `zellij setup --agent-hooks`
+    does each time the TUI shows another session.
+  - **Auth.** Basic auth, user `opencode`, with the `OPENCODE_PASSWORD` in that server child's
+    environment (`/proc/<pid>/environ`, or `KERN_PROCARGS2` on macOS). The request never goes
+    through a proxy, and neither the password nor the header reaches a log.
+  - **Off the screen thread.** Discovery and the post run on a short-lived thread, the post
+    bounded at 3 s. The message counts as in flight meanwhile: no round types it or expires it.
+    A held message in flight also holds back the pane's later held messages; a new message's
+    first post is not held, so another message can pass it. `send-message` answers when the post comes back,
+    so the server's wait for the answer is 10 s.
+  - **The answer.** HTTP 200 settles the record `delivered`, with `via: "opencode-api"`. Any
+    failure types the message in for that same try, through the guard as before, with the
+    reason at debug level: no session reported, no pane pid, no `opencode serve` under the pane,
+    no listener, no password, a refused or failed post, a timeout. A message whose post failed
+    is typed from then on, never posted again: the session never both posts and types a message
+    whose post it saw fail (see the timeout limit below).
+  - **Falls back to typing:** stock OpenCode without the agent-session plugin (no session id),
+    and a TUI attached to a server elsewhere with `--server` (no server under the pane).
+
 - **Message ids** are a small number counted per receiving session: `1`, `2`, ... `reply_to` is
   resolved by the session that delivered the message, so an id only has to be unique there. The
   counter is saved beside the held messages (`next-id`) before an id is used, so a restart of the
   server never gives one twice; a lost counter file restarts past the highest id still on disk.
   An id an older build gave (`m3k9x2q`) still resolves.
 - **The answer** is one record (`--json`, or a line): `delivered`, `queued` with a `reason`,
-  `refused`, `expired`, or `cancelled`. Exit 0 for delivered and queued, 2 otherwise. `--wait <s>` blocks until
+  `refused`, `expired`, or `cancelled`. A message posted to an OpenCode server carries `via:
+  "opencode-api"`. Exit 0 for delivered and queued, 2 otherwise. `--wait <s>` blocks until
   a held message goes in. It waits for delivery only, never for an answer.
 - **Do not wait for the answer.** The reply comes back as a message too, typed into the sender's
   own prompt once the sender is idle. A sender that blocks on `zellij_wait_for`, or polls, freezes
@@ -9489,13 +9538,20 @@ Limits:
   in the old name's directory.
 - An agent that never reports again (a codex whose hooks were removed) keeps a held message until
   it expires.
+- A post to OpenCode that times out may still have reached the server. The session types the
+  message in then, and the agent can get it twice. On loopback a post answers in milliseconds.
+- A message cancelled while its post to OpenCode runs stays `cancelled`, though the post may
+  still land.
+- The agent-session plugin reports a session only while the TUI shows one. A TUI back on its
+  home screen keeps the last session reported, and the post lands there, out of view.
 
 Files: `zellij-utils/src/agent_mail.rs` (record, envelope, stub, guard, address),
 `input/actions.rs`, `cli.rs`, `cli_surface.rs`, `capabilities.rs`, `data.rs`
 (`queued_messages`), `client_server_contract/common_types.proto`, `ipc/protobuf_conversion.rs`;
 `zellij-server/src/agent_mail.rs` (`Draft`, `Mailbox`), `pty_writer.rs` (`WriteNotBefore`),
 `program_status.rs`, `panes/grid.rs`, `panes/terminal_pane.rs`, `tab/mod.rs` (`AgentPrompt`),
-`screen.rs` (send, drain, ticker, show, cancel), `route.rs`; `zellij-client/src/agent_send.rs`,
+`screen.rs` (send, drain, ticker, show, cancel, the OpenCode post), `opencode_api.rs`
+(discovery and the post), `route.rs`; `zellij-client/src/agent_send.rs`,
 `cli_client.rs`; `src/commands.rs`; `src/mcp/send.rs`, `mod.rs`, `tools.rs`, `fleet.rs`,
 `invoke.rs`; `input/options.rs` and `kdl/mod.rs` (`person_name`). Tests: the guard table, the
 envelope and text cleaning, the origin, the Claude wrapper and its escaping, the shape per kind,
@@ -9505,7 +9561,11 @@ the draft on every key class, the mailbox's save, restore, expiry and pruning, t
 (names, tabs, projects, ambiguity, sessions, a shell pane), the MCP route, sender, cancel, command line
 and old-build detection, and on the screen: delivery to an idle agent, a key after it, a draft
 held and left alone then delivered after its turn, a cleared draft, the quiet window, and the
-working, blocked, shell and no-wait cases.
+working, blocked, shell and no-wait cases. For OpenCode: the server's argv, the `/proc/net/tcp`
+and `lsof` parsing, the socket inode, the session id check, the URL and auth header, the body and
+its description, and on the screen a post that succeeds (nothing typed), one that fails (typed
+once through the guard, never posted again), a held message posted on a later round and skipped
+while in flight, and one cancelled meanwhile.
 
 ### A target with no agent starts the default harness
 
