@@ -37,6 +37,8 @@ pub enum Status {
     Refused,
     /// Held until it expired, and never typed in.
     Expired,
+    /// Held, then cancelled by `message-cancel` before it was typed in.
+    Cancelled,
 }
 
 impl Status {
@@ -46,6 +48,7 @@ impl Status {
             Status::Queued => "queued",
             Status::Refused => "refused",
             Status::Expired => "expired",
+            Status::Cancelled => "cancelled",
         }
     }
 }
@@ -258,6 +261,20 @@ pub fn wrapped(envelope: &str, text: &str) -> String {
 /// The tag Claude Code reads as a message from another session.
 const CLAUDE_TAG: &str = "cross-session-message";
 
+/// The longest paste, in characters, that goes in whole: the envelope or wrapper and the text.
+///
+/// Claude Code collapses a `<cross-session-message>` paste to one "Message from @name" line only
+/// when its body is one line and the whole paste is short; measured at about 680 characters it
+/// still collapsed, at about 800 it did not. A longer message goes in as a one-line stub that
+/// names `zellij action message-show <id>`, for every kind, so the receiver reads the rest when it
+/// wants it and the prompt stays one line.
+pub const PASTE_COLLAPSE_LIMIT: usize = 600;
+
+/// The command that prints a message's whole text, run in the receiving session's pane.
+pub fn show_command(id: &str) -> String {
+    format!("zellij action message-show {}", id)
+}
+
 /// The message as it is pasted into the receiving agent's prompt, shaped for its kind.
 ///
 /// Claude Code gets its own cross-session wrapper, with the whole envelope in attributes and the
@@ -270,15 +287,46 @@ const CLAUDE_TAG: &str = "cross-session-message";
 /// ```
 ///
 /// Claude Code's UI reads the paste as a message from another session only when the opening tag
-/// is the very first thing in it. It collapses a one-line message to "Message from @<from-name>";
-/// a message of several lines shows the raw wrapper, which the model still reads correctly. The
-/// way back is two attributes, `reply` and `reply-to`: a value holding two `=` stops the UI
-/// recognising the tag. `from-tab` is there when the sender named its tab, `origin` and `note`
-/// only for a message relayed from the person, `answering` only for a reply, and `reply-to` only
-/// for a sender in a pane.
+/// is the very first thing in it. It collapses a short one-line message to "Message from
+/// @<from-name>"; a message of several lines shows the raw wrapper, which the model still reads
+/// correctly. The way back is two attributes, `reply` and `reply-to`: a value holding two `=`
+/// stops the UI recognising the tag. `from-tab` is there when the sender named its tab, `origin`
+/// and `note` only for a message relayed from the person, `answering` only for a reply, and
+/// `reply-to` only for a sender in a pane.
 ///
 /// Every other kind, and an agent of unknown kind, gets the envelope line with the text below it.
+///
+/// A paste longer than [`PASTE_COLLAPSE_LIMIT`] goes in as a stub, whatever the kind: the text's
+/// first line, cut to fit, then ` … (N chars; read the rest with zellij action message-show
+/// <id>)`. Claude's wrapper then gains `full="zellij action message-show <id>"`. The id is this
+/// record's, given by the receiving session, so the receiver's own session resolves it.
 pub fn pasted(record: &MessageRecord, text: &str) -> String {
+    let text = sanitize(text);
+    let whole = shaped(record, &text, false);
+    if whole.chars().count() <= PASTE_COLLAPSE_LIMIT {
+        return whole;
+    }
+    let suffix = format!(
+        " … ({} chars; read the rest with {})",
+        text.chars().count(),
+        show_command(&record.id)
+    );
+    let first = text.trim_start().lines().next().unwrap_or("");
+    let mut keep = first.chars().count();
+    loop {
+        let head: String = first.chars().take(keep).collect();
+        let stub = format!("{}{}", head.trim_end(), suffix);
+        let paste = shaped(record, stub.trim_start(), true);
+        let over = paste.chars().count().saturating_sub(PASTE_COLLAPSE_LIMIT);
+        if over == 0 || keep == 0 {
+            return paste;
+        }
+        keep = keep.saturating_sub(over);
+    }
+}
+
+/// The paste for `text`, already sanitized. `stub` adds Claude's `full` attribute.
+fn shaped(record: &MessageRecord, text: &str, stub: bool) -> String {
     let claude = record
         .agent
         .as_deref()
@@ -318,6 +366,9 @@ pub fn pasted(record: &MessageRecord, text: &str) -> String {
     if let Some(to) = &sender.to {
         attributes.push(("reply-to", to.clone()));
     }
+    if stub {
+        attributes.push(("full", show_command(&record.id)));
+    }
     let attributes = attributes
         .iter()
         .map(|(name, value)| format!("{}=\"{}\"", name, attribute(value)))
@@ -326,7 +377,7 @@ pub fn pasted(record: &MessageRecord, text: &str) -> String {
     format!(
         "<{tag} {attributes}>\n{body}\n</{tag}>",
         tag = CLAUDE_TAG,
-        body = unclosable(&sanitize(text)),
+        body = unclosable(text),
     )
 }
 
@@ -715,6 +766,91 @@ mod tests {
             "[message 7 from builder (tab develop, boxa), answering 6; \
                                      directly from Sam, sent through another session."
         ));
+    }
+
+    /// A text of `n` characters on one line.
+    fn of_len(n: usize) -> String {
+        "x".repeat(n)
+    }
+
+    #[test]
+    fn a_paste_over_the_limit_becomes_a_stub_and_one_at_the_limit_does_not() {
+        for kind in [Some("claude"), Some("codex"), None] {
+            let rec = record(kind, Some("Sam"));
+            let room = PASTE_COLLAPSE_LIMIT - pasted(&rec, "").chars().count();
+            let at_limit = pasted(&rec, &of_len(room));
+            assert_eq!(at_limit.chars().count(), PASTE_COLLAPSE_LIMIT, "{kind:?}");
+            assert!(at_limit.contains(&of_len(room)), "{kind:?}");
+            assert!(!at_limit.contains("message-show"), "{kind:?}");
+            let over = pasted(&rec, &of_len(room + 1));
+            assert!(
+                over.chars().count() <= PASTE_COLLAPSE_LIMIT,
+                "{kind:?}: {}",
+                over.chars().count()
+            );
+            assert!(
+                over.contains(&format!(
+                    " … ({} chars; read the rest with zellij action message-show 7)",
+                    room + 1
+                )),
+                "{kind:?}: {over}"
+            );
+            // the first line is cut to fit, and the stub fills the room it has
+            assert!(over.chars().count() >= PASTE_COLLAPSE_LIMIT - 1, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_message_is_a_one_line_stub_inside_the_wrapper_for_claude() {
+        let text = format!(
+            "Run the full test suite and report every failure.\n{}",
+            "Then check the lint, the format and the wasm build. ".repeat(12)
+        );
+        let paste = pasted(&record(Some("claude"), None), &text);
+        assert_eq!(
+            paste,
+            "<cross-session-message from=\"zellij:boxa/work/brisk-heron\" from-name=\"builder\" \
+             from-tab=\"develop\" message=\"7\" answering=\"6\" reply=\"zellij_send reply_to=7\" \
+             reply-to=\"boxa/work/brisk-heron\" full=\"zellij action message-show 7\">\n\
+             Run the full test suite and report every failure. … (673 chars; read the rest with \
+             zellij action message-show 7)\n\
+             </cross-session-message>"
+        );
+        let opening = paste.lines().next().unwrap();
+        for value in opening.split('"').skip(1).step_by(2) {
+            assert!(value.matches('=').count() <= 1, "{value}");
+        }
+        // the body is one line
+        assert_eq!(paste.lines().count(), 3);
+    }
+
+    #[test]
+    fn a_long_message_to_another_kind_keeps_the_envelope_first_and_the_stub_below() {
+        let text = format!(
+            "Run the full test suite and report every failure.\n{}",
+            "Then check the lint, the format and the wasm build. ".repeat(12)
+        );
+        assert_eq!(
+            pasted(&record(Some("codex"), None), &text),
+            "[message 7 from builder (tab develop, boxa), answering 6; not from the person. \
+             Reply: zellij_send reply_to=7, or to=boxa/work/brisk-heron]\n\
+             Run the full test suite and report every failure. … (673 chars; read the rest with \
+             zellij action message-show 7)"
+        );
+        // one long line is cut to fit; a multi-line message under the limit goes in whole
+        let long_line = pasted(&record(Some("codex"), None), &"word ".repeat(200));
+        assert!(long_line.chars().count() <= PASTE_COLLAPSE_LIMIT);
+        assert!(long_line.chars().count() >= PASTE_COLLAPSE_LIMIT - 1);
+        assert!(long_line.contains("]\nword word "));
+        assert!(
+            long_line.ends_with(" … (999 chars; read the rest with zellij action message-show 7)")
+        );
+        assert_eq!(
+            pasted(&record(Some("codex"), None), "one\ntwo\nthree")
+                .lines()
+                .count(),
+            4
+        );
     }
 
     #[test]

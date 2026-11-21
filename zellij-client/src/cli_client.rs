@@ -3795,7 +3795,7 @@ fn deliver_message(
     }
     match record.status {
         Status::Delivered | Status::Queued => 0,
-        Status::Refused | Status::Expired => 2,
+        Status::Refused | Status::Expired | Status::Cancelled => 2,
     }
 }
 
@@ -3825,6 +3825,160 @@ pub fn start_message_status_client(
             eprintln!("{}", message);
             2
         },
+    }
+}
+
+/// What a one-message command prints and its exit status: stdout, stderr, exit.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MessageOutcome {
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub exit: i32,
+}
+
+impl MessageOutcome {
+    fn print(self) -> i32 {
+        if let Some(stdout) = self.stdout {
+            println!("{}", stdout);
+        }
+        if let Some(stderr) = self.stderr {
+            eprintln!("{}", stderr);
+        }
+        self.exit
+    }
+
+    fn failed(line: String) -> MessageOutcome {
+        MessageOutcome {
+            stdout: None,
+            stderr: Some(line),
+            exit: 1,
+        }
+    }
+}
+
+fn no_such_message(id: &str, session_name: &str) -> String {
+    format!(
+        "No message '{}' in session {}. Ids are counted per receiving session; `zellij action message-status` lists the ones this session holds or delivered lately.",
+        id, session_name
+    )
+}
+
+/// fork addition: `zellij action message-show`.
+pub fn start_message_show_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    id: &str,
+    output_json: bool,
+) -> i32 {
+    let answer = ask(
+        os_input,
+        session_name,
+        Action::MessageShow { id: id.to_owned() },
+        id,
+    );
+    message_show_outcome(answer, id, session_name, output_json).print()
+}
+
+/// What `message-show` prints for the session's answer: the text, or with `json` the record plus
+/// `text`. The text loses every control character but newline and tab, as it does in the paste.
+pub fn message_show_outcome(
+    answer: Result<Vec<String>, String>,
+    id: &str,
+    session_name: &str,
+    output_json: bool,
+) -> MessageOutcome {
+    let lines = match answer {
+        Ok(lines) => lines,
+        Err(message) => return MessageOutcome::failed(message),
+    };
+    let found = serde_json::from_str::<Option<serde_json::Map<String, serde_json::Value>>>(
+        lines.first().map(String::as_str).unwrap_or("null"),
+    );
+    let mut found = match found {
+        Ok(Some(found)) => found,
+        Ok(None) => return MessageOutcome::failed(no_such_message(id, session_name)),
+        Err(e) => {
+            return MessageOutcome::failed(format!("Could not read the session's answer: {}", e))
+        },
+    };
+    let text = zellij_utils::agent_mail::sanitize(
+        found
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    );
+    let stdout = if output_json {
+        found.insert("text".to_owned(), serde_json::Value::String(text));
+        serde_json::to_string(&found).unwrap_or_default()
+    } else {
+        text
+    };
+    MessageOutcome {
+        stdout: Some(stdout),
+        stderr: None,
+        exit: 0,
+    }
+}
+
+/// fork addition: `zellij action message-cancel`.
+pub fn start_message_cancel_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    id: &str,
+    output_json: bool,
+) -> i32 {
+    let answer = ask(
+        os_input,
+        session_name,
+        Action::MessageCancel { id: id.to_owned() },
+        id,
+    );
+    message_cancel_outcome(answer, id, session_name, output_json).print()
+}
+
+/// What `message-cancel` prints for the session's answer. A cancelled record is a success, also
+/// one cancelled by an earlier call; a record in any other state could not be cancelled, exit 1,
+/// and with `json` its record still goes to stdout.
+pub fn message_cancel_outcome(
+    answer: Result<Vec<String>, String>,
+    id: &str,
+    session_name: &str,
+    output_json: bool,
+) -> MessageOutcome {
+    use zellij_utils::agent_mail::{MessageRecord, Status};
+    let lines = match answer {
+        Ok(lines) => lines,
+        Err(message) => return MessageOutcome::failed(message),
+    };
+    let record = match serde_json::from_str::<Option<MessageRecord>>(
+        lines.first().map(String::as_str).unwrap_or("null"),
+    ) {
+        Ok(Some(record)) => record,
+        Ok(None) => return MessageOutcome::failed(no_such_message(id, session_name)),
+        Err(e) => {
+            return MessageOutcome::failed(format!("Could not read the session's answer: {}", e))
+        },
+    };
+    let shown = if output_json {
+        serde_json::to_string(&record).unwrap_or_default()
+    } else {
+        record.line()
+    };
+    if record.status == Status::Cancelled {
+        return MessageOutcome {
+            stdout: Some(shown),
+            stderr: None,
+            exit: 0,
+        };
+    }
+    MessageOutcome {
+        stdout: output_json.then_some(shown),
+        stderr: Some(format!(
+            "Message {} is {}, not held, so it cannot be cancelled: only a queued message can.",
+            record.id,
+            record.status.as_str()
+        )),
+        exit: 1,
     }
 }
 
@@ -3891,6 +4045,79 @@ fn is_this_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use zellij_utils::data::{NewPanePlacement, UnblockCondition};
+
+    fn stored_json(status: &str, text: &str) -> String {
+        serde_json::json!({
+            "id": "7", "status": status, "pane_id": "terminal_3", "handle": "sunny-otter",
+            "session": "work", "agent": "claude", "from": "boxa/work/brisk-heron",
+            "queued_at": 1, "expires_at": 2, "text": text,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn message_show_prints_the_whole_text_or_the_record_with_it() {
+        let answer = || Ok(vec![stored_json("queued", "Line one.\nLine two.\x1b[2J")]);
+        let plain = message_show_outcome(answer(), "7", "work", false);
+        assert_eq!(plain.exit, 0);
+        // the text as it would be pasted: no escape that could act on the reader's terminal
+        assert_eq!(plain.stdout.as_deref(), Some("Line one.\nLine two.[2J"));
+        let json = message_show_outcome(answer(), "7", "work", true);
+        let value: serde_json::Value = serde_json::from_str(&json.stdout.unwrap()).unwrap();
+        assert_eq!(value["status"], "queued");
+        assert_eq!(value["handle"], "sunny-otter");
+        assert_eq!(value["text"], "Line one.\nLine two.[2J");
+        let delivered = message_show_outcome(
+            Ok(vec![stored_json("delivered", "Done.")]),
+            "7",
+            "work",
+            false,
+        );
+        assert_eq!(delivered.stdout.as_deref(), Some("Done."));
+        // an id this session does not know: exit 1, one clear line
+        let miss = message_show_outcome(Ok(vec!["null".to_owned()]), "9", "work", false);
+        assert_eq!(miss.exit, 1);
+        assert_eq!(miss.stdout, None);
+        assert!(miss
+            .stderr
+            .unwrap()
+            .starts_with("No message '9' in session work."));
+    }
+
+    #[test]
+    fn message_cancel_succeeds_only_for_a_message_that_was_held() {
+        let cancelled =
+            message_cancel_outcome(Ok(vec![stored_json("cancelled", "x")]), "7", "work", false);
+        assert_eq!(
+            cancelled,
+            MessageOutcome {
+                stdout: Some("cancelled 7 for work/sunny-otter".to_owned()),
+                stderr: None,
+                exit: 0,
+            }
+        );
+        for status in ["delivered", "expired", "refused"] {
+            let refused =
+                message_cancel_outcome(Ok(vec![stored_json(status, "x")]), "7", "work", false);
+            assert_eq!(refused.exit, 1, "{status}");
+            assert_eq!(refused.stdout, None, "{status}");
+            assert_eq!(
+                refused.stderr.unwrap(),
+                format!(
+                    "Message 7 is {}, not held, so it cannot be cancelled: only a queued message can.",
+                    status
+                )
+            );
+        }
+        // --json still prints the record of one it could not cancel
+        let json =
+            message_cancel_outcome(Ok(vec![stored_json("delivered", "x")]), "7", "work", true);
+        assert_eq!(json.exit, 1);
+        assert!(json.stdout.unwrap().contains("\"status\":\"delivered\""));
+        let miss = message_cancel_outcome(Ok(vec!["null".to_owned()]), "9", "work", false);
+        assert_eq!(miss.exit, 1);
+        assert!(miss.stderr.unwrap().starts_with("No message '9'"));
+    }
 
     /// Two sessions both hold a message 3, from different senders. A reply resolves in the
     /// replying pane's own session only, and a miss there is a miss.

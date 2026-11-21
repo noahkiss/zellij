@@ -43,6 +43,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "list-panes",
             "list-tabs",
             "list-tree",
+            "message-show",
             "message-status",
             // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
             // and this one changes nothing
@@ -106,6 +107,8 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "hide-floating-panes",
             "ignore-pane-output",
             "mark-pane-seen",
+            // takes a held message back before it is typed in
+            "message-cancel",
             "move-pane",
             "move-pane-backwards",
             "move-tab",
@@ -232,6 +235,17 @@ const OUTPUTS: &[OutputSpec] = &[
     },
     OutputSpec {
         command: "action message-status",
+        shape: "record",
+        keys: crate::agent_mail::RECORD_KEYS,
+    },
+    // the text alone; `--json` makes it the record plus `text`
+    OutputSpec {
+        command: "action message-show",
+        shape: "payload",
+        keys: "",
+    },
+    OutputSpec {
+        command: "action message-cancel",
         shape: "record",
         keys: crate::agent_mail::RECORD_KEYS,
     },

@@ -394,7 +394,7 @@ pub const TOOLS: &[ToolSpec] = &[
                   not for keys or a command line.",
         // no follow-up: the answer comes back typed into the sender's own prompt
         follow_up: None,
-        reports: &["action send-message"],
+        reports: &["action send-message", "action message-cancel"],
         tips: "The receiving session types the message in as one paste and an Enter only when the \
                agent reported idle, done or error, no unsent text is in its prompt, and no key \
                reached the pane in the last 5 seconds. Otherwise it holds the message and tries \
@@ -404,7 +404,11 @@ pub const TOOLS: &[ToolSpec] = &[
                agent or several, with the candidates listed. The receiver reads, with your text, \
                an envelope that names you and the message id; it answers with reply_to=<id>. A \
                Claude Code receiver gets a cross-session message, shown collapsed when your text \
-               is one line. A \
+               is one short line. A message whose paste passes 600 characters arrives as a \
+               one-line stub, its first line and a note; the receiver reads the whole text with \
+               `zellij action message-show <id>` in its shell. cancel=<id> takes back a message \
+               still queued, with session=<host/session> from its record when that is not your \
+               own session. A \
                machine whose zellij has no send-message is refused, not typed into. Do not wait \
                for the answer: it arrives typed into your own prompt as a new message once you \
                are idle, so end your turn or carry on.",
@@ -424,9 +428,10 @@ pub const TOOLS: &[ToolSpec] = &[
             ParamSpec {
                 name: "text",
                 kind: ParamKind::Str,
-                required: true,
+                required: false,
                 from: Some(("action send-message", "text")),
-                describe: "The message. Newlines are kept; it is sent as one paste.",
+                describe: "The message. Newlines are kept; it is sent as one paste. Required \
+                           unless cancel.",
                 default: None,
             },
             ParamSpec {
@@ -465,6 +470,17 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "Set it only when the text is the person's own words or request, which \
                            you relay for them: the receiver is told it comes directly from that \
                            person, by name. Never set it for your own messages.",
+                default: None,
+            },
+            ParamSpec {
+                name: "cancel",
+                kind: ParamKind::Str,
+                required: false,
+                from: Some(("action message-cancel", "id")),
+                describe: "Take back a message you sent that is still queued, by the id in its \
+                           record; it is never typed in. Pass it alone, with `session` set to the \
+                           record's host/session when the message is held in another session. A \
+                           delivered or expired message cannot be cancelled.",
                 default: None,
             },
         ],

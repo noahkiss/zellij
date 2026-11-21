@@ -714,6 +714,16 @@ pub enum Action {
     MessageStatus {
         id: Option<String>,
     },
+    /// fork addition: one message's record and its whole text, as JSON; `null` for an id this
+    /// session does not know.
+    MessageShow {
+        id: String,
+    },
+    /// fork addition: cancel a message this session holds, so it is never typed in. JSON: the
+    /// record as it stands after, or `null` for an id this session does not know.
+    MessageCancel {
+        id: String,
+    },
     ListTabs {
         show_state: bool,
         show_dimensions: bool,
@@ -2616,6 +2626,12 @@ impl Action {
             },
             CliAction::MessageStatus { .. } => {
                 Err("`message-status` is run by the client, not sent as an action".into())
+            },
+            CliAction::MessageShow { .. } => {
+                Err("`message-show` is run by the client, not sent as an action".into())
+            },
+            CliAction::MessageCancel { .. } => {
+                Err("`message-cancel` is run by the client, not sent as an action".into())
             },
             CliAction::TogglePaneBorderless { pane_id } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);

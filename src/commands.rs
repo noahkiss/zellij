@@ -1293,6 +1293,30 @@ fn attach_with_cli_client(
         );
         std::process::exit(exit_status);
     }
+    // `message-show` and `message-cancel` answer one JSON line; the client prints it and picks
+    // the exit status. They resolve the session as `message-status` does
+    if let zellij_utils::cli::CliAction::MessageShow { id, json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_message_show_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            id,
+            *json || output_json,
+        );
+        std::process::exit(exit_status);
+    }
+    if let zellij_utils::cli::CliAction::MessageCancel { id, json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_message_cancel_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            id,
+            *json || output_json,
+        );
+        std::process::exit(exit_status);
+    }
     // `last-reply` never becomes an action: it reads the agent's transcript on this machine,
     // found from the pane list
     if let zellij_utils::cli::CliAction::LastReply { pane_id, json } = &cli_action {

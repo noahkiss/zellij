@@ -2620,6 +2620,58 @@ fn route_action_with_origin(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        // fork addition: the answer is one JSON line, `null` for an id this session does not know;
+        // the client prints it and picks the exit status
+        Action::MessageShow { id } => {
+            use crossbeam::channel::unbounded;
+            let (response_sender, response_receiver) = unbounded();
+            senders
+                .send_to_screen(ScreenInstruction::AgentMessageShow {
+                    id,
+                    response_channel: response_sender,
+                })
+                .with_context(err_context)?;
+            match response_receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(stored) => send_output_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    vec![serde_json::to_string(&stored).unwrap_or_default()],
+                ),
+                Err(_) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout reading the session's messages",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
+        // fork addition: the record as it stands after, cancelled or not; `null` for an unknown id
+        Action::MessageCancel { id } => {
+            use crossbeam::channel::unbounded;
+            let (response_sender, response_receiver) = unbounded();
+            senders
+                .send_to_screen(ScreenInstruction::AgentMessageCancel {
+                    id,
+                    response_channel: response_sender,
+                })
+                .with_context(err_context)?;
+            match response_receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(answer) => {
+                    let record = answer.map(Some).unwrap_or_else(|not_held| not_held);
+                    send_output_to_client(
+                        cli_client_id,
+                        os_input.as_ref(),
+                        vec![serde_json::to_string(&record).unwrap_or_default()],
+                    )
+                },
+                Err(_) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout cancelling the message",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
         Action::ReopenPane {
             handle,
             list: true,

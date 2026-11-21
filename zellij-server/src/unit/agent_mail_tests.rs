@@ -231,3 +231,23 @@ fn new_ids_count_up_per_session_and_survive_a_restart() {
     assert!(restored.get("m3k9x2q").is_some());
     assert_eq!(restored.new_id(), "4");
 }
+
+#[test]
+fn a_cancelled_message_leaves_the_held_ones_and_stays_cancelled_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mailbox = Mailbox::open(dir.path().to_path_buf(), 0);
+    mailbox.hold(message("1", "sunny-otter", 0, 50_000));
+    let cancelled = mailbox.cancel("1", 10).unwrap();
+    assert_eq!(cancelled.status, Status::Cancelled);
+    assert_eq!(cancelled.reason, None);
+    assert!(mailbox.held().is_empty());
+    // a second cancel finds it settled
+    assert_eq!(
+        mailbox.cancel("1", 11).unwrap_err().map(|r| r.status),
+        Some(Status::Cancelled)
+    );
+    let restored = Mailbox::open(dir.path().to_path_buf(), 20);
+    assert!(restored.held().is_empty());
+    assert_eq!(restored.get("1").unwrap().record.status, Status::Cancelled);
+    assert_eq!(restored.get("1").unwrap().text, "Run the tests.");
+}

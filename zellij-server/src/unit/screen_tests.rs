@@ -25840,3 +25840,68 @@ pub fn close_tab_or_confirm_from_a_client_with_no_tab_does_nothing() {
     assert!(closed_tab_panes(&instructions).is_empty());
     assert!(launched_plugins(&instructions).is_empty());
 }
+
+#[test]
+fn a_long_message_goes_in_as_a_stub_that_names_this_sessions_id_and_keeps_its_whole_text() {
+    use zellij_utils::agent_mail::{Status, PASTE_COLLAPSE_LIMIT};
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    let text = format!("Review the branch.\n{}", "One more detail. ".repeat(60));
+    let record = send(&mut screen, &text);
+    assert_eq!(record.status, Status::Delivered, "{record:?}");
+    let sent = pty_writes(&writes);
+    let paste = sent[0]
+        .strip_prefix("w:\x1b[200~")
+        .and_then(|paste| paste.strip_suffix("\x1b[201~"))
+        .expect("one bracketed paste");
+    assert!(paste.chars().count() <= PASTE_COLLAPSE_LIMIT);
+    let show = format!("zellij action message-show {}", record.id);
+    assert!(paste.contains(&format!("full=\"{}\"", show)), "{paste}");
+    assert!(
+        paste.contains(&format!(
+            "Review the branch. … ({} chars; read the rest with {})\n</cross-session-message>",
+            text.trim_end().chars().count(),
+            show
+        )),
+        "{paste}"
+    );
+    // message-show reads the whole text back from the session that gave the id
+    assert_eq!(screen.agent_mail.get(&record.id).unwrap().text, text);
+}
+
+#[test]
+fn a_cancelled_message_is_never_typed_and_a_delivered_one_cannot_be_cancelled() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    let delivered = send(&mut screen, "First.");
+    assert_eq!(delivered.status, Status::Delivered);
+    let held = send(&mut screen, "Second.");
+    assert_eq!(held.status, Status::Queued);
+    assert_eq!(held.reason, Some(Reason::Working));
+    pty_writes(&writes);
+
+    // message-show answers for a held message and a delivered one alike
+    assert_eq!(screen.agent_mail.get(&held.id).unwrap().text, "Second.");
+    assert_eq!(screen.agent_mail.get(&delivered.id).unwrap().text, "First.");
+
+    let cancelled = screen.agent_mail.cancel(&held.id, 5).unwrap();
+    assert_eq!(cancelled.status, Status::Cancelled);
+    assert_eq!(cancelled.reason, None);
+    assert!(screen.agent_mail.held().is_empty());
+    // the agent's turn ends: nothing is typed, and the record stays cancelled
+    agent_reports(&mut screen, "working");
+    agent_reports(&mut screen, "idle");
+    screen.drain_agent_messages();
+    assert!(pty_writes(&writes).is_empty());
+    assert_eq!(
+        screen.agent_mail.get(&held.id).unwrap().record.status,
+        Status::Cancelled
+    );
+
+    // a delivered message is not held: the answer is its record, unchanged
+    let refused = screen.agent_mail.cancel(&delivered.id, 6).unwrap_err();
+    assert_eq!(refused.map(|record| record.status), Some(Status::Delivered));
+    // an id this session never gave
+    assert_eq!(screen.agent_mail.cancel("999", 7), Err(None));
+}

@@ -202,6 +202,9 @@ impl ZellijMcp {
         let local_name = hosts.local_name(local);
         let ambient = self.ambient_session.clone();
         let bad = |message: String| failed(message, json!({"reason": "bad_arguments"}));
+        if let Some(id) = arguments.get("cancel").and_then(Value::as_str) {
+            return self.cancel(arguments, id, local).await;
+        }
         // a reply finds its way back from the message it answers, which this session delivered
         let to = match (
             arguments.get("to").and_then(Value::as_str),
@@ -331,18 +334,53 @@ impl ZellijMcp {
             serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(outcome.stdout.trim())
                 .ok();
         let mut result = self.report(&argv, outcome, None);
-        // a record is the answer whatever its status: its keys at the top, where a caller looks
-        // for `status`, and its one line as the text
-        if let (Some(record), Some(Value::Object(structured))) =
-            (record, result.structured_content.as_mut())
-        {
-            structured.remove("reason");
-            if let Ok(Value::Object(keys)) = serde_json::to_value(&record) {
-                structured.extend(keys);
-            }
-            result.content = vec![ContentBlock::text(record.line())];
-        }
+        record_on_top(&mut result, record);
         with_host(result, &route.target)
+    }
+
+    /// `zellij_send cancel=<id>`: run `action message-cancel` in the session that holds the
+    /// message. Ids are counted per receiving session, so the session is named, never guessed: a
+    /// fall-back to this server's own session could cancel another sender's message there.
+    async fn cancel(
+        &self,
+        arguments: &Map<String, Value>,
+        id: &str,
+        local: &str,
+    ) -> CallToolResult {
+        let bad = |message: String| failed(message, json!({"reason": "bad_arguments"}));
+        let session = match send::cancel_session(arguments) {
+            Ok(session) => session,
+            Err(message) => return bad(message),
+        };
+        let mut routed = Map::new();
+        routed.insert("session".to_owned(), json!(session));
+        let target = match remote::route(&mut routed, &self.remote_hosts(), local) {
+            Ok(target) => target,
+            Err(message) => return bad(message),
+        };
+        let session = routed
+            .get("session")
+            .and_then(Value::as_str)
+            .unwrap_or(session);
+        let argv = send::cancel_argv(id, session);
+        let outcome = match invoke::run_on(&target, &argv).await {
+            Ok(outcome) => outcome,
+            Err(message) => {
+                return with_host(failed(message, json!({"reason": "not_run"})), &target)
+            },
+        };
+        // a failed cancel keeps the CLI's own line, which says why
+        let record = (!outcome.is_error())
+            .then(|| {
+                serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(
+                    outcome.stdout.trim(),
+                )
+                .ok()
+            })
+            .flatten();
+        let mut result = self.report(&argv, outcome, None);
+        record_on_top(&mut result, record);
+        with_host(result, &target)
     }
 
     /// `scope=agents` and `my_agents`: the rows grouped by host, tab and pane, as `scope=fleet`
@@ -1120,6 +1158,23 @@ pub fn start(session: Option<String>, config_path: Option<PathBuf>) -> i32 {
             },
         }
     })
+}
+
+/// A message record is the answer whatever its status: its keys at the top, where a caller looks
+/// for `status`, and its one line as the text.
+fn record_on_top(
+    result: &mut CallToolResult,
+    record: Option<zellij_utils::agent_mail::MessageRecord>,
+) {
+    if let (Some(record), Some(Value::Object(structured))) =
+        (record, result.structured_content.as_mut())
+    {
+        structured.remove("reason");
+        if let Ok(Value::Object(keys)) = serde_json::to_value(&record) {
+            structured.extend(keys);
+        }
+        result.content = vec![ContentBlock::text(record.line())];
+    }
 }
 
 /// `zellij_send reply_to`: the command that looks message `id` up, in `caller_session` only - the
