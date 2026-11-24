@@ -612,6 +612,7 @@ impl MouseHandler {
         mousebinds: Arc<Mousebinds>,
     ) -> Result<MouseEffect> {
         Self::forget_unfinished_pane_drawing(tab, event, client_id);
+        Self::forget_gesture_whose_release_was_lost(tab, event);
         let click_count = Self::count_click(tab, event, client_id);
         let mut context =
             Self::gather_mouse_event_context(tab, event, client_id, passthrough_pane_id)?;
@@ -636,6 +637,23 @@ impl MouseHandler {
         let is_button_press = event.event_type == MouseEventType::Press
             && (event.left || event.right || event.middle);
         if is_button_press && tab.pane_drawings.remove(&client_id).is_some() {
+            tab.set_force_render();
+        }
+    }
+
+    // fork addition: a button press while a selection, resize or floating-pane move is held
+    // means that gesture's release never arrived - one button cannot be pressed twice. A held
+    // gesture swallows every press and wheel event, so a lost release used to leave the tab
+    // ignoring clicks and scrolling until a throwaway click supplied one. End the gesture and
+    // handle the press normally, as forget_unfinished_pane_drawing does for a drawing.
+    fn forget_gesture_whose_release_was_lost(tab: &mut Tab, event: &MouseEvent) {
+        let is_button_press = event.event_type == MouseEventType::Press
+            && (event.left || event.right || event.middle);
+        let is_held = tab.selecting_with_mouse_in_pane.is_some()
+            || tab.pane_being_resized_with_mouse.is_some()
+            || tab.floating_panes.pane_is_being_moved_with_mouse();
+        if is_button_press && is_held {
+            tab.forget_held_mouse_gestures();
             tab.set_force_render();
         }
     }

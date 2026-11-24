@@ -19752,6 +19752,64 @@ fn dragging_in_an_unselectable_plugin_pane_sends_hold_and_release_to_the_plugin(
 }
 
 #[test]
+fn leaving_the_tab_forgets_a_plugin_press_whose_release_landed_elsewhere() {
+    // The tab bar switches tabs on the press, so its release reaches the next tab.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let (mut tab, _plugin_receiver) = tab_with_unselectable_plugin_pane(size, client_id);
+    let mut content = String::new();
+    for i in 0..50 {
+        content.push_str(&format!("Line {}\r\n", i));
+    }
+    tab.handle_pty_bytes(1, Vec::from(content.as_bytes()))
+        .unwrap();
+    let plugin_point = center_of_pane(&tab, PaneId::Plugin(7));
+    let terminal_point = center_of_pane(&tab, PaneId::Terminal(1));
+    tab.handle_mouse_event(&MouseEvent::new_left_press_event(plugin_point), client_id)
+        .unwrap();
+    assert_eq!(tab.selecting_with_mouse_in_pane, Some(PaneId::Plugin(7)));
+    // While the press is held, the wheel is swallowed: the symptom.
+    tab.handle_mouse_event(&MouseEvent::new_scroll_up_event(terminal_point), client_id)
+        .unwrap();
+    assert!(!tab.active_pane_is_scrolled(client_id));
+    tab.drain_single_client(client_id);
+    assert!(tab.selecting_with_mouse_in_pane.is_none());
+    // Back in the tab, with no click in between, the wheel scrolls.
+    tab.add_client(client_id, None).unwrap();
+    tab.handle_mouse_event(&MouseEvent::new_scroll_up_event(terminal_point), client_id)
+        .unwrap();
+    assert!(tab.active_pane_is_scrolled(client_id));
+}
+
+#[test]
+fn a_new_press_ends_a_held_plugin_press_whose_release_was_lost() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let (mut tab, _plugin_receiver) = tab_with_unselectable_plugin_pane(size, client_id);
+    let plugin_point = center_of_pane(&tab, PaneId::Plugin(7));
+    let terminal_point = center_of_pane(&tab, PaneId::Terminal(1));
+    tab.handle_mouse_event(&MouseEvent::new_left_press_event(plugin_point), client_id)
+        .unwrap();
+    assert_eq!(tab.selecting_with_mouse_in_pane, Some(PaneId::Plugin(7)));
+    // No release. The next press is handled, not swallowed: it starts its own selection.
+    tab.handle_mouse_event(&MouseEvent::new_left_press_event(terminal_point), client_id)
+        .unwrap();
+    assert_eq!(tab.selecting_with_mouse_in_pane, Some(PaneId::Terminal(1)));
+    tab.handle_mouse_event(
+        &MouseEvent::new_left_release_event(terminal_point),
+        client_id,
+    )
+    .unwrap();
+    assert!(tab.selecting_with_mouse_in_pane.is_none());
+}
+
+#[test]
 fn a_middle_click_on_an_unselectable_plugin_pane_does_not_start_a_drag() {
     let size = Size {
         cols: 121,

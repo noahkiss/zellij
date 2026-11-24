@@ -4259,6 +4259,26 @@ a switch also fires `ModeUpdate` and `PaneUpdate`, the plugin redraws for those 
 redraw satisfies the wait before the tab-aware one exists. Fixing it needs a render to say which
 event it answers, which `PluginRenderAsset` does not carry.
 
+### A lost mouse release no longer freezes a tab
+
+Since the 0.46 base, a click on a plugin pane, the tab bar included, holds a selection in that
+plugin until the button is released (upstream #5685, #5697, #5859). The tab bar switches tabs on
+the press, so the release lands in the tab you went to. The tab you left stayed held. A held
+gesture swallows every press and every wheel event in its tab, so on your next visit by keyboard
+that tab ignored scrolling and tab-bar clicks until one throwaway click supplied the release.
+0.45 never held a gesture on a plugin press, and the same sequence worked there.
+
+- **A client leaving a tab forgets the tab's held gestures**, in `Tab::drain_single_client`, which
+  every tab switch goes through. The gesture flags are per tab, so they are forgotten only when no
+  client is left in the tab, the same guard `remove_client` uses.
+- **A button press while a gesture is held ends that gesture first**, then is handled normally. One
+  button cannot be pressed twice, so a press means the release was lost: released outside the
+  window, or an app switch mid-drag. A wheel event does not end a gesture, because a real drag can
+  see one. The flags are per tab, so with two clients in one tab, one client's press now ends the
+  other's drag. Before, that press was swallowed.
+
+Tests: `tab_integration_tests.rs`, beside the unselectable-plugin drag test.
+
 ### One warning badge in the tab bar
 
 Two facts are true of a whole session, actionable, and invisible everywhere else. The bar says so

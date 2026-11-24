@@ -3322,6 +3322,15 @@ impl Tab {
         self.connected_clients.borrow_mut().remove(&client_id);
         self.pane_drawings.remove(&client_id);
         self.mouse_click_tracker.remove(&client_id);
+        // fork addition: a client leaving the tab takes its mouse gesture with it. A press on a
+        // plugin pane (the tab bar) holds a selection, and the tab bar switches tabs on that
+        // press, so the release lands in the next tab and this one stayed held - ignoring every
+        // click and scroll after a keyboard return. The flags are per tab, so they are only
+        // forgotten when no client is left to be mid-gesture, as remove_client does.
+        self.mouse_press_owner.remove(&client_id);
+        if self.connected_clients.borrow().is_empty() {
+            self.forget_held_mouse_gestures();
+        }
         (client_id, client_mode_info)
     }
     pub fn has_no_connected_clients(&self) -> bool {
