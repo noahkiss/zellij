@@ -190,6 +190,7 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         terminal_title_template: _,
         session_aliases: _,
         session_restart_drop_env: _,
+        pane_env_drop: _,
         session_service: _,
         resurrect_command_hints: _,
         resurrect_commands: _,

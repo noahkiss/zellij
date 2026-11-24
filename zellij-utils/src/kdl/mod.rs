@@ -3564,6 +3564,7 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "on_quit",
     "osc133_command_selection",
     "osc8_hyperlinks",
+    "pane_env_drop",
     "pane_frame_agent_name",
     "pane_frame_style",
     "pane_frames",
@@ -3785,6 +3786,15 @@ impl Options {
             None => None,
         };
         let session_restart_drop_env = match kdl_options.get("session_restart_drop_env") {
+            Some(kdl_drop_env) => Some(
+                kdl_string_arguments!(kdl_drop_env)
+                    .iter()
+                    .map(|pattern| pattern.to_string())
+                    .collect(),
+            ),
+            None => None,
+        };
+        let pane_env_drop = match kdl_options.get("pane_env_drop") {
             Some(kdl_drop_env) => Some(
                 kdl_string_arguments!(kdl_drop_env)
                     .iter()
@@ -4055,6 +4065,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            pane_env_drop,
             detect_agents,
             pane_frame_agent_name,
             session_up_resume,
@@ -4573,6 +4584,17 @@ impl Options {
             return None;
         }
         let mut node = KdlNode::new("session_restart_drop_env");
+        for pattern in patterns {
+            node.push(KdlValue::String(pattern.to_owned()));
+        }
+        Some(node)
+    }
+    fn pane_env_drop_to_kdl(&self) -> Option<KdlNode> {
+        let patterns = self.pane_env_drop.as_ref()?;
+        if patterns.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("pane_env_drop");
         for pattern in patterns {
             node.push(KdlValue::String(pattern.to_owned()));
         }
@@ -6950,6 +6972,9 @@ impl Options {
         }
         if let Some(session_restart_drop_env) = self.session_restart_drop_env_to_kdl() {
             nodes.push(session_restart_drop_env);
+        }
+        if let Some(pane_env_drop) = self.pane_env_drop_to_kdl() {
+            nodes.push(pane_env_drop);
         }
         if let Some(enabled) = self.pane_frame_agent_name {
             let mut node = KdlNode::new("pane_frame_agent_name");
@@ -13561,6 +13586,22 @@ fn session_restart_drop_env_config_parsing() {
     );
 
     // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn pane_env_drop_config_parsing_and_round_trip() {
+    assert_eq!(
+        Config::from_kdl("", None).unwrap().options.pane_env_drop,
+        None
+    );
+    let config = Config::from_kdl(r#"pane_env_drop "FPATH" "MY_PREFIX_*""#, None).unwrap();
+    assert_eq!(
+        config.options.pane_env_drop,
+        Some(vec!["FPATH".to_owned(), "MY_PREFIX_*".to_owned()])
+    );
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(deserialized.options, config.options);

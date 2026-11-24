@@ -560,6 +560,16 @@ pub struct Options {
     #[serde(default)]
     pub session_restart_drop_env: Option<Vec<String>>,
 
+    /// Environment variables unset in every pane this server spawns, as exact names or as a name
+    /// ending in `*`, which matches by prefix. A pane inherits the server's environment, frozen
+    /// when the server started, so an exported variable that later went stale reaches every new
+    /// pane. A config reload applies a changed list to the panes spawned after it; a running
+    /// pane keeps its own environment. A name the config's `env {}` block sets is kept: setting
+    /// wins over dropping. Unset means drop nothing. config.kdl only.
+    #[clap(skip)]
+    #[serde(default)]
+    pub pane_env_drop: Option<Vec<String>>,
+
     /// Extra directives to place in the init-system unit `zellij session enable` writes, passed
     /// through verbatim: systemd directive lines per section, launchd plist keys. A generated unit
     /// cannot know the local facts - that this session must start after some other service, that
@@ -1061,6 +1071,7 @@ impl Options {
         let session_restart_drop_env = other
             .session_restart_drop_env
             .or_else(|| self.session_restart_drop_env.clone());
+        let pane_env_drop = other.pane_env_drop.or_else(|| self.pane_env_drop.clone());
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
@@ -1208,6 +1219,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            pane_env_drop,
             session_service,
             resurrect_command_hints,
             resurrect_commands,
@@ -1346,6 +1358,7 @@ impl Options {
         let session_restart_drop_env = other
             .session_restart_drop_env
             .or_else(|| self.session_restart_drop_env.clone());
+        let pane_env_drop = other.pane_env_drop.or_else(|| self.pane_env_drop.clone());
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
@@ -1496,6 +1509,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            pane_env_drop,
             session_service,
             resurrect_command_hints,
             resurrect_commands,

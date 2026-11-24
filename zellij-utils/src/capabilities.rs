@@ -76,6 +76,7 @@ pub const CAPABILITIES: &[&str] = &[
     "wait-agent-state", // action wait --for agent-idle|agent-waiting, input_since_state on list-panes --json
     "last-reply",       // action last-reply: an agent's last reply, from its transcript
     "session-drop-env", // session_restart_drop_env
+    "pane-env-drop",    // pane_env_drop: unset variables in every spawned pane, reload-aware
     "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
     "session-service-config", // session_service, pin_exe
     "session-warnings", // Full Disk Access / superseded-build, on ModeInfo for a bar to badge

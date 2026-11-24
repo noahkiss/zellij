@@ -45,6 +45,7 @@ Options {
     terminal_title_template: None,
     session_aliases: None,
     session_restart_drop_env: None,
+    pane_env_drop: None,
     session_service: None,
     resurrect_command_hints: None,
     resurrect_commands: None,

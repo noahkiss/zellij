@@ -1246,6 +1246,8 @@ impl SessionMetaData {
             self.send_terminal_settings_if_changed(client_id, &new_config);
             self.follow_keybinds_dir(&new_config);
             self.sync_pane_env(new_config.env.inner());
+            self.applied_env
+                .sync_drop(new_config.options.pane_env_drop.as_ref());
             let pane_env = self.applied_env.pane_env();
             let base_mode = new_config.options.default_mode.unwrap_or_default();
             let base_mode_changed = self
@@ -1891,6 +1893,8 @@ impl SessionState {
 pub(crate) struct AppliedEnv {
     config: HashMap<String, String>,
     original_values: HashMap<String, Option<String>>,
+    // fork addition: `pane_env_drop`, the patterns unset in every new pane.
+    drop: Vec<String>,
 }
 
 impl AppliedEnv {
@@ -1915,10 +1919,14 @@ impl AppliedEnv {
         AppliedEnv {
             config: env.clone(),
             original_values,
+            drop: vec![],
         }
     }
     fn sync(&mut self, wanted: &HashMap<String, String>) {
         self.config = wanted.clone();
+    }
+    fn sync_drop(&mut self, patterns: Option<&Vec<String>>) {
+        self.drop = patterns.cloned().unwrap_or_default();
     }
     pub(crate) fn pane_env(&self) -> PaneEnv {
         let mut pane_env: PaneEnv = self
@@ -1930,7 +1938,28 @@ impl AppliedEnv {
         for (name, value) in &self.config {
             pane_env.insert(name.clone(), Some(value.clone()));
         }
+        for name in
+            self.names_to_drop(std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()))
+        {
+            pane_env.insert(name, None);
+        }
         pane_env
+    }
+    // The server's own variables that `pane_env_drop` names. A name the config's `env {}` block
+    // sets is kept, because setting it is the more specific request. zellij's own `ZELLIJ*`
+    // variables are kept too: a pane without them cannot find its session.
+    fn names_to_drop(&self, server_env_names: impl Iterator<Item = String>) -> Vec<String> {
+        if self.drop.is_empty() {
+            return vec![];
+        }
+        let candidates: Vec<String> = server_env_names
+            .chain(self.original_values.keys().cloned())
+            .filter(|name| !self.config.contains_key(name) && !name.starts_with("ZELLIJ"))
+            .collect();
+        zellij_utils::session_lifecycle::env_vars_to_drop(
+            &self.drop,
+            candidates.iter().map(|name| name.as_str()),
+        )
     }
 }
 
@@ -2015,6 +2044,68 @@ mod env_sync_tests {
         let name = "ZELLIJ_SESSION_12_ENV_STARTUP_NEW";
         let mut applied = AppliedEnv::at_startup_with(&wanted(&[(name, "new")]), HashMap::new());
         applied.sync(&HashMap::new());
+        assert_eq!(applied.pane_env().get(name), Some(&None));
+    }
+
+    fn patterns(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn pane_env_drop_unsets_a_server_variable_in_new_panes_and_a_reload_changes_it() {
+        let exact = "NKMK_PANE_ENV_DROP_TEST_FPATH";
+        let prefixed = "NKMK_PANE_ENV_DROP_TEST_PREFIX_ONE";
+        let kept = "NKMK_PANE_ENV_DROP_TEST_KEPT";
+        std::env::set_var(exact, "stale");
+        std::env::set_var(prefixed, "stale");
+        std::env::set_var(kept, "fine");
+        let mut applied = AppliedEnv::default();
+        assert_eq!(applied.pane_env().get(exact), None);
+
+        applied.sync_drop(Some(&patterns(&[
+            exact,
+            "NKMK_PANE_ENV_DROP_TEST_PREFIX_*",
+        ])));
+        let pane_env = applied.pane_env();
+        assert_eq!(pane_env.get(exact), Some(&None));
+        assert_eq!(pane_env.get(prefixed), Some(&None));
+        assert_eq!(pane_env.get(kept), None);
+        assert_eq!(std::env::var(exact).unwrap(), "stale");
+
+        applied.sync_drop(None);
+        assert_eq!(applied.pane_env().get(exact), None);
+        for name in [exact, prefixed, kept] {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn pane_env_drop_keeps_what_the_config_sets_and_zellijs_own_variables() {
+        let set_and_dropped = "NKMK_PANE_ENV_DROP_TEST_SET";
+        let own = "ZELLIJ_NKMK_PANE_ENV_DROP_TEST";
+        std::env::set_var(set_and_dropped, "from the shell");
+        std::env::set_var(own, "session");
+        let mut applied = AppliedEnv::default();
+        applied.sync(&wanted(&[(set_and_dropped, "from the config")]));
+        applied.sync_drop(Some(&patterns(&[set_and_dropped, "ZELLIJ*"])));
+        let pane_env = applied.pane_env();
+        assert_eq!(
+            pane_env.get(set_and_dropped),
+            Some(&Some("from the config".to_owned()))
+        );
+        assert_eq!(pane_env.get(own), None);
+        std::env::remove_var(set_and_dropped);
+        std::env::remove_var(own);
+    }
+
+    #[test]
+    fn pane_env_drop_wins_over_restoring_a_value_the_config_no_longer_sets() {
+        let name = "NKMK_PANE_ENV_DROP_TEST_RESTORED";
+        let mut before = HashMap::new();
+        before.insert(name.to_owned(), Some("earlier".to_owned()));
+        let mut applied = AppliedEnv::at_startup_with(&wanted(&[(name, "config")]), before);
+        applied.sync(&HashMap::new());
+        applied.sync_drop(Some(&patterns(&[name])));
         assert_eq!(applied.pane_env().get(name), Some(&None));
     }
 }
@@ -6167,7 +6258,8 @@ fn init_session(
     let default_mode = config.options.default_mode.unwrap_or_default();
     let default_keybinds: SharedKeybinds = Arc::new(config.keybinds.to_keybinds_vec());
     let live_view_captures = crate::pane_mirror::SharedLiveViewCaptures::default();
-    let applied_env = AppliedEnv::at_startup(config.env.inner());
+    let mut applied_env = AppliedEnv::at_startup(config.env.inner());
+    applied_env.sync_drop(config_options.pane_env_drop.as_ref());
 
     let pty_thread = thread::Builder::new()
         .name("pty".to_string())

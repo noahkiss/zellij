@@ -2161,6 +2161,40 @@ silent: it describes no choice of the operator's. A variable the detection does 
 `ServerLaunch::command`). Tests: the list holds the contract's two and every identity variable the
 table reads, and nothing else; the server command removes every one of them.
 
+### Environment variables dropped from every new pane
+
+```kdl
+pane_env_drop "FPATH" "MY_PREFIX_*"
+```
+
+A pane inherits the server's environment, and the server's environment is frozen when the session
+is created. A variable that a shell exported then, and that has since gone stale, reaches every new
+pane for the life of the session. A dotfiles fix cannot reach it, because the pane shell starts
+from the stale value. The case that found it was an exported `FPATH`. An inherited `FPATH` replaces
+zsh's built-in `fpath`, so every new shell lost zsh's own functions directory and `compinit`
+failed.
+
+- **Every pane the server spawns** drops the named variables: a new pane, a new tab, a layout
+  pane, `zellij run`, an editor pane. Names match exactly, or by prefix with a trailing `*`,
+  exactly as `session_restart_drop_env` does.
+- **A config reload applies a changed list** to every pane spawned after it, so a live session
+  takes the fix without a restart. A running pane keeps its own environment, because nothing can
+  change a running process's environment.
+- **A name the config's `env {}` block sets is kept.** Setting a variable is the more specific
+  request.
+- **zellij's own `ZELLIJ*` variables are never dropped.** A pane without them cannot find its
+  session.
+
+The server's own environment is untouched, so the server still resolves commands with its own
+`PATH`. To keep a variable out of the server as well, name it in `session_restart_drop_env`, which
+acts when a session is created. The two keys answer different questions. `session_restart_drop_env`
+is about what a new server inherits. `pane_env_drop` is about what a running server hands out.
+
+It never crosses the wire. The field is `#[clap(skip)]` like `session_restart_drop_env`, and
+`protobuf_conversion.rs` reads it as `None`. It is a top-level key, so an older build ignores it,
+and the shared config can carry it before every machine runs this build. Capability:
+`pane-env-drop`. Code: `AppliedEnv` in `zellij-server/src/lib.rs`, with its tests.
+
 ### A dangling `SSH_AUTH_SOCK` is dropped when a session is created
 
 A stale agent socket is worse than none. With no `SSH_AUTH_SOCK` at all, `ssh` and `git push` fall

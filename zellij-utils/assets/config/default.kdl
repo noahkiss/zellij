@@ -716,6 +716,15 @@ context_menu {
 //
 // session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
 
+// Environment variables unset in every pane this session spawns
+// A pane inherits the server's environment, frozen when the session was created, so a variable
+// that went stale since then reaches every new pane. A config reload applies a changed list to
+// the panes spawned after it. A name `env {}` sets is kept; zellij's own ZELLIJ* names are kept
+// Same patterns as session_restart_drop_env
+// Default: drop nothing
+//
+// pane_env_drop "FPATH"
+
 // Extra directives for the init-system unit `zellij session enable` writes
 // A generated unit cannot know the local facts - that this session must start after some other
 // service, that it wants a particular nice level - so they are named here, where `zellij session
