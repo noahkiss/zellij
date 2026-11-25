@@ -913,16 +913,13 @@ pub(crate) fn background_jobs_main(
                 let should_spawn = {
                     let mut pending = pending_attention_idle_checks.lock().unwrap();
                     let deadline = Instant::now() + Duration::from_millis(delay_ms);
-                    let should_spawn = !pending.contains_key(&pane_id);
-                    pending.insert(pane_id, deadline);
-                    should_spawn
+                    arm_attention_idle_check(&mut pending, pane_id, deadline)
                 };
                 if should_spawn {
                     runtime.spawn({
                         let senders = bus.senders.clone();
                         let pending = pending_attention_idle_checks.clone();
                         async move {
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             loop {
                                 let next_sleep_duration = {
                                     let mut pending = pending.lock().unwrap();
@@ -1320,6 +1317,24 @@ fn drain_web_requests(in_flight: &AtomicUsize, timeout: Duration) {
             return;
         }
         std::thread::sleep(WEB_REQUEST_DRAIN_POLL_INTERVAL);
+    }
+}
+
+/// Records an attention idle check for `pane_id` due at `deadline`, and says whether a timer
+/// task has to be spawned for it. The earliest pending deadline wins: a later request never
+/// postpones an earlier one (a command check behind an idle check), and an earlier one gets a
+/// timer of its own. Firing early is safe - `idle_check` re-arms whatever is not yet due.
+fn arm_attention_idle_check(
+    pending: &mut HashMap<PaneId, Instant>,
+    pane_id: PaneId,
+    deadline: Instant,
+) -> bool {
+    match pending.get(&pane_id) {
+        Some(existing) if *existing <= deadline => false,
+        _ => {
+            pending.insert(pane_id, deadline);
+            true
+        },
     }
 }
 
@@ -1974,5 +1989,41 @@ mod web_request_tests {
             web_request_error_kind(&refused),
             web_request_error_kind(&timed_out)
         );
+    }
+}
+
+#[cfg(test)]
+mod attention_idle_check_tests {
+    use super::*;
+
+    const PANE: PaneId = PaneId::Terminal(1);
+
+    #[test]
+    fn a_later_idle_check_never_postpones_an_earlier_one() {
+        let mut pending = HashMap::new();
+        let now = Instant::now();
+        let command_check = now + Duration::from_millis(1_000);
+        assert!(arm_attention_idle_check(&mut pending, PANE, command_check));
+        arm_attention_idle_check(&mut pending, PANE, now + Duration::from_millis(5_000));
+        assert_eq!(pending[&PANE], command_check);
+    }
+
+    #[test]
+    fn an_earlier_idle_check_gets_a_timer_of_its_own() {
+        let mut pending = HashMap::new();
+        let now = Instant::now();
+        assert!(arm_attention_idle_check(
+            &mut pending,
+            PANE,
+            now + Duration::from_millis(5_000)
+        ));
+        let sooner = now + Duration::from_millis(500);
+        assert!(arm_attention_idle_check(&mut pending, PANE, sooner));
+        assert_eq!(pending[&PANE], sooner);
+        assert!(!arm_attention_idle_check(
+            &mut pending,
+            PANE,
+            now + Duration::from_millis(800)
+        ));
     }
 }
