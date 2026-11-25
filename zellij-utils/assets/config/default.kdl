@@ -259,6 +259,19 @@ context_menu {
 //
 // pane_frame_handle false
 
+// How long, in milliseconds, your input is held after a coding agent's CLI or MCP call moves your
+// focused pane, tab or input mode. While it holds, typing goes to the pane you were in, keys bound to
+// an action and mouse clicks are dropped, and the wheel passes. Typing that keeps coming keeps it up
+// until you pause this long, at most 3 seconds. 0 turns it off. A reload applies it
+// Default: 500
+//
+// input_guard_ms 500
+
+// Where typing goes while the input guard holds: "previous" (the pane you were in) or "drop"
+// Default: "previous"
+//
+// input_guard_typing "previous"
+
 // Set the pane frame style when pane_frames is enabled
 // Options:
 //   - titles (default - draw a title above each pane)

@@ -442,6 +442,7 @@ impl InputHandler {
                     terminal_id: None,
                     client_id,
                     is_cli_client: false,
+                    caller: Default::default(),
                 });
                 self.exit(ExitReason::Normal);
                 should_break = true;
@@ -452,6 +453,7 @@ impl InputHandler {
                     terminal_id: None,
                     client_id,
                     is_cli_client: false,
+                    caller: Default::default(),
                 });
                 self.exit(ExitReason::NormalDetached);
                 should_break = true;
@@ -462,6 +464,7 @@ impl InputHandler {
                     terminal_id: None,
                     client_id,
                     is_cli_client: false,
+                    caller: Default::default(),
                 });
                 self.exit(ExitReason::NormalDetached);
                 should_break = true;
@@ -490,6 +493,7 @@ impl InputHandler {
                     terminal_id: None,
                     client_id,
                     is_cli_client: false,
+                    caller: Default::default(),
                 });
                 self.command_is_executing
                     .wait_until_input_thread_is_unblocked();
@@ -508,6 +512,7 @@ impl InputHandler {
                 terminal_id: None,
                 client_id,
                 is_cli_client: false,
+                caller: Default::default(),
             }),
         }
 

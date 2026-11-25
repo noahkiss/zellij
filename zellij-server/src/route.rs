@@ -407,7 +407,20 @@ pub(crate) fn route_action(
         os_input,
         is_cli_client,
         None,
+        None,
     )
+}
+
+/// fork addition: the input guard, when it is on - what routes the person's own typing through
+/// `ScreenInstruction::PersonWrite`. Off (`input_guard_ms 0`), `None`, and every write takes the
+/// old path.
+fn person_input_guard(
+    input_guards: &crate::input_guard::SharedInputGuards,
+) -> Option<crate::input_guard::SharedInputGuards> {
+    input_guards
+        .lock()
+        .map_or(false, |guards| guards.enabled())
+        .then(|| input_guards.clone())
 }
 
 pub(crate) fn route_bound_mouse_action(
@@ -440,6 +453,7 @@ pub(crate) fn route_bound_mouse_action(
         None,
         false,
         origin_pane_id,
+        None,
     )
 }
 
@@ -455,6 +469,7 @@ fn route_action_with_origin(
     os_input: Option<Box<dyn ServerOsApi>>,
     is_cli_client: bool,
     origin_pane_id: Option<PaneId>,
+    person_guard: Option<crate::input_guard::SharedInputGuards>,
 ) -> Result<(bool, Option<ActionCompletionResult>)> {
     let mut should_break = false;
     let err_context = || format!("failed to route action for client {client_id}");
@@ -504,6 +519,22 @@ fn route_action_with_origin(
         Action::ToggleTab => {
             senders
                 .send_to_screen(ScreenInstruction::ToggleTab(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::Write {
+            key_with_modifier,
+            bytes: raw_bytes,
+            is_kitty_keyboard_protocol,
+        } if person_guard.is_some() => {
+            // fork addition: the person's own typing, which an input guard may route elsewhere
+            senders
+                .send_to_screen(ScreenInstruction::PersonWrite(
+                    key_with_modifier,
+                    raw_bytes,
+                    is_kitty_keyboard_protocol,
                     client_id,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
@@ -3590,6 +3621,40 @@ pub(crate) fn route_thread_main(
                             if let Some((senders, default_shell, client_input_mode, key_actions)) =
                                 dispatch_inputs
                             {
+                                // fork addition: under an input guard a key bound to an action
+                                // is dropped; plain typing (a lone write) goes on, to be routed
+                                // by the screen. A popup's keys are its own and pass
+                                let input_guards = session_data
+                                    .read()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map(|s| s.input_guards.clone());
+                                let person_guard =
+                                    input_guards.as_ref().and_then(person_input_guard);
+                                let routes_only = key_actions
+                                    .iter()
+                                    .all(|action| matches!(action, PopupKeyAction::Route(_)));
+                                let is_plain_typing = matches!(
+                                    key_actions.as_slice(),
+                                    [PopupKeyAction::Route(Action::Write { .. })]
+                                );
+                                if routes_only
+                                    && !is_plain_typing
+                                    && person_guard.as_ref().map_or(false, |guards| {
+                                        guards.lock().map_or(false, |guards| {
+                                            guards.drops_bound_keys(
+                                                client_id,
+                                                std::time::Instant::now(),
+                                            )
+                                        })
+                                    })
+                                {
+                                    log::info!(
+                                        "input guard: dropped a bound key from client {}",
+                                        client_id
+                                    );
+                                    return Ok(should_break);
+                                }
                                 for key_action in key_actions {
                                     let action = match key_action {
                                         PopupKeyAction::Route(action) => action,
@@ -3673,6 +3738,7 @@ pub(crate) fn route_thread_main(
                                         Some(os_input.clone()),
                                         false,
                                         origin_pane_id,
+                                        person_guard.clone(),
                                     ) {
                                         Ok(route_action_should_break) => {
                                             if route_action_should_break.0 {
@@ -3691,6 +3757,7 @@ pub(crate) fn route_thread_main(
                             terminal_id: maybe_pane_id,
                             client_id: maybe_client_id,
                             is_cli_client,
+                            caller,
                         } => {
                             let cli_client_id = client_id;
                             let client_id = if is_cli_client {
@@ -3753,23 +3820,68 @@ pub(crate) fn route_thread_main(
                                         s.default_shell.clone(),
                                         s.session_configuration
                                             .get_client_default_input_mode(&client_id),
+                                        s.input_guards.clone(),
                                     )
                                 });
-                            if let Some((senders, default_shell, client_input_mode)) =
+                            if let Some((senders, default_shell, client_input_mode, input_guards)) =
                                 session_data_assets
                             {
-                                match route_action(
+                                // fork addition: the input guard. An attached client's own
+                                // action is the person's: a click under a guard is dropped,
+                                // and a write (a paste) may be routed by the screen. An agent's
+                                // CLI call is bracketed, so the screen can see whom it moved
+                                let person_guard = if is_cli_client {
+                                    None
+                                } else {
+                                    person_input_guard(&input_guards)
+                                };
+                                if let (Some(guards), Action::MouseEvent { event }) =
+                                    (&person_guard, &action)
+                                {
+                                    let passes = guards.lock().map_or(true, |mut guards| {
+                                        guards.mouse_passes(
+                                            client_id,
+                                            event,
+                                            std::time::Instant::now(),
+                                        )
+                                    });
+                                    if !passes {
+                                        log::info!(
+                                            "input guard: dropped a mouse {:?} from client {}",
+                                            event.event_type,
+                                            client_id
+                                        );
+                                        return Ok(should_break);
+                                    }
+                                }
+                                let agent_call = is_cli_client
+                                    && caller.agent
+                                    && person_input_guard(&input_guards).is_some();
+                                if agent_call {
+                                    let _ = senders.send_to_screen(
+                                        ScreenInstruction::InputGuardSnapshot(cli_client_id),
+                                    );
+                                }
+                                let routed = route_action_with_origin(
                                     action,
                                     client_id,
                                     Some(cli_client_id),
                                     maybe_pane_id.map(|p| PaneId::Terminal(p)),
-                                    senders,
+                                    senders.clone(),
                                     default_shell,
                                     Some(&mut seen_cli_pipes),
                                     client_input_mode,
                                     Some(os_input.clone()),
                                     is_cli_client,
-                                ) {
+                                    None,
+                                    person_guard,
+                                );
+                                if agent_call {
+                                    let _ = senders.send_to_screen(
+                                        ScreenInstruction::InputGuardArm(cli_client_id),
+                                    );
+                                }
+                                match routed {
                                     Ok(route_action_should_break) => {
                                         if route_action_should_break.0 {
                                             should_break = true;
@@ -3790,6 +3902,7 @@ pub(crate) fn route_thread_main(
                                     terminal_id: maybe_pane_id,
                                     client_id: maybe_client_id,
                                     is_cli_client,
+                                    caller,
                                 });
                             }
                         },
@@ -5515,5 +5628,68 @@ mod tests {
         assert_eq!(cloned.affected_tab_id, Some(99));
         // But channel should be None (as per the Clone implementation comment)
         assert!(cloned.channel.is_none());
+    }
+
+    /// fork addition: `input_guard_ms 0` takes the old path - the person's writes go out as
+    /// `WriteCharacter`, exactly as before the guard existed. On, they go as `PersonWrite`.
+    #[test]
+    fn input_guard_ms_0_routes_the_persons_typing_the_old_way() {
+        let write = || Action::Write {
+            key_with_modifier: None,
+            bytes: b"a".to_vec(),
+            is_kitty_keyboard_protocol: false,
+        };
+        // the routed write is read, then dropped, which ends the action for the route call
+        let sent = |guards: &crate::input_guard::SharedInputGuards| {
+            let (to_screen, screen_rx) = crossbeam::channel::unbounded();
+            let senders = ThreadSenders {
+                to_screen: Some(SenderWithContext::new(to_screen)),
+                should_silently_fail: true,
+                ..Default::default()
+            };
+            let person_guard = person_input_guard(guards);
+            let routing = std::thread::spawn(move || {
+                let _ = route_action_with_origin(
+                    write(),
+                    1,
+                    None,
+                    None,
+                    senders,
+                    None,
+                    None,
+                    InputMode::Normal,
+                    None,
+                    false,
+                    None,
+                    person_guard,
+                );
+            });
+            let instruction = loop {
+                let (instruction, _) = screen_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the write reaches the screen");
+                if matches!(
+                    instruction,
+                    ScreenInstruction::WriteCharacter(..) | ScreenInstruction::PersonWrite(..)
+                ) {
+                    break instruction;
+                }
+            };
+            let kind = match instruction {
+                ScreenInstruction::WriteCharacter(..) => "WriteCharacter",
+                _ => "PersonWrite",
+            };
+            drop(instruction);
+            routing.join().unwrap();
+            kind
+        };
+        let guards = crate::input_guard::SharedInputGuards::default();
+        assert_eq!(sent(&guards), "PersonWrite");
+        guards
+            .lock()
+            .unwrap()
+            .configure(0, crate::input_guard::Typing::Previous);
+        assert!(person_input_guard(&guards).is_none());
+        assert_eq!(sent(&guards), "WriteCharacter");
     }
 }

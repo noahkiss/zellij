@@ -958,6 +958,18 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub pane_frame_handle: Option<bool>,
+    /// How long, in milliseconds, a client's input is held after an agent's CLI or MCP call moves
+    /// its focused pane, tab or input mode: typing goes to the pane it was in, bound keys and clicks
+    /// are dropped. 0 turns the guard off. Read by the session server, at start and on reload.
+    /// Unset means 500
+    #[clap(skip)]
+    #[serde(default)]
+    pub input_guard_ms: Option<u64>,
+    /// Where typing goes while the input guard holds: "previous" (the pane the person was in) or
+    /// "drop". Read by the session server, at start and on reload. Unset means "previous"
+    #[clap(skip)]
+    #[serde(default)]
+    pub input_guard_typing: Option<String>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1226,6 +1238,10 @@ impl Options {
             .mcp_wait_timeout
             .or_else(|| self.mcp_wait_timeout.clone());
         let pane_frame_handle = other.pane_frame_handle.or(self.pane_frame_handle);
+        let input_guard_ms = other.input_guard_ms.or(self.input_guard_ms);
+        let input_guard_typing = other
+            .input_guard_typing
+            .or_else(|| self.input_guard_typing.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1330,6 +1346,8 @@ impl Options {
             agent_message_quiet,
             mcp_wait_timeout,
             pane_frame_handle,
+            input_guard_ms,
+            input_guard_typing,
         }
     }
 
@@ -1536,6 +1554,10 @@ impl Options {
             .mcp_wait_timeout
             .or_else(|| self.mcp_wait_timeout.clone());
         let pane_frame_handle = other.pane_frame_handle.or(self.pane_frame_handle);
+        let input_guard_ms = other.input_guard_ms.or(self.input_guard_ms);
+        let input_guard_typing = other
+            .input_guard_typing
+            .or_else(|| self.input_guard_typing.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1640,6 +1662,8 @@ impl Options {
             agent_message_quiet,
             mcp_wait_timeout,
             pane_frame_handle,
+            input_guard_ms,
+            input_guard_typing,
         }
     }
 

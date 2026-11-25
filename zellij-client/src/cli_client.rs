@@ -264,6 +264,7 @@ impl PipeRequest {
             terminal_id: self.pane_id,
             client_id: None,
             is_cli_client: true,
+            caller: Default::default(),
         }
     }
 }
@@ -1128,6 +1129,7 @@ fn ask(
         terminal_id: None,
         client_id: None,
         is_cli_client: true,
+        caller: Default::default(),
     });
     let answer = loop {
         match os_input.recv_from_server() {
@@ -1305,11 +1307,15 @@ fn individual_messages_client(
     pane_id: Option<u32>,
 ) -> ActionOutcome {
     let is_blocking = action_answers_with_its_own_report(&action);
+    // fork addition: the server holds the person's input briefly when an agent's call moves
+    // their focus, so it needs to know which this is
+    let caller = zellij_utils::ipc::ActionCaller::from_env(|name| os_input.env_variable(name));
     let msg = ClientToServerMsg::Action {
         action,
         terminal_id: pane_id,
         client_id: None,
         is_cli_client: true,
+        caller,
     };
     os_input.send_to_server(msg);
     loop {
@@ -2466,6 +2472,7 @@ fn ask_in_sequence(os_input: &mut Box<dyn ClientOsApi>, action: Action) -> Answe
         terminal_id: None,
         client_id: None,
         is_cli_client: true,
+        caller: Default::default(),
     });
     let mut answer = Answer::Reported(Vec::new());
     loop {

@@ -159,6 +159,7 @@ pub fn send_actions_to_session(session_name: &str, actions: Vec<Action>) -> Resu
             terminal_id: None,
             client_id: None,
             is_cli_client: true,
+            caller: Default::default(),
         })?;
         loop {
             match link.recv(PEER_ACTION_TIMEOUT)? {

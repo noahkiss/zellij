@@ -102,11 +102,18 @@ impl From<ClientToServerMsg> for ProtoClientToServerMsg {
                 terminal_id,
                 client_id,
                 is_cli_client,
+                caller,
             } => client_to_server_msg::Message::Action(ActionMsg {
                 action: Some(action.into()),
                 terminal_id,
                 client_id: client_id.map(|id| id as u32),
                 is_cli_client,
+                // a person sends none, so an attached client's messages are unchanged
+                caller: (caller != crate::ipc::ActionCaller::default()).then(|| {
+                    crate::client_server_contract::client_server_contract::ActionCaller {
+                        agent: caller.agent,
+                    }
+                }),
             }),
             ClientToServerMsg::Key {
                 key,
@@ -352,6 +359,12 @@ impl TryFrom<ProtoClientToServerMsg> for ClientToServerMsg {
                 terminal_id: action.terminal_id,
                 client_id: action.client_id.map(|id| id as ClientId),
                 is_cli_client: action.is_cli_client,
+                caller: action
+                    .caller
+                    .map(|caller| crate::ipc::ActionCaller {
+                        agent: caller.agent,
+                    })
+                    .unwrap_or_default(),
             }),
             Some(client_to_server_msg::Message::Key(key)) => Ok(ClientToServerMsg::Key {
                 key: key.key.ok_or_else(|| anyhow!("Missing key"))?.try_into()?,
@@ -1329,6 +1342,8 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             agent_message_quiet: None,
             mcp_wait_timeout: None,
             pane_frame_handle: None,
+            input_guard_ms: None,
+            input_guard_typing: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

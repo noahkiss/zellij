@@ -167,6 +167,7 @@ pub fn paste_message_into(
         terminal_id: None,
         client_id: None,
         is_cli_client: false,
+        caller: Default::default(),
     }
 }
 
@@ -300,6 +301,7 @@ mod tests {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             }
         );
         assert_eq!(msg, paste_message("pasted".to_owned()));

@@ -387,6 +387,7 @@ impl Desktop {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: true,
+                caller: Default::default(),
             })
             .unwrap();
             loop {
@@ -454,6 +455,7 @@ impl Desktop {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: true,
+                caller: Default::default(),
             })
             .unwrap();
             let _ = link.recv(Duration::from_secs(5));
@@ -493,6 +495,7 @@ impl Desktop {
             terminal_id: None,
             client_id: None,
             is_cli_client: true,
+            caller: Default::default(),
         })
         .ok()?;
         loop {
@@ -810,6 +813,7 @@ impl Desktop {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: true,
+                caller: Default::default(),
             })
             .unwrap();
             loop {
@@ -905,6 +909,7 @@ impl Desktop {
             terminal_id: None,
             client_id: None,
             is_cli_client: true,
+            caller: Default::default(),
         })
         .ok()?;
         loop {
@@ -1316,6 +1321,7 @@ impl Desktop {
             terminal_id: None,
             client_id: None,
             is_cli_client: true,
+            caller: Default::default(),
         })
         .ok()?;
         loop {
@@ -1383,6 +1389,7 @@ impl Desktop {
             terminal_id: None,
             client_id: Some(client),
             is_cli_client: false,
+            caller: Default::default(),
         })
         .unwrap();
     }

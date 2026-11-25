@@ -151,6 +151,7 @@ fn cli_message(action: Action) -> ClientToServerMsg {
         terminal_id: None,
         client_id: None,
         is_cli_client: true,
+        caller: Default::default(),
     }
 }
 

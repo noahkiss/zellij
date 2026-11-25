@@ -6,6 +6,7 @@ mod os_input_output_unix;
 mod os_input_output_windows;
 
 pub mod host_query;
+pub mod input_guard;
 pub mod os_input_output;
 pub mod output;
 mod pane_handles;
@@ -1099,6 +1100,8 @@ pub(crate) struct SessionMetaData {
     pub popup_clients: HashSet<ClientId>,
     pub modal_popup_clients: HashSet<ClientId>,
     pub live_view_captures: crate::pane_mirror::SharedLiveViewCaptures,
+    /// fork addition: the input guard, shared with the screen thread. See `input_guard`.
+    pub input_guards: crate::input_guard::SharedInputGuards,
     pub terminal_command_submitted: Arc<std::sync::atomic::AtomicBool>,
     pub web_sharing: WebSharing, // this is a special attribute explicitly set on session
     // initialization because we don't want it to be overridden by
@@ -1436,6 +1439,17 @@ impl SessionMetaData {
                 .send_to_screen(ScreenInstruction::SetPaneFrameHandle(
                     new_config.options.pane_frame_handle.unwrap_or(true),
                 ));
+            let _ = self
+                .senders
+                .send_to_screen(ScreenInstruction::SetInputGuard {
+                    guard_ms: new_config
+                        .options
+                        .input_guard_ms
+                        .unwrap_or(crate::input_guard::DEFAULT_GUARD_MS),
+                    typing: crate::input_guard::Typing::from_config(
+                        new_config.options.input_guard_typing.as_deref(),
+                    ),
+                });
             let _ = self
                 .senders
                 .send_to_screen(ScreenInstruction::SetAgentMailTimings {
@@ -3065,6 +3079,7 @@ mod session_state_tests {
             popup_clients: HashSet::new(),
             modal_popup_clients: HashSet::new(),
             live_view_captures: Default::default(),
+            input_guards: Default::default(),
             terminal_command_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             web_sharing: WebSharing::Off,
             screen_thread: None,
@@ -6279,6 +6294,7 @@ fn init_session(
     let default_mode = config.options.default_mode.unwrap_or_default();
     let default_keybinds: SharedKeybinds = Arc::new(config.keybinds.to_keybinds_vec());
     let live_view_captures = crate::pane_mirror::SharedLiveViewCaptures::default();
+    let input_guards = crate::input_guard::SharedInputGuards::default();
     let mut applied_env = AppliedEnv::at_startup(config.env.inner());
     applied_env.sync_drop(config_options.pane_env_drop.as_ref());
 
@@ -6336,6 +6352,7 @@ fn init_session(
             let default_keybinds = default_keybinds.clone();
             let session_id = session_id.clone();
             let live_view_captures = live_view_captures.clone();
+            let input_guards = input_guards.clone();
             move || {
                 screen_thread_main(
                     screen_bus,
@@ -6347,6 +6364,7 @@ fn init_session(
                     default_keybinds,
                     session_id,
                     live_view_captures,
+                    input_guards,
                 )
                 .fatal();
             }
@@ -6539,6 +6557,7 @@ fn init_session(
         popup_clients: HashSet::new(),
         modal_popup_clients: HashSet::new(),
         live_view_captures,
+        input_guards,
         terminal_command_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         applied_env,
         sent_terminal_settings: HashMap::new(),

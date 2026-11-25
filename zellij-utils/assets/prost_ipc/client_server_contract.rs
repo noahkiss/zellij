@@ -4537,6 +4537,17 @@ pub struct ActionMsg {
     pub client_id: ::core::option::Option<u32>,
     #[prost(bool, tag="4")]
     pub is_cli_client: bool,
+    /// fork addition: who ran the CLI call. Absent from an older client, which reads as a person
+    #[prost(message, optional, tag="5")]
+    pub caller: ::core::option::Option<ActionCaller>,
+}
+/// fork addition: what the CLI process knew about its caller
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ActionCaller {
+    /// the CLI process passed the agent test (`caller_is_agent`)
+    #[prost(bool, tag="1")]
+    pub agent: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

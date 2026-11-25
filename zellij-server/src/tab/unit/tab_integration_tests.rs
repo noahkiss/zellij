@@ -21254,3 +21254,46 @@ fn pane_frame_handle_false_hides_the_handle_on_the_frame_only() {
         "and drawn again once shown"
     );
 }
+
+/// fork addition: while an input guard holds a client's input, the pane an agent focused says so
+/// on that client's frame, and stops saying so when the guard ends.
+#[test]
+fn an_input_guard_marks_the_focused_pane_on_its_clients_frame() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab(size, ModeInfo::default());
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+    let frame = |tab: &mut Tab| {
+        tab.set_force_render();
+        let mut output = Output::default();
+        tab.render(&mut output, None).unwrap();
+        take_snapshot(
+            output.serialize().unwrap().get(&client_id).unwrap().ansi(),
+            size.rows,
+            size.cols,
+            Palette::default(),
+        )
+    };
+    let marker = crate::ui::pane_contents_and_ui::INPUT_GUARD_MARKER;
+    assert!(!frame(&mut tab).contains(marker));
+    crate::ui::pane_contents_and_ui::set_input_guard_markers(
+        [(client_id, PaneId::Terminal(2))].into_iter().collect(),
+    );
+    let held = frame(&mut tab);
+    crate::ui::pane_contents_and_ui::set_input_guard_markers(Default::default());
+    assert!(held.contains(marker), "{}", held);
+    assert!(!frame(&mut tab).contains(marker), "and gone once it ends");
+}

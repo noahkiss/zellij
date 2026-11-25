@@ -146,6 +146,7 @@ impl FakeClientHandle {
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         };
         if let Some(sender) = self.server_sender.lock().unwrap().as_mut() {
             let _ = sender.send_client_msg(msg);

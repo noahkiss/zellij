@@ -9183,6 +9183,78 @@ action carries `no_focus` as before, so the client/server contract does not chan
 decision table, the settled `new-pane` and `new-tab`, the clap conflicts, `zellij run --focus` and `zellij plugin --focus`, and
 agent detection from the environment.
 
+### An agent's focus change holds the person's input briefly (`input_guard_ms`)
+
+```kdl
+input_guard_ms 500             // 0 turns it off; unset, 500
+input_guard_typing "previous"  // or "drop"; unset, "previous"
+```
+
+```
+# the person is typing in terminal_3; an agent runs, from its own pane:
+zellij action go-to-tab 2
+# before: the rest of the word lands in tab 2, and a chord fires there
+# after:  for 500 ms the typing still goes to terminal_3, a chord or click is dropped,
+#         and tab 2's focused frame says "input held"
+```
+
+When an agent's CLI or MCP call moves a client's focused pane, focused tab or input mode, that
+client's input is guarded for `input_guard_ms`. The caller is an agent by the same test as "An
+agent's new pane or tab leaves the person's focus alone" (`caller_is_agent`). The person's own keys
+and mouse, a plugin, and a CLI call with no agent variable (a person's alias, a script) never start
+one. Closing a pane counts when it moves the person's focus.
+
+While the guard holds:
+
+| Input | Goes to |
+|---|---|
+| plain typing: characters, Enter, Backspace, a paste (a key that resolves to a write, with no binding) | the pane the person was in, if it still exists, through the normal write path; with `"drop"`, or when that pane is gone, nowhere |
+| a key bound to an action: a chord, a mode key | dropped |
+| a mouse press | dropped, with its drag and its release |
+| a release whose press passed | passes, always |
+| the wheel, a hover | passes |
+
+Typing that keeps coming keeps the guard up until the person pauses for `input_guard_ms`, at most
+3 s from its start (or `input_guard_ms`, if longer), so a word is not split across two panes. A
+second agent move during a guard restarts its clock and keeps the pane the person was in first.
+A mode change alone guards chords and clicks; the typing still goes where it was going.
+
+Redirected typing is written by `Tab::write_to_pane_id` with the client's id, the path a focused
+pane gets, so the agent-message draft and quiet tracking (`input_since_state`) see it. An agent's
+own writes are never guarded: they are CLI actions, not the person's input.
+
+**Fail open.** A guard ends on the clock: its end is computed from its start at every question, so
+no timer has to fire. It also ends when its client detaches, when its client leaves a tab
+(`drain_connected_clients`, unless an agent's call is mid-move), and when the client's focus moves
+by anything that is not an agent's call. A dropped press is forgotten at the next press of that
+button, so a lost release cannot hold the mouse (see nkmk.45's held gestures). `input_guard_ms 0`
+sends nothing new: the person's writes go out as `WriteCharacter` and no agent call is bracketed.
+
+How it works. The CLI sends one carrier on every action, `ActionCaller { agent }`. The route thread
+brackets an agent's call with `InputGuardSnapshot` and `InputGuardArm`; the screen compares every
+client's tab, pane and mode before and after and arms a guard for each client that moved. The
+route thread drops bound keys and clicks from the shared state; the screen routes typing, which
+arrives as `PersonWrite`, so a key sent before the move but handled after it is still judged
+right. The frame marker is the pane note slot, drawn for the guarded client only.
+
+`zellij-server/src/input_guard.rs` (the rules, as plain data with `now` passed in), the hooks in
+`route.rs` and `screen.rs` (`arm_input_guards`, `route_guarded_typing`,
+`sync_input_guard_markers`), the marker in `ui/pane_contents_and_ui.rs`, the carrier in
+`zellij-utils/src/ipc.rs` and `zellij-client/src/cli_client.rs`. Tests: the rules in
+`input_guard.rs`; in `screen_tests.rs` an agent's tab switch routing typing back, a move with no
+agent call, `input_guard_ms 0`, a gone pane, a move that is not the agent's, a second agent move,
+and the drain; in `route.rs` the old write path at 0; the config keys in `kdl/mod.rs`; the carrier
+round trip.
+
+Contract: `ActionMsg` gains `ActionCaller caller = 5`, a new optional message after
+`is_cli_client = 4`; `ActionCaller` is new, with `bool agent = 1`. Nothing existing changes or is
+renumbered, so the contract version stays. A server from before it skips the field: no guard. A
+client from before it sends none, which reads as a person. An attached client never sets it. The
+prost output was edited by hand to match what `cargo xtask proto` writes for those lines.
+
+Older builds warn about the two unknown top-level keys and run without a guard. Capability:
+`input-guard`.
+
 ### A pane made without focus in a full tab leaves the focus alone
 
 ```

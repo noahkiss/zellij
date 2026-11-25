@@ -361,6 +361,7 @@ pub fn request_force_close(
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             },
         ),
         _ => request_detach(sender, role),
@@ -374,6 +375,7 @@ pub fn request_detach(sender: &SharedSender, role: Role) -> Result<()> {
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         },
         Role::Watcher => {
             crate::input::keyboard::key_press_message(KeyWithModifier::new(BareKey::Esc))
@@ -854,6 +856,7 @@ mod tests {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             }
         );
     }

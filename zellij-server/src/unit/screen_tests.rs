@@ -585,6 +585,7 @@ impl MockScreen {
         let debug = false;
         let default_keybinds = std::sync::Arc::new(config.keybinds.to_keybinds_vec());
         let live_view_captures = self.session_metadata.live_view_captures.clone();
+        let input_guards = self.session_metadata.input_guards.clone();
         let screen_thread = std::thread::Builder::new()
             .name("screen_thread".to_string())
             .spawn(move || {
@@ -599,6 +600,7 @@ impl MockScreen {
                     default_keybinds,
                     "test-session-id".to_string(),
                     live_view_captures,
+                    input_guards,
                 )
                 .expect("TEST")
             })
@@ -671,6 +673,7 @@ impl MockScreen {
         .should_silently_fail();
         let default_keybinds = std::sync::Arc::new(config.keybinds.to_keybinds_vec());
         let live_view_captures = self.session_metadata.live_view_captures.clone();
+        let input_guards = self.session_metadata.input_guards.clone();
         std::thread::Builder::new()
             .name("screen_thread".to_string())
             .spawn(move || {
@@ -685,6 +688,7 @@ impl MockScreen {
                     default_keybinds,
                     "test-session-id".to_string(),
                     live_view_captures,
+                    input_guards,
                 )
                 .expect("TEST")
             })
@@ -712,6 +716,7 @@ impl MockScreen {
         let debug = false;
         let default_keybinds = std::sync::Arc::new(config.keybinds.to_keybinds_vec());
         let live_view_captures = self.session_metadata.live_view_captures.clone();
+        let input_guards = self.session_metadata.input_guards.clone();
         let screen_thread = std::thread::Builder::new()
             .name("screen_thread".to_string())
             .spawn(move || {
@@ -726,6 +731,7 @@ impl MockScreen {
                     default_keybinds,
                     "test-session-id".to_string(),
                     live_view_captures,
+                    input_guards,
                 )
                 .expect("TEST")
             })
@@ -956,6 +962,7 @@ impl MockScreen {
             popup_clients: self.session_metadata.popup_clients.clone(),
             modal_popup_clients: self.session_metadata.modal_popup_clients.clone(),
             live_view_captures: self.session_metadata.live_view_captures.clone(),
+            input_guards: self.session_metadata.input_guards.clone(),
             terminal_command_submitted: self.session_metadata.terminal_command_submitted.clone(),
         }
     }
@@ -1020,6 +1027,7 @@ impl MockScreen {
             popup_clients: Default::default(),
             modal_popup_clients: Default::default(),
             live_view_captures: Default::default(),
+            input_guards: Default::default(),
             terminal_command_submitted: Default::default(),
         };
 
@@ -26246,4 +26254,136 @@ fn a_cancelled_message_is_never_typed_and_a_delivered_one_cannot_be_cancelled() 
     assert_eq!(refused.map(|record| record.status), Some(Status::Delivered));
     // an id this session never gave
     assert_eq!(screen.agent_mail.cancel("999", 7), Err(None));
+}
+
+// =====================================================================
+// fork addition: the input guard
+// =====================================================================
+
+/// Two tabs, one pane each (terminal 1 in the first, terminal 2 in the second), client 1
+/// looking at the second.
+fn screen_with_two_tabs_for_the_input_guard() -> (Screen, ForwardCapture) {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, capture) = create_new_screen_with_forward_capture(size);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    assert_eq!(screen.get_active_pane_id(&1), Some(PaneId::Terminal(2)));
+    capture.drain_pty_writes();
+    (screen, capture)
+}
+
+/// What an agent's `go-to-tab` does to the screen: the snapshot, the move, the arm.
+fn agent_switches_tab(screen: &mut Screen) -> bool {
+    let spots = screen.input_guard_spots();
+    screen.input_guard_snapshots.insert(99, spots);
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    screen.arm_input_guards(99)
+}
+
+#[test]
+fn an_agents_tab_switch_routes_the_persons_typing_to_the_pane_they_were_in() {
+    let (mut screen, capture) = screen_with_two_tabs_for_the_input_guard();
+    assert!(agent_switches_tab(&mut screen), "the move is guarded");
+    assert_eq!(screen.get_active_pane_id(&1), Some(PaneId::Terminal(1)));
+    assert_eq!(
+        screen.input_guard_markers.get(&1),
+        Some(&PaneId::Terminal(1)),
+        "the newly focused pane carries the marker"
+    );
+    assert!(screen.route_guarded_typing(1, &None, b"ab", false));
+    assert_eq!(
+        capture.drain_pty_writes(),
+        vec![(b"ab".to_vec(), 2)],
+        "the typing reached the pane the person was in, not the one the agent focused"
+    );
+}
+
+#[test]
+fn a_move_with_no_agent_call_around_it_is_not_guarded() {
+    let (mut screen, _capture) = screen_with_two_tabs_for_the_input_guard();
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    assert!(!screen.arm_input_guards(99), "no snapshot, no guard");
+    assert!(!screen.route_guarded_typing(1, &None, b"a", false));
+}
+
+#[test]
+fn input_guard_ms_0_takes_the_old_path() {
+    let (mut screen, capture) = screen_with_two_tabs_for_the_input_guard();
+    screen
+        .input_guards
+        .lock()
+        .unwrap()
+        .configure(0, crate::input_guard::Typing::Previous);
+    assert!(!agent_switches_tab(&mut screen), "nothing is armed");
+    assert!(screen.input_guard_markers.is_empty());
+    assert!(
+        !screen.route_guarded_typing(1, &None, b"a", false),
+        "typing takes the normal path"
+    );
+    assert!(capture.drain_pty_writes().is_empty());
+}
+
+#[test]
+fn typing_for_a_pane_that_is_gone_is_dropped() {
+    let (mut screen, capture) = screen_with_two_tabs_for_the_input_guard();
+    screen.input_guards.lock().unwrap().arm(
+        1,
+        Some(PaneId::Terminal(77)),
+        Some(PaneId::Terminal(2)),
+        std::time::Instant::now(),
+    );
+    assert!(screen.route_guarded_typing(1, &None, b"a", false));
+    assert!(capture.drain_pty_writes().is_empty());
+}
+
+#[test]
+fn a_focus_move_that_is_not_an_agents_ends_the_guard() {
+    let (mut screen, _capture) = screen_with_two_tabs_for_the_input_guard();
+    assert!(agent_switches_tab(&mut screen));
+    // the person's own move (or a script's with no agent env): no snapshot around it
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    screen.sync_input_guard_markers();
+    assert!(screen.input_guard_markers.is_empty(), "the marker went");
+    assert!(
+        !screen.route_guarded_typing(1, &None, b"a", false),
+        "typing takes the normal path again"
+    );
+}
+
+#[test]
+fn a_second_agent_move_keeps_the_first_previous_pane() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, capture) = create_new_screen_with_forward_capture(size);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    new_tab(&mut screen, 3, 2);
+    capture.drain_pty_writes();
+    // the person is in terminal 3; the agent moves them to 1, then to 2
+    assert!(agent_switches_tab(&mut screen));
+    assert!(agent_switches_tab(&mut screen));
+    assert_eq!(screen.get_active_pane_id(&1), Some(PaneId::Terminal(2)));
+    assert!(screen.route_guarded_typing(1, &None, b"x", false));
+    assert_eq!(capture.drain_pty_writes(), vec![(b"x".to_vec(), 3)]);
+}
+
+#[test]
+fn leaving_the_tab_ends_the_guard_unless_an_agent_call_is_moving_it() {
+    let (mut screen, _capture) = screen_with_two_tabs_for_the_input_guard();
+    let held = |screen: &Screen| {
+        screen
+            .input_guards
+            .lock()
+            .unwrap()
+            .active(1, std::time::Instant::now())
+            .is_some()
+    };
+    assert!(agent_switches_tab(&mut screen));
+    // an agent call still running: its own drain does not end the guard
+    screen.input_guard_snapshots.insert(98, HashMap::new());
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    assert!(held(&screen));
+    screen.input_guard_snapshots.clear();
+    // any other drain does (drain_connected_clients), before a frame is drawn
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    assert!(!held(&screen));
 }

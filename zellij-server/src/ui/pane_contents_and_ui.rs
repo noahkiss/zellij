@@ -27,6 +27,24 @@ pub fn frame_handle_shown() -> bool {
     FRAME_HANDLE_SHOWN.with(|cell| cell.get())
 }
 
+thread_local! {
+    /// fork addition: the panes an input guard holds input for, by client: the pane an agent's
+    /// call just focused. Set by the screen, on its thread, as guards start and end.
+    static INPUT_GUARD_MARKERS: std::cell::RefCell<HashMap<ClientId, PaneId>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// fork addition: what an input guard's frame marker says.
+pub const INPUT_GUARD_MARKER: &str = "input held";
+
+pub fn set_input_guard_markers(markers: HashMap<ClientId, PaneId>) {
+    INPUT_GUARD_MARKERS.with(|cell| *cell.borrow_mut() = markers);
+}
+
+fn input_guard_marks(client_id: ClientId, pane_id: PaneId) -> bool {
+    INPUT_GUARD_MARKERS.with(|cell| cell.borrow().get(&client_id) == Some(&pane_id))
+}
+
 pub fn dim_character_chunks(character_chunks: &mut Vec<CharacterChunk>) {
     for chunk in character_chunks.iter_mut() {
         for terminal_character in chunk.terminal_characters.iter_mut() {
@@ -451,8 +469,16 @@ impl<'a> PaneContentsAndUi<'a> {
         } else {
             String::new()
         };
-        // fork addition: and the note somebody left on it, if there is one
-        let pane_note = self.pane.pane_note();
+        // fork addition: and the note somebody left on it, if there is one - while an input guard
+        // holds this client's input after an agent focused this pane, the guard's marker instead
+        let pane_note = if input_guard_marks(client_id, self.pane.pid()) {
+            Some((
+                INPUT_GUARD_MARKER.to_owned(),
+                zellij_utils::data::NoteColor::Warn,
+            ))
+        } else {
+            self.pane.pane_note()
+        };
         let frame_params = if session_is_mirrored {
             FrameParams {
                 focused_client,

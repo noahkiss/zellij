@@ -1591,6 +1591,7 @@ fn a_reload_that_changes_the_paste_chords_claims_the_new_one() {
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         }
     );
 }
@@ -3109,6 +3110,7 @@ mod composing {
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         }
     }
 

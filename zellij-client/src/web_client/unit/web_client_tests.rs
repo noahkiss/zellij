@@ -540,6 +540,7 @@ mod web_client_tests {
                         terminal_id: _,
                         client_id: _,
                         is_cli_client: _,
+                        caller: _,
                     } => {
                         found_terminal_input = true;
                     },
@@ -3644,6 +3645,7 @@ mod web_client_tests {
                     terminal_id: None,
                     client_id: None,
                     is_cli_client: false,
+                    caller: Default::default(),
                 })
         })
         .await;
@@ -3674,6 +3676,7 @@ mod web_client_tests {
                     terminal_id: None,
                     client_id: None,
                     is_cli_client: false,
+                    caller: Default::default(),
                 }),
                 "a structured client's {:?} reaches the session, got {:?}",
                 action,

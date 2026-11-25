@@ -340,6 +340,7 @@ impl App {
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         }) {
             report!("the window could not pass an action to its session: {}", e);
         }

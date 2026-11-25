@@ -165,6 +165,27 @@ pub struct MobileStatePayload {
     pub render_prefs: MobileRenderPrefsPayload,
 }
 
+/// fork addition: what a CLI process knew about its caller, carried on every action it sends.
+///
+/// One carrier for every verb, rather than a flag per action: the server decides what each
+/// fact means for each action. On the wire it is `ActionMsg.caller`, an optional message, so a
+/// server from before it skips it and a client from before it sends none, which reads as the
+/// default - a person.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActionCaller {
+    /// The CLI process passed the agent test ([`crate::agent_detect::caller_is_agent`]).
+    pub agent: bool,
+}
+
+impl ActionCaller {
+    /// The caller as this process's environment describes it.
+    pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        ActionCaller {
+            agent: crate::agent_detect::caller_is_agent(var),
+        }
+    }
+}
+
 // Types of messages sent from the client to the server
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -206,6 +227,9 @@ pub enum ClientToServerMsg {
         terminal_id: Option<u32>,
         client_id: Option<ClientId>,
         is_cli_client: bool,
+        /// fork addition: who ran the CLI call. Default (a person) from an attached client and
+        /// from an older CLI
+        caller: ActionCaller,
     },
     Key {
         key: KeyWithModifier,

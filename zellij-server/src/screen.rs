@@ -1131,6 +1131,27 @@ pub enum ScreenInstruction {
         quiet_ms: u64,
         startup_ms: u64,
     },
+    /// fork addition: the input guard's settings from the config, at a reload.
+    SetInputGuard {
+        guard_ms: u64,
+        typing: crate::input_guard::Typing,
+    },
+    /// fork addition: an agent's CLI call (the CLI client id) is about to run; note where every
+    /// client is looking, to compare with after it.
+    InputGuardSnapshot(ClientId),
+    /// fork addition: that call ran; guard every client whose pane, tab or mode it moved.
+    InputGuardArm(ClientId),
+    /// fork addition: the guard's clock, while a guard holds: repaint the marker as guards end.
+    InputGuardTick,
+    /// fork addition: the person's own plain typing, sent instead of `WriteCharacter` while the
+    /// input guard is on, so it can be routed to the pane they were in.
+    PersonWrite(
+        Option<KeyWithModifier>,
+        Vec<u8>,
+        bool,
+        ClientId,
+        Option<NotificationEnd>,
+    ),
     SetModeHintsWhenBarsHidden(bool),
     SetGraphemeClusters(bool),
     GetSessionPreview {
@@ -1771,6 +1792,11 @@ impl From<&ScreenInstruction> for ScreenContext {
                 ScreenContext::SetHiddenBarsNotification
             },
             ScreenInstruction::SetAgentMailTimings { .. } => ScreenContext::SetAgentMailTimings,
+            ScreenInstruction::SetInputGuard { .. } => ScreenContext::SetInputGuard,
+            ScreenInstruction::InputGuardSnapshot(..) => ScreenContext::InputGuardSnapshot,
+            ScreenInstruction::InputGuardArm(..) => ScreenContext::InputGuardArm,
+            ScreenInstruction::InputGuardTick => ScreenContext::InputGuardTick,
+            ScreenInstruction::PersonWrite(..) => ScreenContext::PersonWrite,
             ScreenInstruction::SetPaneFrameHandle(..) => ScreenContext::SetPaneFrameHandle,
             ScreenInstruction::SetModeHintsWhenBarsHidden(..) => {
                 ScreenContext::SetModeHintsWhenBarsHidden
@@ -2498,6 +2524,15 @@ pub(crate) struct Screen {
     /// fork addition: how long a new agent has to report a state: the config's
     /// `agent_startup_grace`, or `agent_mail::STARTUP_MS`.
     agent_mail_startup_ms: u64,
+    /// fork addition: the input guard, shared with the route thread; see `crate::input_guard`.
+    input_guards: crate::input_guard::SharedInputGuards,
+    /// fork addition: where every client was looking before an agent's call that is still
+    /// running, by the CLI client id of that call.
+    input_guard_snapshots: HashMap<ClientId, HashMap<ClientId, crate::input_guard::Spot>>,
+    /// fork addition: whether the thread that drives `InputGuardTick` runs.
+    input_guard_ticking: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// fork addition: the guard markers the frames were last drawn with.
+    input_guard_markers: HashMap<ClientId, PaneId>,
     /// fork addition: messages posted to an OpenCode agent's own server whose answer has not come
     /// back, by id. None of them is typed in while it is here; see `crate::opencode_api`.
     opencode_in_flight: HashMap<String, OpenCodeAttempt>,
@@ -2952,6 +2987,10 @@ impl Screen {
             agent_mail_ticking: Default::default(),
             agent_mail_quiet_ms: zellij_utils::agent_mail::QUIET_MS,
             agent_mail_startup_ms: zellij_utils::agent_mail::STARTUP_MS,
+            input_guards: Default::default(),
+            input_guard_snapshots: HashMap::new(),
+            input_guard_ticking: Default::default(),
+            input_guard_markers: HashMap::new(),
             opencode_in_flight: HashMap::new(),
             opencode_typed: HashSet::new(),
             pending_reopen_handles: HashMap::new(),
@@ -3153,6 +3192,7 @@ impl Screen {
                 .iter()
                 .map(|(client_id, _mode_info)| *client_id)
                 .collect();
+            self.clear_input_guards_on_drain(&arriving_client_ids);
             let arriving_clients_overflow_destination =
                 self.clients_are_larger_than_tab(destination_tab_index, &arriving_client_ids);
             let destination_tab = self
@@ -3474,6 +3514,11 @@ impl Screen {
                 .with_context(err_context)
         } else {
             let client_mode_infos_in_closed_tab = tab_to_close.drain_connected_clients(None);
+            let drained: Vec<ClientId> = client_mode_infos_in_closed_tab
+                .iter()
+                .map(|(client_id, _)| *client_id)
+                .collect();
+            self.clear_input_guards_on_drain(&drained);
             self.move_clients_from_closed_tab(client_mode_infos_in_closed_tab)
                 .with_context(err_context)?;
             self.move_suppressed_panes_from_closed_tab(suppressed_panes)
@@ -6335,6 +6380,7 @@ impl Screen {
         // message, triggering our render_to_clients method which does the actual rendering
 
         self.sync_nested_guest_fullscreen_state();
+        self.sync_input_guard_markers();
 
         let _ = self
             .bus
@@ -7439,6 +7485,10 @@ impl Screen {
         } else {
             None
         };
+        if let Some(drained) = &drained_clients {
+            let drained: Vec<ClientId> = drained.iter().map(|(client_id, _)| *client_id).collect();
+            self.clear_input_guards_on_drain(&drained);
+        }
 
         if !self.active_tab_ids.contains_key(&client_id) {
             self.connected_clients
@@ -9017,6 +9067,171 @@ impl Screen {
 
     /// fork addition: a thread that asks for `DrainAgentMessages` once a second, for as long as
     /// any message is held. Started again by the next held message once it stops.
+    /// fork addition: where every attached client is looking, for the input guard.
+    fn input_guard_spots(&self) -> HashMap<ClientId, crate::input_guard::Spot> {
+        let clients: Vec<ClientId> = self.connected_clients.borrow().keys().copied().collect();
+        clients
+            .into_iter()
+            .map(|client_id| {
+                (
+                    client_id,
+                    crate::input_guard::Spot {
+                        tab: self.active_tab_ids.get(&client_id).copied(),
+                        pane: self.get_active_pane_id(&client_id),
+                        mode: self.get_client_input_mode(client_id),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// fork addition: an agent's call (`token`) ran: guard every client it moved. Returns
+    /// whether a frame needs drawing.
+    fn arm_input_guards(&mut self, token: ClientId) -> bool {
+        let Some(before) = self.input_guard_snapshots.remove(&token) else {
+            return false;
+        };
+        let moved = crate::input_guard::moved(&before, &self.input_guard_spots());
+        if moved.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if let Ok(mut guards) = self.input_guards.lock() {
+            if !guards.enabled() {
+                return false;
+            }
+            for (client_id, previous, focused) in moved {
+                log::info!(
+                    "input guard: an agent moved client {} from {:?} to {:?}",
+                    client_id,
+                    previous,
+                    focused
+                );
+                guards.arm(client_id, previous, focused, now);
+            }
+        }
+        self.start_input_guard_ticker();
+        self.sync_input_guard_markers();
+        true
+    }
+
+    /// fork addition: a client left a tab. Its guard ends - unless an agent's call is still
+    /// running, whose own move this is; that call re-arms the guard when it ends, keeping the
+    /// pane the person was in first.
+    fn clear_input_guards_on_drain(&self, client_ids: &[ClientId]) {
+        if !self.input_guard_snapshots.is_empty() {
+            return;
+        }
+        if let Ok(mut guards) = self.input_guards.lock() {
+            for client_id in client_ids {
+                guards.clear(*client_id);
+            }
+        }
+    }
+
+    /// fork addition: end the guards whose client's focus moved by anything but an agent's call,
+    /// forget ended guards, and point the frame marker at the guarded panes. Returns whether the
+    /// markers changed, which needs a frame.
+    fn sync_input_guard_markers(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let guards_handle = self.input_guards.clone();
+        let Ok(mut guards) = guards_handle.lock() else {
+            return false;
+        };
+        let mut markers = guards.markers(now);
+        if markers.is_empty() && self.input_guard_markers.is_empty() {
+            return false;
+        }
+        // while an agent's call runs, its own move is not a move by somebody else
+        if self.input_guard_snapshots.is_empty() {
+            for (client_id, pane_id) in markers.clone() {
+                if self.get_active_pane_id(&client_id) != Some(pane_id) {
+                    guards.clear(client_id);
+                    markers.remove(&client_id);
+                }
+            }
+        }
+        drop(guards);
+        if markers == self.input_guard_markers {
+            return false;
+        }
+        crate::ui::pane_contents_and_ui::set_input_guard_markers(markers.clone());
+        self.input_guard_markers = markers;
+        for tab in self.tabs.values_mut() {
+            tab.set_force_render();
+        }
+        true
+    }
+
+    /// fork addition: the person's plain typing, under an input guard. Returns whether it was
+    /// handled here (routed to the pane they were in, or dropped); `false` is the normal path.
+    fn route_guarded_typing(
+        &mut self,
+        client_id: ClientId,
+        key: &Option<KeyWithModifier>,
+        bytes: &[u8],
+        is_kitty: bool,
+    ) -> bool {
+        let focused_now = self.get_active_pane_id(&client_id);
+        let verdict = match self.input_guards.lock() {
+            Ok(mut guards) => guards.typing(client_id, focused_now, std::time::Instant::now()),
+            Err(_) => return false,
+        };
+        match verdict {
+            crate::input_guard::TypingVerdict::Pass => false,
+            crate::input_guard::TypingVerdict::Drop => true,
+            crate::input_guard::TypingVerdict::ToPane(pane_id) => {
+                self.record_client_input(client_id);
+                // the same write path a focused pane gets, so the pane's input tracking sees it;
+                // a pane that is gone takes nothing
+                if let Some(tab) = self
+                    .tabs
+                    .values_mut()
+                    .find(|tab| tab.has_pane_with_pid(&pane_id))
+                {
+                    tab.write_to_pane_id(
+                        key,
+                        bytes.to_vec(),
+                        is_kitty,
+                        pane_id,
+                        Some(client_id),
+                        None,
+                    )
+                    .non_fatal();
+                }
+                let _ = self.render(None);
+                true
+            },
+        }
+    }
+
+    /// fork addition: drive `InputGuardTick` while a guard holds, so its marker goes when it ends.
+    fn start_input_guard_ticker(&self) {
+        use std::sync::atomic::Ordering;
+        if self.input_guard_ticking.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ticking = self.input_guard_ticking.clone();
+        let senders = self.bus.senders.clone();
+        let started = std::thread::Builder::new()
+            .name("input_guard".to_owned())
+            .spawn(move || {
+                while ticking.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if senders
+                        .send_to_screen(ScreenInstruction::InputGuardTick)
+                        .is_err()
+                    {
+                        ticking.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            });
+        if started.is_err() {
+            self.input_guard_ticking.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn start_agent_mail_ticker(&self) {
         use std::sync::atomic::Ordering;
         if self.agent_mail_ticking.swap(true, Ordering::SeqCst) {
@@ -12995,6 +13210,7 @@ pub(crate) fn screen_thread_main(
     default_keybinds: SharedKeybinds,
     session_id: String,
     live_view_captures: crate::pane_mirror::SharedLiveViewCaptures,
+    input_guards: crate::input_guard::SharedInputGuards,
 ) -> Result<()> {
     // Resolve `theme_dark` / `theme_light` to concrete `Styling` from the
     // bundled themes BEFORE `config.options` is moved out below. These
@@ -13161,6 +13377,15 @@ pub(crate) fn screen_thread_main(
     );
     screen.default_keybinds = default_keybinds;
     screen.live_views.borrow_mut().captures = live_view_captures;
+    screen.input_guards = input_guards;
+    if let Ok(mut guards) = screen.input_guards.lock() {
+        guards.configure(
+            config_options
+                .input_guard_ms
+                .unwrap_or(crate::input_guard::DEFAULT_GUARD_MS),
+            crate::input_guard::Typing::from_config(config_options.input_guard_typing.as_deref()),
+        );
+    }
     screen.default_context_menu_config = config.context_menu.clone();
     screen.default_mousebinds = config.mousebinds.clone();
     screen.configured_default_shell = configured_default_shell;
@@ -13253,6 +13478,18 @@ pub(crate) fn screen_thread_main(
             .bus
             .recv()
             .context("failed to receive event on channel")?;
+        // fork addition: the person's typing under an input guard goes to the pane they were in,
+        // or nowhere; without a guard it is an ordinary `WriteCharacter`
+        let event = match event {
+            ScreenInstruction::PersonWrite(key, bytes, is_kitty, client_id, completion) => {
+                if screen.route_guarded_typing(client_id, &key, &bytes, is_kitty) {
+                    drop(completion);
+                    continue;
+                }
+                ScreenInstruction::WriteCharacter(key, bytes, is_kitty, client_id, completion)
+            },
+            event => event,
+        };
         let screen_context: ScreenContext = (&event).into();
         err_ctx.add_call(ContextType::Screen(screen_context));
         // here we start caching resizes, so that we'll send them in bulk at the end of each event
@@ -15977,6 +16214,10 @@ pub(crate) fn screen_thread_main(
                 let was_attached = screen.connected_clients.borrow().contains_key(&client_id);
                 screen.clear_live_views_of_client(client_id);
                 screen.mode_hints_requested.remove(&client_id);
+                // fork addition: a client that leaves takes its input guard with it
+                if let Ok(mut guards) = screen.input_guards.lock() {
+                    guards.forget_client(client_id);
+                }
                 screen.remove_client(client_id).non_fatal();
                 if was_attached {
                     screen.log_and_report_session_state().non_fatal();
@@ -18304,6 +18545,41 @@ pub(crate) fn screen_thread_main(
                     crate::ui::pane_contents_and_ui::set_frame_handle_shown(shown);
                     screen.render(None)?;
                 }
+            },
+            ScreenInstruction::SetInputGuard { guard_ms, typing } => {
+                if let Ok(mut guards) = screen.input_guards.lock() {
+                    guards.configure(guard_ms, typing);
+                }
+                if screen.sync_input_guard_markers() {
+                    screen.render(None)?;
+                }
+            },
+            ScreenInstruction::InputGuardSnapshot(token) => {
+                let spots = screen.input_guard_spots();
+                screen.input_guard_snapshots.insert(token, spots);
+            },
+            ScreenInstruction::InputGuardArm(token) => {
+                if screen.arm_input_guards(token) {
+                    screen.render(None)?;
+                }
+            },
+            ScreenInstruction::InputGuardTick => {
+                if screen.sync_input_guard_markers() {
+                    screen.render(None)?;
+                }
+                let still_held = screen
+                    .input_guards
+                    .lock()
+                    .map(|guards| guards.any_active(std::time::Instant::now()))
+                    .unwrap_or(false);
+                if !still_held {
+                    screen
+                        .input_guard_ticking
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            ScreenInstruction::PersonWrite(..) => {
+                // turned into a `WriteCharacter` or handled where it is received
             },
             ScreenInstruction::SetAgentMailTimings {
                 quiet_ms,

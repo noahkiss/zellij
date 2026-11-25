@@ -3550,6 +3550,8 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "grapheme_clusters",
     "hidden_bars_notification",
     "host_notification_protocol",
+    "input_guard_ms",
+    "input_guard_typing",
     "input_while_scrolled",
     "keybinds_dir",
     "layout_dir",
@@ -3846,6 +3848,31 @@ impl Options {
         let pane_frame_handle =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frame_handle")
                 .map(|(v, _)| v);
+        let input_guard_ms =
+            match kdl_property_first_arg_as_i64_or_error!(kdl_options, "input_guard_ms") {
+                Some((value, _)) if value >= 0 => Some(value as u64),
+                Some((value, entry)) => {
+                    note_unknown_value(
+                        "input_guard_ms",
+                        &value.to_string(),
+                        entry,
+                        "0, or a number of milliseconds",
+                    );
+                    None
+                },
+                None => None,
+            };
+        let input_guard_typing =
+            match kdl_property_first_arg_as_string_or_error!(kdl_options, "input_guard_typing") {
+                Some((value, _)) if value == "previous" || value == "drop" => {
+                    Some(value.to_owned())
+                },
+                Some((value, entry)) => {
+                    note_unknown_value("input_guard_typing", value, entry, "previous or drop");
+                    None
+                },
+                None => None,
+            };
         let detect_agents =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "detect_agents").map(|(v, _)| v);
         let session_up_resume =
@@ -4205,6 +4232,8 @@ impl Options {
             agent_message_quiet,
             mcp_wait_timeout,
             pane_frame_handle,
+            input_guard_ms,
+            input_guard_typing,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -7140,6 +7169,16 @@ impl Options {
         if let Some(shown) = self.pane_frame_handle {
             let mut node = KdlNode::new("pane_frame_handle");
             node.push(KdlValue::Bool(shown));
+            nodes.push(node);
+        }
+        if let Some(ms) = self.input_guard_ms {
+            let mut node = KdlNode::new("input_guard_ms");
+            node.push(KdlValue::Base10(ms as i64));
+            nodes.push(node);
+        }
+        if let Some(typing) = &self.input_guard_typing {
+            let mut node = KdlNode::new("input_guard_typing");
+            node.push(KdlValue::String(typing.to_owned()));
             nodes.push(node);
         }
         if let Some(detect_agents) = self.detect_agents_to_kdl() {
@@ -12757,6 +12796,44 @@ fn remote_hosts_timeouts_are_read_for_the_server_and_warn_on_a_bad_value() {
         "{}",
         bad.warnings[0]
     );
+}
+
+#[test]
+fn input_guard_ms_and_input_guard_typing_parse_warn_and_round_trip() {
+    let read = |kdl: &str| Config::from_kdl(kdl, None).unwrap();
+    let unset = read("");
+    assert_eq!(unset.options.input_guard_ms, None);
+    assert_eq!(unset.options.input_guard_typing, None);
+    for (kdl, ms, typing) in [
+        ("input_guard_ms 0", Some(0), None),
+        ("input_guard_ms 750", Some(750), None),
+        ("input_guard_typing \"drop\"", None, Some("drop")),
+        (
+            "input_guard_ms 500\ninput_guard_typing \"previous\"",
+            Some(500),
+            Some("previous"),
+        ),
+    ] {
+        let config = read(kdl);
+        assert_eq!(config.options.input_guard_ms, ms, "{}", kdl);
+        assert_eq!(
+            config.options.input_guard_typing.as_deref(),
+            typing,
+            "{}",
+            kdl
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let again = read(&config.to_string(false));
+        assert_eq!(again.options, config.options);
+    }
+    // a negative span or an unknown word: the default, with a warning
+    for kdl in ["input_guard_ms -1", "input_guard_typing \"elsewhere\""] {
+        let config = read(kdl);
+        assert_eq!(config.options.input_guard_ms, None, "{}", kdl);
+        assert_eq!(config.options.input_guard_typing, None, "{}", kdl);
+        assert_eq!(config.warnings.len(), 1, "{} {:?}", kdl, config.warnings);
+    }
+    assert!(Config::from_kdl("input_guard_ms \"500\"", None).is_err());
 }
 
 #[test]

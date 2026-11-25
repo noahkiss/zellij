@@ -105,4 +105,6 @@ Options {
     agent_message_quiet: None,
     mcp_wait_timeout: None,
     pane_frame_handle: None,
+    input_guard_ms: None,
+    input_guard_typing: None,
 }

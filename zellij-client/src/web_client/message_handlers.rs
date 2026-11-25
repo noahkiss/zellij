@@ -105,6 +105,7 @@ fn dispatch_termwiz_event(
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             });
         },
         InputEvent::Paste(pasted_text) => {
@@ -117,6 +118,7 @@ fn dispatch_termwiz_event(
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             });
             os_input.send_to_server(ClientToServerMsg::Action {
                 action: Action::Write {
@@ -127,6 +129,7 @@ fn dispatch_termwiz_event(
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             });
             os_input.send_to_server(ClientToServerMsg::Action {
                 action: Action::Write {
@@ -137,6 +140,7 @@ fn dispatch_termwiz_event(
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             });
         },
         _ => {

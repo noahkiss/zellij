@@ -478,6 +478,7 @@ fn control_payload_to_server_msg(
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             }
         },
         WebClientToWebServerControlMessagePayload::NewPaneInTab { .. } => {
@@ -495,6 +496,7 @@ fn control_payload_to_server_msg(
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             }
         },
         WebClientToWebServerControlMessagePayload::NewTab => ClientToServerMsg::Action {
@@ -512,6 +514,7 @@ fn control_payload_to_server_msg(
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         },
         WebClientToWebServerControlMessagePayload::SetMobileRenderPreferences {
             single_pane,
@@ -538,6 +541,7 @@ fn control_payload_to_server_msg(
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         },
         WebClientToWebServerControlMessagePayload::Paste { chars } => ClientToServerMsg::Action {
             action: Action::Paste {
@@ -547,24 +551,28 @@ fn control_payload_to_server_msg(
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         },
         WebClientToWebServerControlMessagePayload::Text { chars } => ClientToServerMsg::Action {
             action: Action::WriteChars { chars },
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         },
         WebClientToWebServerControlMessagePayload::Detach => ClientToServerMsg::Action {
             action: Action::Detach,
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         },
         WebClientToWebServerControlMessagePayload::Quit => ClientToServerMsg::Action {
             action: Action::Quit,
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         },
         WebClientToWebServerControlMessagePayload::Unknown => {
             log::warn!("Ignoring unknown control message type from web client");
@@ -891,6 +899,7 @@ mod tests {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             },
             "a typed mouse event keeps the fields an SGR encoding cannot carry"
         );
@@ -912,6 +921,7 @@ mod tests {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             }
         );
 
@@ -925,6 +935,7 @@ mod tests {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             }
         );
 
@@ -938,6 +949,7 @@ mod tests {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             }
         );
         assert!(control_payload_to_server_msg(
@@ -965,6 +977,7 @@ mod tests {
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,
+                caller: Default::default(),
             },
             "an IME commit is typed text; the paste path would bracket it"
         );

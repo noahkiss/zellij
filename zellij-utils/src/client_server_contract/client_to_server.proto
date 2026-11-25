@@ -94,6 +94,14 @@ message ActionMsg {
   optional uint32 terminal_id = 2;
   optional uint32 client_id = 3;
   bool is_cli_client = 4;
+  // fork addition: who ran the CLI call. Absent from an older client, which reads as a person
+  ActionCaller caller = 5;
+}
+
+// fork addition: what the CLI process knew about its caller
+message ActionCaller {
+  // the CLI process passed the agent test (`caller_is_agent`)
+  bool agent = 1;
 }
 
 message KeyMsg {

@@ -476,6 +476,7 @@ mod tests {
             terminal_id: None,
             client_id: None,
             is_cli_client: false,
+            caller: Default::default(),
         }
     }
 

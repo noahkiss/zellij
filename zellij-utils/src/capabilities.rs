@@ -115,6 +115,8 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-frame-handle", // pane_frame_handle false: no handle on the frame
     // send-message --receipt, zellij_send receipt: a notice when a held message is delivered
     "agent-message-receipt",
+    // input_guard_ms, input_guard_typing: an agent's focus change holds the person's input
+    "input-guard",
 ];
 
 /// The version, split into the parts that can actually be compared.
