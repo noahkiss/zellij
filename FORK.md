@@ -3636,6 +3636,21 @@ visible or focused only once that is a dwell old. Everything downstream of those
 upstream's code. A look that starts asks for the same `ClearPaneBellAfterDwell` job; its handler
 re-syncs attention visibility, which clears what the look has earned.
 
+### An attention check is never postponed by a later one
+
+Upstream's attention tracker asks for a timed re-check of a pane in two cases: a running command
+that will count as "working" once it passes the done threshold, and a burst of output that may
+"go quiet". The background job kept one deadline per pane, and every new request replaced it. A
+later idle check therefore pushed an earlier command check back: a pane could go on showing
+nothing for seconds after its command became "working". The timer also slept for the first
+request's delay before it looked at the deadline, so a sooner request waited behind it.
+
+The earliest pending deadline now wins (`arm_attention_idle_check` in
+`zellij-server/src/background_jobs.rs`). A later request leaves it alone. An earlier request takes its
+place and gets a timer of its own, and each timer sleeps to whatever deadline is pending when it
+wakes. Firing for the earliest request is safe for the later one: `idle_check` re-arms any check
+that is not due yet.
+
 ### A pane uuid that outlives id reuse
 
 ```
