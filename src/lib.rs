@@ -157,12 +157,15 @@ fn main() {
             near_current_pane,
             no_focus,
             focus,
+            now,
             borderless,
             border_style,
             tab_id,
             ready,
         })) = opts.command
         {
+            // fork addition: `--now` rides on the action this sends
+            zellij_utils::ipc::set_focus_now(now);
             let cwd = cwd.or_else(|| std::env::current_dir().ok());
             let skip_plugin_cache = false; // N/A for this action
 
@@ -231,11 +234,14 @@ fn main() {
             pinned,
             no_focus,
             focus,
+            now,
             borderless,
             border_style,
             tab_id,
         })) = opts.command
         {
+            // fork addition: `--now` rides on the action this sends
+            zellij_utils::ipc::set_focus_now(now);
             let cwd = None;
             let stacked = false;
             let blocking = false;

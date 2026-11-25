@@ -9407,7 +9407,7 @@ script with no agent variable, and a plugin are never held.
 
 | Verb | What waits |
 |---|---|
-| `focus-pane-id`, `go-to-tab`, `go-to-tab-by-id`, `go-to-tab-name`, `move-focus` | the whole call |
+| `focus-pane-id`, `go-to-tab`, `go-to-tab-by-id`, `go-to-tab-name`, `go-to-next-tab`, `go-to-previous-tab`, `move-focus`, `move-focus-or-tab`, `focus-next-pane`, `focus-previous-pane` | the whole call |
 | `go-to-tab-name --create` | the tab is made now, without focus; only the move to it waits |
 | `new-pane`, `run`, `new-tab`, `launch-plugin` with focus (`--focus`, `-f`) | the pane or tab is made and runs now; only bringing it to the front waits |
 
@@ -9415,9 +9415,9 @@ Anything else, `--no-focus`, and the probes are not held. `switch-session` is no
 moves the focus, so MCP has no `now`.
 
 **`zellij action --now <verb>`** applies at once. It is one action-level flag, before the verb like
-`--json`, and it is a no-op on a verb that moves no focus. The top-level `zellij run --focus` and
-`zellij plugin --focus` have no `--now`; `zellij action new-pane --focus` and `zellij action
-launch-plugin -f` take it.
+`--json`, and it is a no-op on a verb that moves no focus. The top-level `zellij run --focus --now`
+and `zellij plugin --focus --now` take it after the subcommand, since they have no action level;
+there it requires `--focus`.
 
 **Output.** A held verb from an agent returns at once and ends its report with `focus: pending`; one
 that applied with `focus: applied` (`"focus"` in `action --json`). Nothing blocks by default.

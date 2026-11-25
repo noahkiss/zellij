@@ -179,8 +179,8 @@ pub enum Command {
         json: bool,
 
         /// Move the focus at once. From a coding agent, a verb that moves the person's focus
-        /// (focus-pane-id, go-to-tab*, move-focus, and new-pane, new-tab, run or launch-plugin with
-        /// focus) waits until their typing pauses (`focus_wait_idle`). This skips the wait. It goes
+        /// (focus-pane-id, go-to-tab*, go-to-next/previous-tab, move-focus*, focus-next/previous-pane,
+        /// and new-pane, new-tab, run or launch-plugin with focus) waits until their typing pauses (`focus_wait_idle`). This skips the wait. It goes
         /// before the verb, like --json; on any other verb it does nothing
         #[clap(long)]
         now: bool,
@@ -1203,6 +1203,10 @@ pub enum Sessions {
         /// harness's own session variable is set
         #[clap(long, conflicts_with("no_focus"))]
         focus: bool,
+        /// With --focus from an agent: take the focus at once, rather than when the person's
+        /// typing pauses (`focus_wait_idle`). The pane is made at once either way
+        #[clap(long, requires("focus"))]
+        now: bool,
         /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
@@ -1276,6 +1280,10 @@ pub enum Sessions {
         /// harness's own session variable is set
         #[clap(long, conflicts_with("no_focus"))]
         focus: bool,
+        /// With --focus from an agent: take the focus at once, rather than when the person's
+        /// typing pauses (`focus_wait_idle`). The pane is made at once either way
+        #[clap(long, requires("focus"))]
+        now: bool,
         /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]

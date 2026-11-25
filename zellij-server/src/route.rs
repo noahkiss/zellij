@@ -515,8 +515,9 @@ impl FocusAfter {
 }
 
 /// The verbs friendly focus holds: focus-pane-id, go-to-tab, go-to-tab-by-id, go-to-tab-name
-/// (with --create, the create runs now), move-focus, and a new pane, tab, run or plugin made
-/// with focus. Anything else - and a probe or create with --no-focus - is unaffected.
+/// (with --create, the create runs now), move-focus, move-focus-or-tab, focus-next-pane,
+/// focus-previous-pane, go-to-next-tab, go-to-previous-tab, and a new pane, tab, run or plugin
+/// made with focus. Anything else - and a probe or create with --no-focus - is unaffected.
 fn focus_plan(action: &Action) -> FocusPlan {
     let create = |now: Action| FocusPlan::Create {
         now,
@@ -535,9 +536,14 @@ fn focus_plan(action: &Action) -> FocusPlan {
         Action::FocusPluginPaneWithId { pane_id, .. } => FocusPlan::Move {
             target: Some(PaneId::Plugin(pane_id)),
         },
-        Action::GoToTab { .. } | Action::GoToTabById { .. } | Action::MoveFocus { .. } => {
-            FocusPlan::Move { target: None }
-        },
+        Action::GoToTab { .. }
+        | Action::GoToTabById { .. }
+        | Action::MoveFocus { .. }
+        | Action::MoveFocusOrTab { .. }
+        | Action::FocusNextPane
+        | Action::FocusPreviousPane
+        | Action::GoToNextTab
+        | Action::GoToPreviousTab => FocusPlan::Move { target: None },
         Action::GoToTabName {
             create: false,
             no_focus: false,
@@ -6293,6 +6299,13 @@ mod tests {
             Action::MoveFocus {
                 direction: zellij_utils::data::Direction::Left,
             },
+            Action::MoveFocusOrTab {
+                direction: zellij_utils::data::Direction::Right,
+            },
+            Action::FocusNextPane,
+            Action::FocusPreviousPane,
+            Action::GoToNextTab,
+            Action::GoToPreviousTab,
             Action::GoToTabName {
                 name: "x".to_owned(),
                 create: false,
