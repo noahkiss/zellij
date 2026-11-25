@@ -5288,6 +5288,12 @@ zellij_read_pane)``. For `handle` on `zellij_create` the line names the handle t
 ``ignored: `handle` (handles are generated; this pane's is sunny-otter)``. A parameter a tool
 refuses by name, such as `floating`, says so in its own refusal and is not also listed.
 
+**A `name` for a pane is ignored, not refused (nkmk.47).** Agents do not choose a pane's name, and
+they keep trying. `zellij_create` with `name` and any kind but `tab` used to refuse the whole call,
+so the agent tried again without a pane to show for it. It now makes the pane and says
+``ignored: `name` (only kind=tab takes a name; pane handles are generated; this pane's is
+sunny-otter)``, which points the agent at the handle it has to use.
+
 ### `session up` comes back with the shape the session had
 
 ```
@@ -9122,9 +9128,10 @@ action new-tab --no-focus --name=build --wait-ready --ready-timeout=10
 ```
 
 Without `name`, a tab an agent makes is called `Tab #N`. `name` names the tab, and only the tab: it
-is accepted with `kind: tab` alone. Any other kind, and `reopen`, refuse it with one line before a
-session is asked anything. A pane still keeps its generated handle, and a command pane is still
-named after its command.
+is used with `kind: tab` alone. `reopen` refuses it with one line before a session is asked
+anything. Any other kind makes the pane and lists `name` as ignored, with the pane's generated
+handle (nkmk.47; it refused the call before). A pane still keeps its generated handle, and a
+command pane is still named after its command.
 
 `src/mcp/tools.rs` (the `name` parameter and the tool's tips) and `src/mcp/invoke.rs`
 (`create_kind_allowed`, the `tab` arm of `argv_in`). Tests: the tab's name on the command line, a

@@ -910,10 +910,10 @@ fn note_ignored(result: &mut CallToolResult, tool: &str, ignored: &[String]) {
     };
     structured.insert("ignored".to_owned(), json!(ignored));
     let mut parts = Vec::new();
-    let (handles, others): (Vec<&String>, Vec<&String>) = ignored
+    let (named, others): (Vec<&String>, Vec<&String>) = ignored
         .iter()
-        .partition(|name| tool == "zellij_create" && name.as_str() == "handle");
-    if !handles.is_empty() {
+        .partition(|name| tool == "zellij_create" && matches!(name.as_str(), "handle" | "name"));
+    if !named.is_empty() {
         let made = structured
             .get("handle")
             .and_then(Value::as_str)
@@ -931,13 +931,20 @@ fn note_ignored(result: &mut CallToolResult, tool: &str, ignored: &[String]) {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-        parts.push(match made {
-            Some(handle) => format!(
-                "`handle` (handles are generated; this pane's is {})",
-                handle
-            ),
-            None => "`handle` (handles are generated; this call made no pane)".to_owned(),
-        });
+        let which = match made {
+            Some(handle) => format!("this pane's is {}", handle),
+            None => "this call made no pane".to_owned(),
+        };
+        for name in named {
+            parts.push(if name == "name" {
+                format!(
+                    "`name` (only kind=tab takes a name; pane handles are generated; {})",
+                    which
+                )
+            } else {
+                format!("`handle` (handles are generated; {})", which)
+            });
+        }
     }
     if !others.is_empty() {
         let names = others
@@ -1561,6 +1568,20 @@ mod tests {
             json!(
                 "ignored: `handle` (handles are generated; this pane's is sunny-otter); \
                  `brief` (not a parameter of zellij_create)"
+            )
+        );
+        let mut named = server.report(
+            &create_argv(),
+            outcome(0, "pane_id: terminal_7\nhandle: sunny-otter\n", ""),
+            Some(true),
+        );
+        note_ignored(&mut named, "zellij_create", &["name".to_owned()]);
+        let first = serde_json::to_value(&named.content[0]).unwrap();
+        assert_eq!(
+            first["text"],
+            json!(
+                "ignored: `name` (only kind=tab takes a name; pane handles are generated; \
+                 this pane's is sunny-otter)"
             )
         );
         // nothing ignored, nothing added

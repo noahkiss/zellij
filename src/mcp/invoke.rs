@@ -646,13 +646,9 @@ fn create_kind_allowed(args: &Args) -> Result<(), String> {
         return Err("`floating` is unsupported; use stacked, agent_tab or tab.".to_owned());
     }
     let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
-    // `name` names a new tab. A pane keeps its generated handle and its command's name
-    if kind != "tab" && args.values.contains_key("name") {
-        return Err(format!(
-            "`name` names a new tab and needs kind: tab, not kind: {}.",
-            kind
-        ));
-    }
+    // `name` names a new tab. A pane keeps its generated handle and its command's name, and a
+    // `name` given for one is reported as ignored, with the handle the pane got - see
+    // `tools::ignored_parameters`
     match kind.as_str() {
         "agent_tab" | "stacked" | "tab" => Ok(()),
         other => Err(format!(
@@ -2173,35 +2169,27 @@ mod tests {
         assert!(
             line("zellij_create", json!({"kind": "tab", "name": "-x"}), None).contains("--name=-x")
         );
+        // a pane keeps its generated handle: the name is not passed on, and the answer says it
+        // was ignored
         for kind in ["stacked", "agent_tab"] {
-            let refused = refusal("zellij_create", json!({"kind": kind, "name": "build"}));
-            assert_eq!(
-                refused,
-                format!(
-                    "`name` names a new tab and needs kind: tab, not kind: {}.",
-                    kind
-                )
+            let built = argv_in(
+                "zellij_create",
+                &args(json!({"kind": kind, "name": "build"})),
+                None,
+                &a_shell_env(),
+                Some(("work-zj", TabPlacement::Existing)),
+            )
+            .expect("a create that builds");
+            assert!(
+                !built.iter().any(|word| word.contains("build")),
+                "{:?}",
+                built
             );
         }
-        // the default kind is agent_tab, and a pane in it keeps its generated handle
-        assert!(refusal("zellij_create", json!({"name": "build"})).contains("kind: agent_tab"));
         assert!(
             refusal("zellij_create", json!({"reopen": "last", "name": "build"}))
                 .contains("takes no `name`")
         );
-    }
-
-    #[tokio::test]
-    async fn an_agent_tab_create_refuses_a_name_before_asking_the_session() {
-        let call = plan_in(
-            "zellij_create",
-            &args(json!({"name": "build"})),
-            Some("no-such-session-mcp-test"),
-            &a_shell_env(),
-            &Target::Local,
-        )
-        .await;
-        assert!(matches!(call, Err(reason) if reason.contains("needs kind: tab")));
     }
 
     #[test]

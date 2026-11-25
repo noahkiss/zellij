@@ -603,7 +603,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: None,
                 describe: "With kind=tab only: the new tab's name. Without one zellij numbers \
-                           the tab. Any other kind refuses it; a pane keeps its generated handle.",
+                           the tab. A pane cannot be named: any other kind ignores it, and the \
+                           answer names the pane's generated handle.",
                 default: None,
             },
             ParamSpec {
@@ -691,6 +692,19 @@ pub fn ignored_parameters(tool: &str, arguments: &Map<String, Value>) -> Vec<Str
                 .iter()
                 .any(|(unlisted_tool, param)| *unlisted_tool == tool && param == key)
         })
+        // `name` names a new tab. A pane keeps its generated handle: agents keep asking for a
+        // name, and are told the handle instead. A reopen refuses `name` itself
+        .chain(
+            arguments
+                .keys()
+                .filter(|key| {
+                    tool == "zellij_create"
+                        && key.as_str() == "name"
+                        && !arguments.contains_key("reopen")
+                        && arguments.get("kind").and_then(Value::as_str) != Some("tab")
+                })
+                .take(1),
+        )
         .cloned()
         .collect()
 }
@@ -1150,6 +1164,20 @@ mod tests {
         // a parameter the tool refuses by name says so itself, and is not also "ignored"
         assert!(ignored_parameters("zellij_create", &given(json!({"floating": true}))).is_empty());
         assert!(ignored_parameters("zellij_overview", &given(json!({"session": "w"}))).is_empty());
+        // a pane cannot be named; a tab can, and a reopen refuses it with its own line
+        assert_eq!(
+            ignored_parameters("zellij_create", &given(json!({"name": "build"}))),
+            vec!["name".to_owned()]
+        );
+        assert!(
+            ignored_parameters("zellij_create", &given(json!({"name": "b", "kind": "tab"})))
+                .is_empty()
+        );
+        assert!(ignored_parameters(
+            "zellij_create",
+            &given(json!({"name": "b", "reopen": "last"}))
+        )
+        .is_empty());
         let schema = output_schema();
         assert_eq!(schema["properties"]["ignored"]["type"], json!("array"));
     }
