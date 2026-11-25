@@ -175,8 +175,9 @@ fn an_agent_reporting_its_status_is_shown_on_its_frame_until_seen() {
 fn the_focused_pane_reports_its_status_while_the_host_window_is_unfocused() {
     let (mut zellij, _left, focused) = start_with_two_panes(runner());
     focused.output(&program_status("state=done:app=claude"));
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(markers_on_screen(&zellij.snapshot().text), "");
+    // bell_clear_delay_ms defaults to 1000, so a look at the focused pane
+    // clears the marker after the dwell instead of instantly.
+    wait_for_markers(&zellij, "");
     zellij.send_stdin(b"\x1b[O");
     std::thread::sleep(Duration::from_millis(200));
     focused.output(&program_status("state=working:app=claude"));
