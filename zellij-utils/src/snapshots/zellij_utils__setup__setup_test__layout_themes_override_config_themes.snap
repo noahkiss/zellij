@@ -6746,6 +6746,7 @@ Config {
         command_pane_on_clean_exit: None,
         person_name: None,
         agent_message_expire: None,
+        remote_timeouts: None,
     },
     themes: {
         "other-theme-from-config": Theme {

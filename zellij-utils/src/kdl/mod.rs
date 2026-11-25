@@ -3981,6 +3981,15 @@ impl Options {
             |value| crate::agent_mail::parse_expire(value).map(|_| value.trim().to_owned()),
             "seconds, a number with s, m, h or d (\"4h\"), or never",
         );
+        // fork addition: the timeouts inside `remote_hosts`, which the MCP server reads too; read
+        // here for the session server and for `setup --check`
+        let remote_timeouts = kdl_options.get("remote_hosts").and_then(|block| {
+            let (timeouts, warnings) = crate::remote_timeouts::from_block(block.children()?);
+            for warning in warnings {
+                note_unknown(block.span().offset(), warning);
+            }
+            timeouts
+        });
         let host_notification_protocol = known_value_or_note(
             "host_notification_protocol",
             kdl_property_first_arg_as_string_or_error!(kdl_options, "host_notification_protocol"),
@@ -4127,6 +4136,7 @@ impl Options {
             command_pane_on_clean_exit,
             person_name,
             agent_message_expire,
+            remote_timeouts,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -12598,6 +12608,40 @@ fn agent_message_expire_config_parsing_and_round_trip() {
     let zero = Config::from_kdl("agent_message_expire \"0\"", None).unwrap();
     assert_eq!(zero.options.agent_message_expire, None);
     assert!(Config::from_kdl("agent_message_expire 3", None).is_err());
+}
+
+#[test]
+fn remote_hosts_timeouts_are_read_for_the_server_and_warn_on_a_bad_value() {
+    use crate::remote_timeouts::RemoteTimeouts;
+    assert_eq!(
+        Config::from_kdl("", None).unwrap().options.remote_timeouts,
+        None
+    );
+    let config = Config::from_kdl(
+        "remote_hosts {\n    connect_timeout \"8s\"\n    host \"boxa\"\n}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        config.options.remote_timeouts,
+        Some(RemoteTimeouts {
+            connect_s: 8,
+            fleet_s: 13
+        })
+    );
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    // a block of hosts alone sets nothing
+    let hosts_only = Config::from_kdl("remote_hosts {\n    host \"boxa\"\n}", None).unwrap();
+    assert_eq!(hosts_only.options.remote_timeouts, None);
+    // a bad value warns, keeps the default, and the config still loads
+    let bad = Config::from_kdl("remote_hosts {\n    connect_timeout \"0s\"\n}", None).unwrap();
+    assert_eq!(bad.options.remote_timeouts, Some(RemoteTimeouts::default()));
+    assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
+    assert!(
+        bad.warnings[0].contains("connect_timeout"),
+        "{}",
+        bad.warnings[0]
+    );
 }
 
 #[test]

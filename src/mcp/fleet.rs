@@ -1,7 +1,7 @@
 //! `zellij_overview scope=fleet`: every coding agent, in every session, on every listed host.
 //!
 //! One `list-agents --all-sessions --json` here and one on each remote host, all at once, each
-//! bounded by [`remote::FLEET_TIMEOUT_S`]. A host that does not answer is one short row in the
+//! bounded by the block's `fleet_timeout` (10 s unset). A host that does not answer is one short row in the
 //! answer, never an error for the whole call and never a wait longer than the bound: a
 //! supervisor asking "what is running everywhere" wants the hosts that answered now.
 
@@ -11,7 +11,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{json, Map, Value};
 
 use super::invoke::{self, AgentsView, Outcome};
-use super::remote::{self, RemoteHosts, Target};
+use super::remote::{RemoteHosts, Target};
 
 /// The command line asked of every host.
 pub fn list_agents_argv() -> Vec<String> {
@@ -33,7 +33,7 @@ pub async fn overview(hosts: &RemoteHosts, local: &str) -> CallToolResult {
             .into_iter()
             .map(|host| (host.name.clone(), Target::Remote(host.clone()))),
     );
-    let answers = gather(targets, Duration::from_secs(remote::FLEET_TIMEOUT_S)).await;
+    let answers = gather(targets, Duration::from_secs(hosts.timeouts.fleet_s)).await;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64);
@@ -406,6 +406,7 @@ fn first_line(first: &str, then: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::remote;
 
     fn ok(stdout: &str) -> Answer {
         Ok(Outcome {
@@ -445,9 +446,11 @@ mod tests {
                 name: "boxa".into(),
                 bin: None,
                 alias: Some("a".into()),
+                connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
             }],
             warnings: vec!["a warning".to_owned()],
             path: None,
+            timeouts: Default::default(),
         };
         let result = merge(&answers, 1_042_000, &listed, Some("boxz"));
         assert_eq!(result.is_error, Some(false));
@@ -626,11 +629,13 @@ mod tests {
             name: "boxa".into(),
             bin: Some(zellij.display().to_string()),
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         };
         let down = remote::RemoteHost {
             name: "boxdown".into(),
             bin: None,
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         };
         let answers = gather(
             vec![
@@ -673,6 +678,7 @@ mod tests {
             name: "boxold".into(),
             bin: Some(old.display().to_string()),
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         };
         let answers = gather(
             vec![("boxold".into(), Target::Remote(behind))],
@@ -694,6 +700,7 @@ mod tests {
             name: "boxslow".into(),
             bin: Some(slow.display().to_string()),
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         };
         let started = std::time::Instant::now();
         let answers = gather(

@@ -2065,11 +2065,6 @@ fn default_expire_s(config: Option<&Config>) -> u64 {
         .unwrap_or(zellij_utils::agent_mail::DEFAULT_EXPIRE_S)
 }
 
-/// How long `send-message --host` waits for the other machine, in seconds, on top of any `--wait`.
-/// ssh gives up on a connection after five; the rest is that machine's `send-message`, which
-/// answers at once unless `--wait` asks it to wait.
-const SEND_ON_HOST_TIMEOUT_S: u64 = 20;
-
 /// fork addition: `send-message --host <host>`: the same command line, run by that machine's
 /// zellij over ssh, as `zellij_send` reaches another machine. Only a host in `remote_hosts` is
 /// tried, and only once; ssh never asks for a password or a host key.
@@ -2106,7 +2101,9 @@ fn send_message_on_host(
         zellij_utils::cli::CliAction::SendMessage { wait, .. } => wait.unwrap_or(0),
         _ => 0,
     };
-    let timeout_s = SEND_ON_HOST_TIMEOUT_S.saturating_add(wait_s);
+    // ssh's connect timeout plus 15 s for that machine's `send-message`, which answers at once
+    // unless `--wait` asks it to wait: 20 s at the defaults (`remote_hosts { connect_timeout }`)
+    let timeout_s = hosts.timeouts.send_on_host_s().saturating_add(wait_s);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

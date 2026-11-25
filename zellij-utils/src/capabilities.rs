@@ -106,6 +106,8 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-message-expire",
     // session_service { upgrade_restart_clientless_for }: the upgrade restart waits for a dwell
     "upgrade-restart-clientless-for",
+    // remote_hosts { connect_timeout fleet_timeout }, and the bounds derived from them
+    "remote-hosts-timeouts",
 ];
 
 /// The version, split into the parts that can actually be compared.

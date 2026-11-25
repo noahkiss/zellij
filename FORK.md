@@ -8679,6 +8679,8 @@ remote_hosts {
     from "~/.config/fleet/machines.tsv" column="hostname" where="zellij_peer=yes"
     host "boxa"
     host "boxb" bin="/opt/homebrew/bin/zellij"   // optional: the zellij binary on that machine
+    connect_timeout "5s"   // optional: ssh's ConnectTimeout
+    fleet_timeout "10s"    // optional: how long scope=fleet waits for one host
 }
 ```
 
@@ -8714,8 +8716,8 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   takes `boxa/` to ask that machine. A session name cannot contain `/`
   (`validate_session_name`), so the split is never ambiguous. A pane handle alone is always
   local: name its host through `session`.
-- **The transport.** `ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o
-  ForwardX11=no`, never interactive and never forwarding. A connection is shared for 60 seconds
+- **The transport.** `ssh -T -o BatchMode=yes -o ConnectTimeout=<connect_timeout> -o
+  ForwardAgent=no -o ForwardX11=no`, never interactive and never forwarding. A connection is shared for 60 seconds
   through `ControlMaster`, with its socket in `/tmp/zellij-mcp-<uid>` (private, and short: a
   `$TMPDIR` on macOS is too long for a socket path). The remote line is
   `sh -c '<script>' sh '<bin>' '<argv>'...`, every word single-quoted, so the remote login shell
@@ -8725,7 +8727,7 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   `PATH`. `ZELLIJ_MCP_SSH` names a different ssh program, for tests. Exit 255 is ssh's own failure
   and is reported as "ssh could not reach <host>".
 - **`zellij_overview scope=fleet`** runs `list-agents --all-sessions --json` here
-  and on every remote host at once, each bounded by 10 seconds. Every row gains `host`. A host that does not
+  and on every remote host at once, each bounded by `fleet_timeout`. Every row gains `host`. A host that does not
   answer is one host entry with its `error` and `error_kind` `unreachable`, and one that answers
   with an error has `error_kind` `error`, never a failed call. A host on a build from before `--all-sessions` gets `ls --json` and one
   `list-agents` per session instead, so a fleet halfway through an upgrade still lists. The
@@ -8745,6 +8747,17 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   line as that machine's zellij ran it.
 - **Capability `mcp-remote-hosts`.**
 
+- **`connect_timeout` and `fleet_timeout`** set the two waits: whole seconds or a number with
+  `s`, `m` or `h`, from 1 s to 2 min, 5 s and 10 s unset. A bare number is seconds. Zero, a
+  fraction of a second (ssh takes whole seconds) and a value that is no span warn and keep the
+  default; a value past 2 min is cut to 2 min, with a warning. `fleet_timeout` must exceed
+  `connect_timeout`: an unset one follows a longer connect to connect plus 5 s, and a set one that
+  does not exceed it is raised to that, with a warning. The waits that contain them derive from
+  `connect_timeout`, so no outer bound cuts off an inner one: `send-message --host` waits connect
+  plus 15 s (20 s), and the session server kills the `send-message --host` it runs for a notice
+  at connect plus 25 s (30 s). These come from `zellij_utils::remote_timeouts`. ssh_config cannot
+  set `ConnectTimeout` for these calls, because `-o` wins.
+
 What is not supported: a host outside the block, password or host-key prompts (`BatchMode` fails
 instead), and a remote `kind: stacked`. Cancelling a remote `zellij_wait_for` kills the
 local ssh. The remote `wait` runs on until its own `--timeout`, because a `-T` session sends it no
@@ -8752,9 +8765,14 @@ hangup.
 
 **The block is read by `zellij mcp` alone**, from the config file the CLI would use (`--config`,
 `ZELLIJ_CONFIG_FILE`, `ZELLIJ_CONFIG_DIR`, then the default). It is read again on every call that
-names a host, so an edit needs no restart. It is not in `Options`, because `Options` crosses the
-client/server contract and no other process needs the list. An older binary ignores an unknown
-top-level key, so the block can be in a shared config before every machine runs this build. An
+names a host, so an edit needs no restart. The list is not in `Options`, because `Options` crosses
+the client/server contract and no other process needs it. The two timeouts are, as
+`Options::remote_timeouts`, set to `None` on the contract: the session server reads them from its
+own config file at start and at every reload, for the notice deadline, and `setup --check` warns
+on a bad one. An older binary ignores an unknown top-level key, so the block can be in a shared
+config before every machine runs this build. An older `zellij mcp` warns about `connect_timeout`
+and `fleet_timeout` as unknown entries and keeps 5 s and 10 s; its config parser never looks
+inside the block. An
 unknown entry or property warns on stderr at startup and in the fleet answer's `diagnostics`. One
 gap follows from not being in `Options`. A configuration-plugin save that writes `config.kdl`
 from the parsed config (`write_config_to_disk`) drops the block, as it drops comments.
@@ -9518,10 +9536,11 @@ reads stdin).
     send-message --to <its handle> --from host/-/zellij`, which the server runs on a short-lived
     thread. A sender on another machine gets the same command with `--host <its host>` (below),
     which runs it there over ssh. Either way that machine's config sets the notice's hold. The
-    child runs outside any pane, is killed after 30 s, and is never retried; at most 4 run at
+    child runs outside any pane, is killed after 30 s (`connect_timeout` plus 25 s), and is never
+    retried; at most 4 run at
     once, and a notice past that is dropped. Each outcome is one line in the server log.
   - A sender on a machine that does not answer (asleep, off the network) costs one ssh connect
-    timeout (5 s) and a log line. A host not in the receiving machine's `remote_hosts` is refused
+    timeout (`connect_timeout`, 5 s) and a log line. A host not in the receiving machine's `remote_hosts` is refused
     before ssh runs. ssh never asks for a password or a host key (`BatchMode`), so a server
     started by launchd or systemd without the key the login shell has is refused, not stalled.
   - The command line, a sender whose pane runs no agent any more, and a message that expired
@@ -9531,7 +9550,7 @@ reads stdin).
     sender is no pane. So a notice never starts another, on any machine.
 - **`send-message --host <host>`** runs the rest of the command line on another machine, over the
   same ssh `zellij_send` uses: only a host listed in `remote_hosts` in this config, given 20 s
-  plus any `--wait`. It passes `--session`, or `--all-sessions` for a `--to` with no session, and
+  (`connect_timeout` plus 15 s) plus any `--wait`. It passes `--session`, or `--all-sessions` for a `--to` with no session, and
   leaves an unset `--expire-s` unset, so the other machine's config decides. A host that names
   this machine (compared by first label, ignoring case and `user@`) is an ordinary local send.
 - **A message that lands late says how late.** A message typed or posted 2 minutes or more after

@@ -927,6 +927,13 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub agent_message_expire: Option<String>,
+    /// `remote_hosts { connect_timeout fleet_timeout }`, when the block sets either: how long a call to
+    /// another machine waits. Read from inside the `remote_hosts` block, which the MCP server and
+    /// `send-message --host` read themselves; kept here for the session server, whose notice deadline
+    /// derives from it, and for `setup --check`. Never written back: a config dump has no `remote_hosts`
+    #[clap(skip)]
+    #[serde(default)]
+    pub remote_timeouts: Option<crate::remote_timeouts::RemoteTimeouts>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1184,6 +1191,7 @@ impl Options {
         let agent_message_expire = other
             .agent_message_expire
             .or_else(|| self.agent_message_expire.clone());
+        let remote_timeouts = other.remote_timeouts.or(self.remote_timeouts);
 
         Options {
             stacked_pane_list_orientation,
@@ -1283,6 +1291,7 @@ impl Options {
             command_pane_on_clean_exit,
             person_name,
             agent_message_expire,
+            remote_timeouts,
         }
     }
 
@@ -1478,6 +1487,7 @@ impl Options {
         let agent_message_expire = other
             .agent_message_expire
             .or_else(|| self.agent_message_expire.clone());
+        let remote_timeouts = other.remote_timeouts.or(self.remote_timeouts);
 
         Options {
             stacked_pane_list_orientation,
@@ -1577,6 +1587,7 @@ impl Options {
             command_pane_on_clean_exit,
             person_name,
             agent_message_expire,
+            remote_timeouts,
         }
     }
 

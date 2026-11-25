@@ -1375,6 +1375,7 @@ mod tests {
             name: "boxa".into(),
             bin: None,
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         });
         assert!(same_dir("/srv/app/", "/srv/app", &remote));
         assert!(!same_dir("/srv", "/srv/app", &remote));

@@ -14,6 +14,10 @@
 //! }
 //! ```
 //!
+//! `connect_timeout` and `fleet_timeout` set how long ssh waits for a connection and how long
+//! `scope=fleet` waits for one host: whole seconds from 1 to 120, 5 and 10 unset. The bounds that
+//! derive from them are in `zellij_utils::remote_timeouts`.
+//!
 //! An alias is a second, shorter name for a host: `boxc/work` reaches `boxc.example.net`. A `from`
 //! line takes its aliases from a column, `alias_column="short"`.
 //!
@@ -41,10 +45,6 @@ pub const SSH_PROGRAM_ENV: &str = "ZELLIJ_MCP_SSH";
 /// cannot contain it - see `zellij_utils::sessions::validate_session_name`.
 pub const HOST_SEPARATOR: char = '/';
 
-/// How long `zellij_overview scope=fleet` waits for any one host, in seconds. ssh gives up on a
-/// connection after five; the rest is the remote `list-agents` itself.
-pub const FLEET_TIMEOUT_S: u64 = 10;
-
 /// One `host` line of the block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteHost {
@@ -56,6 +56,8 @@ pub struct RemoteHost {
     /// A second name a `session` may use for this host: `alias="boxc"`, or a `from` table's
     /// `alias_column`. ssh is always given `name`.
     pub alias: Option<String>,
+    /// ssh's `ConnectTimeout`, in seconds: the block's `connect_timeout`, 5 unset.
+    pub connect_timeout_s: u64,
 }
 
 /// The `remote_hosts` block, and what in it was passed over.
@@ -67,6 +69,8 @@ pub struct RemoteHosts {
     pub warnings: Vec<String>,
     /// The file the block was read from, for a refusal to name.
     pub path: Option<PathBuf>,
+    /// The block's `connect_timeout` and `fleet_timeout`, or their defaults.
+    pub timeouts: zellij_utils::remote_timeouts::RemoteTimeouts,
 }
 
 impl RemoteHosts {
@@ -139,8 +143,11 @@ impl RemoteHosts {
                         }
                     }
                 },
+                // read by `zellij_utils::remote_timeouts`, below
+                name if zellij_utils::remote_timeouts::is_timeout_entry(name) => {},
                 other => hosts.warnings.push(format!(
-                    "unknown remote_hosts entry {:?}, ignored (expected host or from)",
+                    "unknown remote_hosts entry {:?}, ignored (expected host, from, \
+                     connect_timeout or fleet_timeout)",
                     other
                 )),
             }
@@ -166,6 +173,12 @@ impl RemoteHosts {
             }
         }
         hosts.drop_clashing_aliases();
+        let (timeouts, warnings) = zellij_utils::remote_timeouts::from_block(children);
+        hosts.warnings.extend(warnings);
+        hosts.timeouts = timeouts.unwrap_or_default();
+        for host in &mut hosts.hosts {
+            host.connect_timeout_s = hosts.timeouts.connect_s;
+        }
         hosts
     }
 
@@ -340,6 +353,7 @@ impl RemoteHosts {
                 name: name.to_ascii_lowercase(),
                 bin: None,
                 alias,
+                connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
             });
         }
         hosts
@@ -387,7 +401,12 @@ impl RemoteHosts {
             return None;
         }
         let alias = alias.filter(|alias| !alias.eq_ignore_ascii_case(&name));
-        Some(RemoteHost { name, bin, alias })
+        Some(RemoteHost {
+            name,
+            bin,
+            alias,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
+        })
     }
 
     /// The listed host by this name or alias, ignoring case.
@@ -637,13 +656,19 @@ pub fn zellij_command_with(host: &RemoteHost, argv: &[String], strict: bool) -> 
 /// never forwarding the agent or X. A connection is shared across calls for a minute when there is
 /// a private directory for its socket, because a supervisor polling three hosts would otherwise pay
 /// a handshake per host per poll.
-pub fn ssh_argv(host: &str, remote_line: String, control_dir: Option<&Path>) -> Vec<String> {
+pub fn ssh_argv(
+    host: &str,
+    remote_line: String,
+    control_dir: Option<&Path>,
+    connect_timeout_s: u64,
+) -> Vec<String> {
+    let connect_timeout = format!("ConnectTimeout={}", connect_timeout_s);
     let mut argv: Vec<String> = [
         "-T",
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=5",
+        connect_timeout.as_str(),
         "-o",
         "ForwardAgent=no",
         "-o",
@@ -703,9 +728,18 @@ fn ssh_program() -> String {
 ///
 /// Exit 255 is ssh's own failure - the host did not answer, or refused the key - and says so,
 /// since the remote CLI never exits 255 and the bare ssh message does not name the cause.
-pub async fn run_line(host: &str, remote_line: String) -> Result<Outcome, String> {
+pub async fn run_line(
+    host: &str,
+    remote_line: String,
+    connect_timeout_s: u64,
+) -> Result<Outcome, String> {
     let program = ssh_program();
-    let argv = ssh_argv(host, remote_line, control_dir().as_deref());
+    let argv = ssh_argv(
+        host,
+        remote_line,
+        control_dir().as_deref(),
+        connect_timeout_s,
+    );
     let output = tokio::process::Command::new(&program)
         .args(&argv)
         .stdin(std::process::Stdio::null())
@@ -729,7 +763,12 @@ pub async fn run_line(host: &str, remote_line: String) -> Result<Outcome, String
 
 /// Run `zellij <argv>` on `host`.
 pub async fn run(host: &RemoteHost, argv: &[String]) -> Result<Outcome, String> {
-    run_line(&host.name, zellij_command(host, argv)).await
+    run_line(
+        &host.name,
+        zellij_command(host, argv),
+        host.connect_timeout_s,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -756,17 +795,20 @@ mod tests {
                 RemoteHost {
                     name: "boxa".into(),
                     bin: None,
-                    alias: None
+                    alias: None,
+                    connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
                 },
                 RemoteHost {
                     name: "boxb".into(),
                     bin: Some("/opt/homebrew/bin/zellij".into()),
-                    alias: None
+                    alias: None,
+                    connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
                 },
                 RemoteHost {
                     name: "Local-Box".into(),
                     bin: None,
-                    alias: None
+                    alias: None,
+                    connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
                 },
             ]
         );
@@ -780,6 +822,24 @@ mod tests {
         assert_eq!(RemoteHosts::load(None), RemoteHosts::default());
         let missing = RemoteHosts::load(Some(Path::new("/nonexistent/zellij/config.kdl")));
         assert!(missing.hosts.is_empty() && missing.warnings.is_empty());
+    }
+
+    #[test]
+    fn the_timeouts_reach_every_host_and_a_bad_one_warns() {
+        let hosts = RemoteHosts::parse(
+            "remote_hosts {\n  connect_timeout \"9s\"\n  fleet_timeout \"40s\"\n  host \"boxa\"\n  host \"boxb\"\n}\n",
+        );
+        assert!(hosts.warnings.is_empty(), "{:?}", hosts.warnings);
+        assert_eq!(hosts.timeouts.connect_s, 9);
+        assert_eq!(hosts.timeouts.fleet_s, 40);
+        assert!(hosts.hosts.iter().all(|host| host.connect_timeout_s == 9));
+        let bad =
+            RemoteHosts::parse("remote_hosts {\n  connect_timeout \"0\"\n  host \"boxa\"\n}\n");
+        assert_eq!(bad.hosts.len(), 1);
+        assert_eq!(bad.hosts[0].connect_timeout_s, 5);
+        assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
+        // no block, or one without the keys: the old constants
+        assert_eq!(RemoteHosts::parse(CONFIG).timeouts.fleet_s, 10);
     }
 
     #[test]
@@ -857,7 +917,8 @@ mod tests {
             Target::Remote(RemoteHost {
                 name: "boxb".into(),
                 bin: Some("/opt/homebrew/bin/zellij".into()),
-                alias: None
+                alias: None,
+                connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
             })
         );
         assert_eq!(arguments["session"], json!("work"));
@@ -957,6 +1018,7 @@ mod tests {
             name: "boxa".into(),
             bin: None,
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         };
         let argv: Vec<String> = ["-s", "my work", "action", "write-chars", "--", "it's $x"]
             .iter()
@@ -979,6 +1041,7 @@ mod tests {
             name: "boxa".into(),
             bin: Some(fake.display().to_string()),
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         };
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -1019,6 +1082,7 @@ mod tests {
             name: "boxa".into(),
             bin: Some(fake.display().to_string()),
             alias: None,
+            connect_timeout_s: zellij_utils::remote_timeouts::DEFAULT_CONNECT_TIMEOUT_S,
         };
         let argv = vec!["action".to_owned(), "list-panes".to_owned()];
         let run = |strict: bool| {
@@ -1040,6 +1104,7 @@ mod tests {
             "boxa",
             "sh -c 'x'".into(),
             Some(Path::new("/tmp/zellij-mcp-1000")),
+            5,
         );
         let joined = argv.join(" ");
         for expected in [
@@ -1059,8 +1124,9 @@ mod tests {
             );
         }
         assert_eq!(&argv[argv.len() - 3..], &["--", "boxa", "sh -c 'x'"]);
-        let unshared = ssh_argv("boxa", "x".into(), None);
+        let unshared = ssh_argv("boxa", "x".into(), None, 12);
         assert!(unshared.iter().any(|w| w == "ControlMaster=no"));
+        assert!(unshared.iter().any(|w| w == "ConnectTimeout=12"));
         assert!(!unshared.iter().any(|w| w.starts_with("ControlPath")));
     }
 

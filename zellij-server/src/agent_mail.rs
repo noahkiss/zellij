@@ -585,11 +585,25 @@ impl Mailbox {
     }
 }
 
-/// How long a notice to a sender elsewhere may take before its `send-message` is killed. That
-/// command gives another machine 20 s (ssh gives up on a connection after 5); this is the bound
-/// past it.
-#[cfg(not(test))]
-const NOTICE_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a notice to a sender elsewhere may take before its `send-message` is killed, in
+/// seconds: 10 s past the bound that command keeps itself, which is ssh's connect timeout plus 15
+/// s. 30 s at the defaults; `remote_hosts { connect_timeout }` moves it, through
+/// [`set_remote_timeouts`].
+static NOTICE_DEADLINE_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30);
+
+/// fork addition: takes the config's `remote_hosts` timeouts, at the session's start and at every
+/// reload, so a notice's deadline stays past the `send-message --host` it runs.
+pub fn set_remote_timeouts(timeouts: zellij_utils::remote_timeouts::RemoteTimeouts) {
+    NOTICE_DEADLINE_S.store(
+        timeouts.notice_deadline_s(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// The notice deadline [`set_remote_timeouts`] last set.
+pub fn notice_deadline() -> Duration {
+    Duration::from_secs(NOTICE_DEADLINE_S.load(std::sync::atomic::Ordering::SeqCst))
+}
 
 /// How many notices to senders elsewhere may be on their way at once. A burst of expiries past
 /// this is logged and dropped, so a sender's machine that does not answer never piles up threads.
@@ -661,7 +675,7 @@ fn zellij_program() -> std::ffi::OsString {
         .unwrap_or_else(|| "zellij".into())
 }
 
-/// Runs `zellij <argv>` to [`NOTICE_DEADLINE`], outside any pane: the child carries none of the
+/// Runs `zellij <argv>` to [`notice_deadline`], outside any pane: the child carries none of the
 /// variables that make a command think it runs in one.
 #[cfg(not(test))]
 fn run_notice(argv: &[String]) -> Result<(), String> {
@@ -678,10 +692,11 @@ fn run_notice(argv: &[String]) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("cannot run zellij: {}", e))?;
     let started = Instant::now();
+    let deadline = notice_deadline();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < NOTICE_DEADLINE => {
+            Ok(None) if started.elapsed() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
             },
             Ok(None) => {
@@ -689,7 +704,7 @@ fn run_notice(argv: &[String]) -> Result<(), String> {
                 let _ = child.wait();
                 return Err(format!(
                     "send-message took more than {} s",
-                    NOTICE_DEADLINE.as_secs()
+                    deadline.as_secs()
                 ));
             },
             Err(e) => return Err(e.to_string()),

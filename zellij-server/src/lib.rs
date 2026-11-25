@@ -1265,6 +1265,9 @@ impl SessionMetaData {
                 // fixed at `FirstClientConnected` and unchanged for the life of the session.
                 set_snapshot_settings(SnapshotSettings::from_options(Some(&new_config.options)));
                 set_terminal_title_format(TerminalTitleFormat::from_options(&new_config.options));
+                crate::agent_mail::set_remote_timeouts(
+                    new_config.options.remote_timeouts.unwrap_or_default(),
+                );
             }
 
             self.default_shell = new_config.options.default_shell.as_ref().map(|shell| {
@@ -4554,6 +4557,9 @@ pub fn start_server_impl(
                 set_terminal_title_format(TerminalTitleFormat::from_options(
                     &runtime_config_options,
                 ));
+                crate::agent_mail::set_remote_timeouts(
+                    runtime_config_options.remote_timeouts.unwrap_or_default(),
+                );
                 info!("FirstClientConnected: initializing session");
                 let mut session = init_session(
                     os_input.clone(),

@@ -732,6 +732,18 @@ context_menu {
 //
 // agent_message_expire "4h"
 
+// How long a call to another machine waits (zellij mcp, send-message --host), inside the
+// remote_hosts block: ssh's connection timeout, and how long zellij_overview scope=fleet waits for
+// one host. Whole seconds, or a number with s, m or h, from 1s to 120s. fleet_timeout must exceed
+// connect_timeout; one that does not is raised to connect_timeout plus 5s
+// Default: connect_timeout "5s", fleet_timeout "10s"
+//
+// remote_hosts {
+//     connect_timeout "8s"
+//     fleet_timeout "20s"
+//     host "boxa"
+// }
+
 // Extra directives for the init-system unit `zellij session enable` writes
 // A generated unit cannot know the local facts - that this session must start after some other
 // service, that it wants a particular nice level - so they are named here, where `zellij session

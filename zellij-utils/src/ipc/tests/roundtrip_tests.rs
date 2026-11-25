@@ -525,6 +525,7 @@ fn test_client_messages() {
                 command_pane_on_clean_exit: None,
                 person_name: None,
                 agent_message_expire: None,
+                remote_timeouts: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),

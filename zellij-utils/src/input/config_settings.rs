@@ -202,6 +202,7 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         command_pane_on_clean_exit: _,
         person_name: _,
         agent_message_expire: _,
+        remote_timeouts: _,
     } = options;
     let entries = [
         (SettingKey::SimplifiedUi, display_text(simplified_ui)),

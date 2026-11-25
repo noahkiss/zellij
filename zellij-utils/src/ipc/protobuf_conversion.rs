@@ -1324,6 +1324,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             // read by the sending CLI from its own config; the server never needs it
             person_name: None,
             agent_message_expire: None,
+            remote_timeouts: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,
