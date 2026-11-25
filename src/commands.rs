@@ -705,6 +705,10 @@ fn no_session_answers_to(sentence: String) -> ! {
     for (name, _) in get_sessions().unwrap_or_default() {
         eprintln!("{}", name);
     }
+    // fork addition: and why there may be none here, when this shell resolved the wrong place
+    if let Some(note) = zellij_utils::sessions::socket_dir_misresolved() {
+        eprintln!("{}", note);
+    }
     process::exit(2);
 }
 

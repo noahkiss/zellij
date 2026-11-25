@@ -5060,7 +5060,9 @@ and on macOS the per-user temporary dir read from the system (`confstr(_CS_DARWI
 not from `TMPDIR`. They also feed the existing split warnings of `ls` and `attach`. The note never
 names `--all-sessions`: the fleet overview reads an exit 2 that names it as an older build.
 
-Plain `list-agents` without `--all-sessions` already exited 2 with no session to ask.
+Plain `list-agents` without `--all-sessions` already exited 2 with no session to ask. That error,
+and every other "no active session" error from `zellij action`, now ends with the same note when it
+applies.
 
 `socket_dir_misresolved` and `misresolved_note` in `zellij-utils/src/sessions.rs`, the candidates in
 `zellij-utils/src/consts.rs` (`socket_dir_candidates`), the check in `src/commands.rs`. Tests in
@@ -9230,6 +9232,14 @@ by anything that is not an agent's call. A dropped press is forgotten at the nex
 button, so a lost release cannot hold the mouse (see nkmk.45's held gestures). `input_guard_ms 0`
 sends nothing new: the person's writes go out as `WriteCharacter` and no agent call is bracketed.
 
+An agent's call counts its moves as its own for 2 s at most (`AGENT_CALL_WINDOW`). A call that ran
+longer - one that blocks until a pane exits - arms nothing, so the person's own tab switches meanwhile
+are not held against them. A client whose person used a bound key or a click while the call ran is
+not guarded either: that move may be theirs.
+
+The marker is drawn in the frame's title row. A tab with one pane draws no frame row, so a guard
+there shows no marker; the guard still holds.
+
 How it works. The CLI sends one carrier on every action, `ActionCaller { agent }`. The route thread
 brackets an agent's call with `InputGuardSnapshot` and `InputGuardArm`; the screen compares every
 client's tab, pane and mode before and after and arms a guard for each client that moved. The
@@ -9291,7 +9301,9 @@ Anything else, `--no-focus`, and the probes are not held. `switch-session` is no
 moves the focus, so MCP has no `now`.
 
 **`zellij action --now <verb>`** applies at once. It is one action-level flag, before the verb like
-`--json`, and it is a no-op on a verb that moves no focus.
+`--json`, and it is a no-op on a verb that moves no focus. The top-level `zellij run --focus` and
+`zellij plugin --focus` have no `--now`; `zellij action new-pane --focus` and `zellij action
+launch-plugin -f` take it.
 
 **Output.** A held verb from an agent returns at once and ends its report with `focus: pending`; one
 that applied with `focus: applied` (`"focus"` in `action --json`). Nothing blocks by default.
@@ -9305,7 +9317,9 @@ pane has no virtual focus and must name its target. To type into a pane, name it
 (`write-chars --pane-id`); no focus is needed first.
 
 **State.** Idle time and the held change are per attached client. A later change for the same
-client replaces the held one. A held change for a pane that is gone does nothing when it applies.
+client replaces the held one, and so does one that applies at once (`--now`, or a person who is
+not typing): the person is not pulled back to the older target at their next pause. A move to a pane
+or tab that is not there is not held: it goes through at once and reports its miss, exit 2. A held change for a pane that is gone does nothing when it applies.
 A client that detaches drops its held change.
 
 **Fail open.** A held change is applied or dropped on the clock: it applies by `focus_wait_max` at

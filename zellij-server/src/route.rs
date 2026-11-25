@@ -673,6 +673,54 @@ fn focus_plan(action: &Action) -> FocusPlan {
     }
 }
 
+/// fork addition: whether the pane or tab a focus move names is there. A move to nothing is not
+/// held: it goes through at once and reports its miss (exit 2) as it always did. A create, a
+/// relative move, and a session that does not answer in time count as there.
+fn focus_target_exists(action: &Action, senders: &ThreadSenders) -> bool {
+    let names_a_target = matches!(
+        action,
+        Action::FocusPaneByPaneId { .. }
+            | Action::FocusTerminalPaneWithId { .. }
+            | Action::FocusPluginPaneWithId { .. }
+            | Action::GoToTab { .. }
+            | Action::GoToTabById { .. }
+            | Action::GoToTabName { create: false, .. }
+    );
+    if !names_a_target {
+        return true;
+    }
+    match request_panes_from_screen(senders, true) {
+        Ok(Some(panes)) => focus_target_in(action, &panes),
+        _ => true,
+    }
+}
+
+/// [`focus_target_exists`] against a pane list.
+fn focus_target_in(action: &Action, panes: &[zellij_utils::data::PaneListEntry]) -> bool {
+    let pane_is = |id: u32, plugin: bool| {
+        panes
+            .iter()
+            .any(|entry| entry.pane_info.id == id && entry.pane_info.is_plugin == plugin)
+    };
+    match action {
+        Action::FocusPaneByPaneId { pane_id, .. } => match pane_id {
+            zellij_utils::data::PaneId::Terminal(id) => pane_is(*id, false),
+            zellij_utils::data::PaneId::Plugin(id) => pane_is(*id, true),
+        },
+        Action::FocusTerminalPaneWithId { pane_id, .. } => pane_is(*pane_id, false),
+        Action::FocusPluginPaneWithId { pane_id, .. } => pane_is(*pane_id, true),
+        // `go-to-tab` takes the 1-based position
+        Action::GoToTab { index } => panes
+            .iter()
+            .any(|entry| entry.tab_position + 1 == *index as usize),
+        Action::GoToTabById { id } => panes
+            .iter()
+            .any(|entry| entry.pane_info.tab_id as u64 == *id),
+        Action::GoToTabName { name, .. } => panes.iter().any(|entry| entry.tab_name == *name),
+        _ => true,
+    }
+}
+
 /// fork addition: whether an attached client's action is the person at work - a key, a paste,
 /// a click or the wheel. A hover is not: friendly focus waits for typing, not for a resting mouse.
 fn is_person_activity(action: &Action) -> bool {
@@ -4039,6 +4087,18 @@ pub(crate) fn route_thread_main(
                                     );
                                     return Ok(should_break);
                                 }
+                                // a bound key that passed may move the focus: the person's own
+                                // move, which no agent's bracket may claim
+                                if routes_only && !is_plain_typing {
+                                    if let Some(Ok(mut guards)) =
+                                        input_guards.as_ref().map(|guards| guards.lock())
+                                    {
+                                        guards.note_person_move(
+                                            client_id,
+                                            std::time::Instant::now(),
+                                        );
+                                    }
+                                }
                                 for key_action in key_actions {
                                     let action = match key_action {
                                         PopupKeyAction::Route(action) => action,
@@ -4224,11 +4284,16 @@ pub(crate) fn route_thread_main(
                                     (&person_guard, &action)
                                 {
                                     let passes = guards.lock().map_or(true, |mut guards| {
-                                        guards.mouse_passes(
-                                            client_id,
-                                            event,
-                                            std::time::Instant::now(),
-                                        )
+                                        let now = std::time::Instant::now();
+                                        let passes = guards.mouse_passes(client_id, event, now);
+                                        if passes
+                                            && event.event_type
+                                                == zellij_utils::input::mouse::MouseEventType::Press
+                                            && (event.left || event.right || event.middle)
+                                        {
+                                            guards.note_person_move(client_id, now);
+                                        }
+                                        passes
                                     });
                                     if !passes {
                                         log::info!(
@@ -4276,7 +4341,14 @@ pub(crate) fn route_thread_main(
                                     && !matches!(plan, FocusPlan::Unaffected)
                                     && input_guards.lock().map_or(false, |guards| {
                                         guards.should_wait(client_id, std::time::Instant::now())
-                                    });
+                                    })
+                                    && focus_target_exists(&action, &senders);
+                                if !waits && !matches!(plan, FocusPlan::Unaffected) {
+                                    // it applies now: a change still held is overtaken by it
+                                    if let Ok(mut guards) = input_guards.lock() {
+                                        guards.cancel_pending(client_id);
+                                    }
+                                }
                                 let bracket =
                                     agent_call && person_input_guard(&input_guards).is_some();
                                 let waiter = FocusWaiter {
@@ -6355,5 +6427,58 @@ mod tests {
             .unwrap()
             .defer(1, Some(5), None, std::time::Instant::now());
         assert!(with_virtual_focus(write(), caller(Some(5)), &guards).is_err());
+    }
+
+    /// fork addition: a focus move to a pane or tab that is not there is not held; it goes
+    /// through at once and reports its miss.
+    #[test]
+    fn a_focus_move_to_nothing_is_not_held() {
+        use zellij_utils::data::{PaneId as UtilsPaneId, PaneInfo, PaneListEntry};
+        let entry = |id, is_plugin, tab_id, tab_position, tab_name: &str| PaneListEntry {
+            pane_info: PaneInfo {
+                id,
+                is_plugin,
+                tab_id,
+                ..Default::default()
+            },
+            tab_position,
+            tab_name: tab_name.to_owned(),
+            agent: None,
+            command_state: None,
+            last_command_exit_code: None,
+            input_since_prompt: false,
+            input_since_state: false,
+            prefilled_command: None,
+            queued_messages: 0,
+            program_status: None,
+        };
+        let panes = vec![entry(0, false, 0, 0, "one"), entry(1, false, 4, 1, "two")];
+        let there = |action: Action| focus_target_in(&action, &panes);
+        assert!(there(Action::FocusPaneByPaneId {
+            pane_id: UtilsPaneId::Terminal(1),
+            no_focus: false,
+        }));
+        assert!(!there(Action::FocusPaneByPaneId {
+            pane_id: UtilsPaneId::Terminal(9),
+            no_focus: false,
+        }));
+        assert!(!there(Action::FocusPaneByPaneId {
+            pane_id: UtilsPaneId::Plugin(1),
+            no_focus: false,
+        }));
+        assert!(there(Action::GoToTab { index: 2 }));
+        assert!(!there(Action::GoToTab { index: 3 }));
+        assert!(there(Action::GoToTabById { id: 4 }));
+        assert!(!there(Action::GoToTabById { id: 1 }));
+        assert!(there(Action::GoToTabName {
+            name: "two".to_owned(),
+            create: false,
+            no_focus: false,
+        }));
+        assert!(!there(Action::GoToTabName {
+            name: "three".to_owned(),
+            create: false,
+            no_focus: false,
+        }));
     }
 }

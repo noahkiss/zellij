@@ -26275,7 +26275,9 @@ fn screen_with_two_tabs_for_the_input_guard() -> (Screen, ForwardCapture) {
 /// What an agent's `go-to-tab` does to the screen: the snapshot, the move, the arm.
 fn agent_switches_tab(screen: &mut Screen) -> bool {
     let spots = screen.input_guard_spots();
-    screen.input_guard_snapshots.insert(99, spots);
+    screen
+        .input_guard_snapshots
+        .insert(99, (std::time::Instant::now(), spots));
     screen.switch_tab_next(None, true, 1).expect("TEST");
     screen.arm_input_guards(99)
 }
@@ -26379,11 +26381,75 @@ fn leaving_the_tab_ends_the_guard_unless_an_agent_call_is_moving_it() {
     };
     assert!(agent_switches_tab(&mut screen));
     // an agent call still running: its own drain does not end the guard
-    screen.input_guard_snapshots.insert(98, HashMap::new());
+    screen
+        .input_guard_snapshots
+        .insert(98, (std::time::Instant::now(), HashMap::new()));
     screen.switch_tab_next(None, true, 1).expect("TEST");
     assert!(held(&screen));
     screen.input_guard_snapshots.clear();
     // any other drain does (drain_connected_clients), before a frame is drawn
     screen.switch_tab_next(None, true, 1).expect("TEST");
     assert!(!held(&screen));
+}
+
+#[test]
+fn a_call_that_ran_long_arms_no_guard() {
+    let (mut screen, _capture) = screen_with_two_tabs_for_the_input_guard();
+    let spots = screen.input_guard_spots();
+    let long_ago = std::time::Instant::now()
+        - crate::input_guard::AGENT_CALL_WINDOW
+        - std::time::Duration::from_millis(1);
+    screen.input_guard_snapshots.insert(99, (long_ago, spots));
+    // the person switched tabs while a blocking call ran
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    assert!(!screen.arm_input_guards(99));
+    assert!(!screen.agent_call_in_flight());
+}
+
+#[test]
+fn a_move_the_person_made_during_the_call_is_not_held_against_them() {
+    let (mut screen, _capture) = screen_with_two_tabs_for_the_input_guard();
+    let spots = screen.input_guard_spots();
+    screen
+        .input_guard_snapshots
+        .insert(99, (std::time::Instant::now(), spots));
+    screen
+        .input_guards
+        .lock()
+        .unwrap()
+        .note_person_move(1, std::time::Instant::now());
+    screen.switch_tab_next(None, true, 1).expect("TEST");
+    assert!(!screen.arm_input_guards(99));
+}
+
+#[test]
+fn an_agent_mode_change_and_an_agent_close_both_arm_a_guard() {
+    // a mode change: the pane stays, so typing passes and chords are held
+    let (mut screen, _capture) = screen_with_two_tabs_for_the_input_guard();
+    let spots = screen.input_guard_spots();
+    screen
+        .input_guard_snapshots
+        .insert(99, (std::time::Instant::now(), spots));
+    screen
+        .change_mode(InputMode::Locked, None, 1)
+        .expect("TEST");
+    assert!(screen.arm_input_guards(99), "a mode change is guarded");
+    assert!(screen
+        .input_guards
+        .lock()
+        .unwrap()
+        .drops_bound_keys(1, std::time::Instant::now()));
+    assert!(!screen.route_guarded_typing(1, &None, b"a", false));
+
+    // a close that moves the person: their pane goes, they land elsewhere
+    let (mut screen, _capture) = screen_with_two_tabs_for_the_input_guard();
+    let spots = screen.input_guard_spots();
+    screen
+        .input_guard_snapshots
+        .insert(99, (std::time::Instant::now(), spots));
+    screen.close_tab(1).expect("TEST");
+    assert!(
+        screen.arm_input_guards(99),
+        "a close that moved them is guarded"
+    );
 }

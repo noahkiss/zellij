@@ -2530,7 +2530,13 @@ pub(crate) struct Screen {
     input_guards: crate::input_guard::SharedInputGuards,
     /// fork addition: where every client was looking before an agent's call that is still
     /// running, by the CLI client id of that call.
-    input_guard_snapshots: HashMap<ClientId, HashMap<ClientId, crate::input_guard::Spot>>,
+    input_guard_snapshots: HashMap<
+        ClientId,
+        (
+            std::time::Instant,
+            HashMap<ClientId, crate::input_guard::Spot>,
+        ),
+    >,
     /// fork addition: whether the thread that drives `InputGuardTick` runs.
     input_guard_ticking: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// fork addition: the guard markers the frames were last drawn with.
@@ -9090,19 +9096,30 @@ impl Screen {
     /// fork addition: an agent's call (`token`) ran: guard every client it moved. Returns
     /// whether a frame needs drawing.
     fn arm_input_guards(&mut self, token: ClientId) -> bool {
-        let Some(before) = self.input_guard_snapshots.remove(&token) else {
+        let Some((taken, before)) = self.input_guard_snapshots.remove(&token) else {
             return false;
         };
+        let now = std::time::Instant::now();
+        // a call that ran long (one that blocks until a pane exits, or ran out its completion
+        // wait) cannot tell its own move from the person's: it arms nothing
+        if now.saturating_duration_since(taken) > crate::input_guard::AGENT_CALL_WINDOW {
+            return false;
+        }
         let moved = crate::input_guard::moved(&before, &self.input_guard_spots());
         if moved.is_empty() {
             return false;
         }
-        let now = std::time::Instant::now();
+        let mut armed = false;
         if let Ok(mut guards) = self.input_guards.lock() {
             if !guards.enabled() {
                 return false;
             }
             for (client_id, previous, focused) in moved {
+                // the person moved too, by a key or a click of their own, while the call ran:
+                // the move is theirs as much as the agent's, and is not held against them
+                if guards.person_moved_since(client_id, taken) {
+                    continue;
+                }
                 log::info!(
                     "input guard: an agent moved client {} from {:?} to {:?}",
                     client_id,
@@ -9110,18 +9127,31 @@ impl Screen {
                     focused
                 );
                 guards.arm(client_id, previous, focused, now);
+                armed = true;
             }
+        }
+        if !armed {
+            return false;
         }
         self.start_input_guard_ticker();
         self.sync_input_guard_markers();
         true
     }
 
+    /// fork addition: whether an agent's call is running now - one bracketed within
+    /// `input_guard::AGENT_CALL_WINDOW`. An older bracket no longer counts.
+    fn agent_call_in_flight(&self) -> bool {
+        let now = std::time::Instant::now();
+        self.input_guard_snapshots.values().any(|(taken, _)| {
+            now.saturating_duration_since(*taken) <= crate::input_guard::AGENT_CALL_WINDOW
+        })
+    }
+
     /// fork addition: a client left a tab. Its guard ends - unless an agent's call is still
     /// running, whose own move this is; that call re-arms the guard when it ends, keeping the
     /// pane the person was in first.
     fn clear_input_guards_on_drain(&self, client_ids: &[ClientId]) {
-        if !self.input_guard_snapshots.is_empty() {
+        if self.agent_call_in_flight() {
             return;
         }
         if let Ok(mut guards) = self.input_guards.lock() {
@@ -9145,7 +9175,7 @@ impl Screen {
             return false;
         }
         // while an agent's call runs, its own move is not a move by somebody else
-        if self.input_guard_snapshots.is_empty() {
+        if !self.agent_call_in_flight() {
             for (client_id, pane_id) in markers.clone() {
                 if self.get_active_pane_id(&client_id) != Some(pane_id) {
                     guards.clear(client_id);
@@ -18568,7 +18598,12 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::InputGuardSnapshot(token) => {
                 let spots = screen.input_guard_spots();
-                screen.input_guard_snapshots.insert(token, spots);
+                let now = std::time::Instant::now();
+                // a bracket whose end never came is forgotten
+                screen.input_guard_snapshots.retain(|_, (taken, _)| {
+                    now.saturating_duration_since(*taken) <= crate::input_guard::AGENT_CALL_WINDOW
+                });
+                screen.input_guard_snapshots.insert(token, (now, spots));
             },
             ScreenInstruction::InputGuardArm(token) => {
                 if screen.arm_input_guards(token) {

@@ -33,6 +33,9 @@ use crate::ClientId;
 pub const DEFAULT_GUARD_MS: u64 = 500;
 /// The most `input_guard_ms` is taken as.
 pub const MAX_GUARD_MS: u64 = 10_000;
+/// How long an agent's call may run and still count its moves as its own. A longer one - a call
+/// that blocks until a pane exits - arms nothing, and stops holding back the clears.
+pub const AGENT_CALL_WINDOW: Duration = Duration::from_secs(2);
 /// The longest typing keeps a guard up, counted from its start, when `input_guard_ms` is shorter.
 pub const TYPING_CAP: Duration = Duration::from_secs(3);
 
@@ -122,6 +125,8 @@ pub struct InputGuards {
     wait_max_ms: u64,
     /// When each client's person last pressed a key, clicked or scrolled.
     last_input: HashMap<ClientId, Instant>,
+    /// When each client's person last used a bound key or a click - something that can move.
+    last_move: HashMap<ClientId, Instant>,
     /// The focus change waiting for each client's person to pause.
     pending: HashMap<ClientId, Pending>,
     next_generation: u64,
@@ -160,6 +165,7 @@ impl Default for InputGuards {
             wait_idle_ms: zellij_utils::focus_wait::DEFAULT_IDLE_MS,
             wait_max_ms: zellij_utils::focus_wait::DEFAULT_MAX_MS,
             last_input: HashMap::new(),
+            last_move: HashMap::new(),
             pending: HashMap::new(),
             next_generation: 0,
         }
@@ -193,6 +199,24 @@ impl InputGuards {
     /// The person at `client_id` pressed a key, clicked or scrolled.
     pub fn note_person_input(&mut self, client_id: ClientId, now: Instant) {
         self.last_input.insert(client_id, now);
+    }
+
+    /// The person at `client_id` used a bound key or clicked, and it passed.
+    pub fn note_person_move(&mut self, client_id: ClientId, now: Instant) {
+        self.last_move.insert(client_id, now);
+    }
+
+    /// Whether the person at `client_id` used a bound key or clicked after `since`.
+    pub fn person_moved_since(&self, client_id: ClientId, since: Instant) -> bool {
+        self.last_move
+            .get(&client_id)
+            .map_or(false, |moved| *moved >= since)
+    }
+
+    /// An agent's focus change applied at once: one still held for the client is dropped, so the
+    /// person is not pulled back to it at their next pause.
+    pub fn cancel_pending(&mut self, client_id: ClientId) {
+        self.pending.remove(&client_id);
     }
 
     /// Whether an agent's focus change for `client_id` waits now: the wait is on and the person
@@ -376,6 +400,7 @@ impl InputGuards {
         self.guards.remove(&client_id);
         self.dropped_presses.remove(&client_id);
         self.last_input.remove(&client_id);
+        self.last_move.remove(&client_id);
         self.pending.remove(&client_id);
     }
 
@@ -784,6 +809,17 @@ mod tests {
         assert_eq!(guards.virtual_focus(5), Some(Some(NEW)));
         guards.forget_client(ME);
         assert_eq!(guards.pending_state(ME, second, t0), PendingState::Gone);
+        assert_eq!(guards.virtual_focus(5), None);
+    }
+
+    #[test]
+    fn a_change_that_applies_at_once_drops_a_held_one() {
+        let t0 = Instant::now();
+        let mut guards = InputGuards::default();
+        guards.note_person_input(ME, t0);
+        let held = guards.defer(ME, Some(5), Some(OLD), t0);
+        guards.cancel_pending(ME);
+        assert_eq!(guards.pending_state(ME, held, t0), PendingState::Gone);
         assert_eq!(guards.virtual_focus(5), None);
     }
 
