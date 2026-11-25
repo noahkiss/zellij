@@ -1,5 +1,8 @@
 //! Dwell tracking for `bell_clear_delay_ms`.
 //!
+//! The same delay governs the attention markers (`AttentionTracker::set_look_dwell_ms`): it is
+//! how long a pane must be looked at before its notifications clear.
+//!
 //! A pane that rang the bell keeps its `[!]` until it has been focused, without
 //! interruption, for the configured delay. The rule the tracker implements is:
 //! clear the bell once the pane has been continuously focused for the delay,
@@ -14,6 +17,10 @@ use std::time::{Duration, Instant};
 
 use crate::panes::PaneId;
 use crate::ClientId;
+
+/// The dwell when the config does not set `bell_clear_delay_ms`. 0 restores upstream's
+/// clear-on-look.
+pub const DEFAULT_BELL_CLEAR_DELAY_MS: u64 = 1000;
 
 #[derive(Debug, Default)]
 pub struct BellDwellTracker {

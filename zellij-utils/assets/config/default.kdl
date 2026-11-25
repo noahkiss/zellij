@@ -671,12 +671,14 @@ context_menu {
 //
 // osc8_hyperlinks false
 
-// How long a pane that rang the bell has to stay focused before its [!] notification clears,
-// in milliseconds
-// The dwell restarts if the pane rings again while it is focused
-// Default: 0 (the notification clears the moment the pane is focused)
+// How long a pane must be looked at, without a break, before its notifications clear, in
+// milliseconds. It covers the bell's [!] (cleared by focusing the pane) and the attention
+// markers: done, failed, new output and notifications (seen once the pane has been on screen
+// for the delay, acknowledged on its frame once it has been focused for it)
+// The bell's dwell restarts if the pane rings again while it is focused
+// Default: 1000. 0 restores the upstream behaviour: a look clears them at once
 //
-// bell_clear_delay_ms 1000
+// bell_clear_delay_ms 0
 
 // Badge the tab bar (`TCC`) when this machine's Full Disk Access is missing (macOS only)
 // Opt-in, because only you know whether you mean zellij to hold that permission - and where you

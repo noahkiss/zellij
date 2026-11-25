@@ -163,7 +163,9 @@ pub enum BackgroundJob {
     },
     AttentionIdleCheck(PaneId, u64),
     ReportHostProgramStatus(Option<zellij_utils::attention::HostProgramStatus>),
-    ClearPaneBellAfterDwell(PaneId, u64), // u64 - the dwell in milliseconds
+    // u64 - the dwell in milliseconds. Also sent when a look at a pane starts, so the
+    // attention markers are re-synced once the look has lasted the dwell.
+    ClearPaneBellAfterDwell(PaneId, u64),
     Exit,
 }
 

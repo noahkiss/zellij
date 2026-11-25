@@ -522,9 +522,9 @@ pub struct Options {
     #[serde(default)]
     pub session_snapshot_limit: Option<usize>,
 
-    /// How long a pane that rang the bell has to stay focused before its notification is
-    /// cleared, in milliseconds. Default is 0 - the notification clears the moment the pane is
-    /// focused.
+    /// How long a pane must be looked at, without a break, before its notifications clear, in
+    /// milliseconds: the bell's `[!]` and the attention markers (done, failed, new output, a
+    /// notification). Default is 1000; 0 clears them the moment the pane is looked at.
     /// config.kdl only - it is read by the server, so there is nothing for a CLI flag to affect.
     #[clap(skip)]
     #[serde(default)]

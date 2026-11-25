@@ -3012,7 +3012,11 @@ impl Screen {
             host_notification_protocol: HostNotificationProtocol::default(),
             client_host_terminal_env: HashMap::new(),
             last_forwarded_osc7: HashMap::new(),
-            attention: crate::attention::AttentionTracker::default(),
+            attention: {
+                let mut attention = crate::attention::AttentionTracker::default();
+                attention.set_look_dwell_ms(bell_clear_delay_ms);
+                attention
+            },
             last_session_attention: None,
             global_attention: None,
             client_session_histories: HashMap::new(),
@@ -11711,6 +11715,7 @@ impl Screen {
         self.mouse_hover_tips = mouse_hover_tips;
         self.visual_bell = visual_bell;
         self.bell_dwell.set_delay_ms(bell_clear_delay_ms);
+        self.attention.set_look_dwell_ms(bell_clear_delay_ms);
         self.focus_follows_mouse = focus_follows_mouse;
         self.mouse_click_through = mouse_click_through;
         self.osc133_command_selection = osc133_command_selection;
@@ -13342,7 +13347,9 @@ pub(crate) fn screen_thread_main(
     let mouse_hover_effects = config_options.mouse_hover_effects.unwrap_or(true);
     let mouse_hover_tips = config_options.mouse_hover_tips.unwrap_or(true);
     let visual_bell = config_options.visual_bell.unwrap_or(true);
-    let bell_clear_delay_ms = config_options.bell_clear_delay_ms.unwrap_or(0);
+    let bell_clear_delay_ms = config_options
+        .bell_clear_delay_ms
+        .unwrap_or(crate::bell_dwell::DEFAULT_BELL_CLEAR_DELAY_MS);
     let focus_follows_mouse = config_options.focus_follows_mouse.unwrap_or(false);
     let mouse_click_through = config_options.mouse_click_through.unwrap_or(false);
     let nested_session_handling = config_options.nested_session_handling.unwrap_or_default();
@@ -19775,7 +19782,10 @@ pub(crate) fn screen_thread_main(
                 screen.reconfigure_attention(config);
             },
             ScreenInstruction::ClearBellAfterDwell(pane_id) => {
+                // one dwell has passed since a look at this pane started: the bell decides for
+                // itself, and a re-sync lets the attention tracker clear what the look has earned
                 screen.clear_bell_after_dwell(pane_id);
+                screen.sync_attention_visibility();
                 screen.render(None)?;
             },
         }
