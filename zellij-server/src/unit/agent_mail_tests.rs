@@ -264,9 +264,18 @@ fn an_expired_message_yields_one_notice_and_a_notice_yields_none() {
     let expired = mailbox.expire(60_000);
     assert_eq!(expired, vec!["3".to_owned(), "4".to_owned()]);
     // the settled record keeps its last reason, which the notice names
-    let (to, _, text) = expiry_notice(&mailbox.get("3").unwrap().record, "boxa", "work").unwrap();
-    assert_eq!(to, "brisk-heron");
-    assert!(text.contains("the agent stayed busy"), "{text}");
+    let notice = expiry_notice(&mailbox.get("3").unwrap().record, "boxa", "work").unwrap();
+    assert_eq!(
+        notice.to,
+        zellij_utils::agent_mail::NoticeTo::Here {
+            handle: "brisk-heron".into()
+        }
+    );
+    assert!(
+        notice.text.contains("the agent stayed busy"),
+        "{}",
+        notice.text
+    );
     assert_eq!(
         expiry_notice(&mailbox.get("4").unwrap().record, "boxa", "work"),
         None

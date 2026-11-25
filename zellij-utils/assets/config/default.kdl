@@ -725,6 +725,13 @@ context_menu {
 //
 // pane_env_drop "FPATH"
 
+// How long a message to a busy coding agent waits before it expires, when its sender gives no
+// expiry (`send-message --expire-s`, `zellij_send expire_s`)
+// Read on the receiving machine. Seconds, a number with s, m, h or d, or "never"
+// Default: 30 minutes
+//
+// agent_message_expire "4h"
+
 // Extra directives for the init-system unit `zellij session enable` writes
 // A generated unit cannot know the local facts - that this session must start after some other
 // service, that it wants a particular nice level - so they are named here, where `zellij session

@@ -25511,6 +25511,70 @@ fn a_message_to_an_idle_agent_goes_in_as_one_paste_and_a_held_enter() {
 }
 
 #[test]
+fn an_expired_message_from_another_machine_tells_its_sender_there() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, _writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "working");
+    let record = send(&mut screen, "Run the tests.");
+    assert_eq!(record.status, Status::Queued);
+    crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow_mut().clear());
+    screen
+        .agent_mail
+        .held_mut_for_test(&record.id)
+        .record
+        .expires_at = 0;
+    screen.drain_agent_messages();
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Expired
+    );
+    // the sender is boxa/work/brisk-heron: another machine, told through send-message --host
+    let sent = crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow().clone());
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0][..6],
+        [
+            "--session",
+            "work",
+            "action",
+            "send-message",
+            "--host",
+            "boxa"
+        ]
+    );
+    assert!(sent[0].contains(&"brisk-heron".to_owned()), "{sent:?}");
+    assert!(
+        sent[0]
+            .last()
+            .unwrap()
+            .starts_with(&format!("message {} to {}/", record.id, record.session)),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn a_held_message_that_lands_late_names_its_age() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "working");
+    let record = send(&mut screen, "Run the tests.");
+    assert_eq!(record.status, Status::Queued);
+    screen
+        .agent_mail
+        .held_mut_for_test(&record.id)
+        .record
+        .queued_at -= 47 * 60 * 1000;
+    agent_reports(&mut screen, "idle");
+    screen.drain_agent_messages();
+    let sent = pty_writes(&writes);
+    assert!(
+        sent.first()
+            .is_some_and(|paste| paste.contains(" queued=\"47 min ago\" ")),
+        "{sent:?}"
+    );
+}
+
+#[test]
 fn a_message_against_a_persons_draft_is_held_and_the_draft_left_alone() {
     use zellij_utils::agent_mail::{Reason, Status};
     // the original bug: a message typed into a prompt that held half a sentence went out with it

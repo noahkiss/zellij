@@ -6745,6 +6745,7 @@ Config {
         input_while_scrolled: None,
         command_pane_on_clean_exit: None,
         person_name: None,
+        agent_message_expire: None,
     },
     themes: {},
     plugins: PluginAliases {

@@ -9474,17 +9474,56 @@ reads stdin).
 - **Held messages** are kept by the receiving session, one JSON file each under
   `$XDG_STATE_HOME/zellij/messages/<session>/`, so they survive a restart of its server. The server
   tries them once a second, in order, one per pane per round; a message just delivered counts as
-  the agent's turn until it reports one. A held message expires after `--expire-s` (1800 by
-  default); `0` means deliver now or refuse. A pane is found again by its handle, so a restored
-  pane gets its messages. The last 100 settled messages are kept for a week, for `--reply-to`.
+  the agent's turn until it reports one. A held message expires after `--expire-s`; `0` means
+  deliver now or refuse. A pane is found again by its handle, so a restored pane gets its
+  messages. The last 100 settled messages are kept for a week, for `--reply-to`.
+- **The default hold is the receiving machine's.** Without `--expire-s`, `send-message` takes the
+  config's `agent_message_expire`, and 30 minutes (`agent_mail::DEFAULT_EXPIRE_S`) without it:
+
+  ```kdl
+  agent_message_expire "4h"
+  ```
+
+  The value is `"never"`, whole seconds (`"1800"`), or a number with `s`, `m`, `h` or `d`.
+  `"never"` holds a message for about a hundred years (`NEVER_EXPIRE_S`), so `expires_at` stays a
+  number a JSON reader holds exactly. `"0"` and a value that is no span leave the default, with a
+  config warning: as a default for every message, 0 would refuse every held one. The CLI reads
+  the key, never the session (it is not in the protobuf `Options`), and resolves the number it
+  sends; the contract's `expire_s` is unchanged. `zellij_send` runs the CLI on the receiving
+  machine, so that machine's config decides. Its `expire_s` advertises no default, since an agent
+  that copied one would override the config.
 - **An expired message is reported to its sender.** The session sends the sender a message of
   its own, from `zellij` (address `host/-/zellij`): `message 3 to work/sunny-otter expired
   undelivered after 30 min: the agent stayed busy. Resend it, or use the agent's harness
-  channel.` The reason follows the message's last hold reason. Only a sender that is an agent's
-  pane in the receiving session, on the same machine, is told. A sender in another session or on
-  another machine, the command line, and a message that expired while no server ran get no
-  notice. The notice is held and expires like any message; a notice that expires is dropped,
-  since its sender is no pane.
+  channel.` The reason follows the message's last hold reason.
+  - A sender that is an agent's pane in the receiving session gets the notice from that session,
+    held for `DEFAULT_EXPIRE_S`: the session does not read `agent_message_expire`.
+  - A sender in another session gets it through `zellij --session <its session> action
+    send-message --to <its handle> --from host/-/zellij`, which the server runs on a short-lived
+    thread. A sender on another machine gets the same command with `--host <its host>` (below),
+    which runs it there over ssh. Either way that machine's config sets the notice's hold. The
+    child runs outside any pane, is killed after 30 s, and is never retried; at most 4 run at
+    once, and a notice past that is dropped. Each outcome is one line in the server log.
+  - A sender on a machine that does not answer (asleep, off the network) costs one ssh connect
+    timeout (5 s) and a log line. A host not in the receiving machine's `remote_hosts` is refused
+    before ssh runs. ssh never asks for a password or a host key (`BatchMode`), so a server
+    started by launchd or systemd without the key the login shell has is refused, not stalled.
+  - The command line, a sender whose pane runs no agent any more, and a message that expired
+    while no server ran get no notice. A message from `host/-/zellij` never starts
+    `default_harness`.
+  - A notice is held and expires like any message; a notice that expires is dropped, since its
+    sender is no pane. So a notice never starts another, on any machine.
+- **`send-message --host <host>`** runs the rest of the command line on another machine, over the
+  same ssh `zellij_send` uses: only a host listed in `remote_hosts` in this config, given 20 s
+  plus any `--wait`. It passes `--session`, or `--all-sessions` for a `--to` with no session, and
+  leaves an unset `--expire-s` unset, so the other machine's config decides. A host that names
+  this machine (compared by first label, ignoring case and `user@`) is an ordinary local send.
+- **A message that lands late says how late.** A message typed or posted 2 minutes or more after
+  it was queued (`agent_mail::LATE_MS`) names its age, so the receiver can weigh an instruction
+  that may be stale: `queued 47 min ago` in the envelope line, after `answering`, and
+  `queued="47 min ago"` in Claude's wrapper, after `answering`. An age of an hour or more reads
+  `3 h 5 min`. The age counts toward the stub's 600 characters. Whether Claude Code still
+  collapses a wrapper with the extra attribute is not measured.
 - **The envelope** is one line, marked as another agent's (Claude Code gets it as attributes,
   below):
 
@@ -9660,7 +9699,8 @@ fork owns; a server from before it ignores the field and names no tab. It gained
 string from_person = 8` the same way; a server from before it ignores the field and says "not
 from the person". No plugin-API change.
 Capabilities: `agent-send-message`; `agent-message-show-cancel` for the stub, `message-show`,
-`message-cancel` and `zellij_send cancel`.
+`message-cancel` and `zellij_send cancel`; `agent-message-expire` for `agent_message_expire`,
+notices to other sessions and machines, `send-message --host` and the age.
 
 Limits:
 
@@ -9677,6 +9717,10 @@ Limits:
   still land.
 - The agent-session plugin reports a session only while the TUI shows one. A TUI back on its
   home screen keeps the last session reported, and the post lands there, out of view.
+- A sender's machine on a build from before `agent_message_expire` does not know that a
+  `host/-/zellij` message must never start `default_harness`. With that key set there, a notice
+  to a sender whose agent has left its pane can start a harness in it.
+- A burst of more than 4 expiries in one round tells only the first 4 senders elsewhere.
 
 Files: `zellij-utils/src/agent_mail.rs` (record, envelope, stub, guard, address),
 `input/actions.rs`, `cli.rs`, `cli_surface.rs`, `capabilities.rs`, `data.rs`
@@ -9686,7 +9730,10 @@ Files: `zellij-utils/src/agent_mail.rs` (record, envelope, stub, guard, address)
 `screen.rs` (send, drain, ticker, show, cancel, the OpenCode post), `opencode_api.rs`
 (discovery and the post), `route.rs`; `zellij-client/src/agent_send.rs`,
 `cli_client.rs`; `src/commands.rs`; `src/mcp/send.rs`, `mod.rs`, `tools.rs`, `fleet.rs`,
-`invoke.rs`; `input/options.rs` and `kdl/mod.rs` (`person_name`). Tests: the guard table, the
+`invoke.rs`; `input/options.rs` and `kdl/mod.rs` (`person_name`, `agent_message_expire`). Tests: the expiry
+default's parse and round trip, the notice's target here, in another session and on another
+machine and its command line, `--host`'s command line, the age in each shape, and on the screen
+the notice to another machine and a late message's age; the guard table, the
 envelope and text cleaning, the origin, the Claude wrapper and its escaping, the shape per kind,
 the stub at and over the limit for Claude and another kind, show and cancel of a held and a
 delivered message (a cancelled one is never typed), the client's exit for each answer,

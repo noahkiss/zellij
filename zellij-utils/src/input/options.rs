@@ -920,6 +920,13 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub person_name: Option<String>,
+    /// How long `send-message` holds a message that does not pass `--expire-s`: `"never"`, a
+    /// whole number of seconds, or a number with `s`, `m`, `h` or `d` (`"4h"`). Read by the CLI
+    /// on the receiving machine, where `zellij_send` runs it; the session never reads it. Unset
+    /// means 30 minutes
+    #[clap(skip)]
+    #[serde(default)]
+    pub agent_message_expire: Option<String>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1174,6 +1181,9 @@ impl Options {
             .command_pane_on_clean_exit
             .or(self.command_pane_on_clean_exit);
         let person_name = other.person_name.or_else(|| self.person_name.clone());
+        let agent_message_expire = other
+            .agent_message_expire
+            .or_else(|| self.agent_message_expire.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1272,6 +1282,7 @@ impl Options {
             input_while_scrolled,
             command_pane_on_clean_exit,
             person_name,
+            agent_message_expire,
         }
     }
 
@@ -1464,6 +1475,9 @@ impl Options {
             .command_pane_on_clean_exit
             .or(self.command_pane_on_clean_exit);
         let person_name = other.person_name.or_else(|| self.person_name.clone());
+        let agent_message_expire = other
+            .agent_message_expire
+            .or_else(|| self.agent_message_expire.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1562,6 +1576,7 @@ impl Options {
             input_while_scrolled,
             command_pane_on_clean_exit,
             person_name,
+            agent_message_expire,
         }
     }
 

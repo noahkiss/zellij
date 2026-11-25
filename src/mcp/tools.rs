@@ -400,7 +400,10 @@ pub const TOOLS: &[ToolSpec] = &[
                reached the pane in the last 5 seconds. Otherwise it holds the message and tries \
                again each second: status queued, with reason working, blocked, draft, typing or \
                starting. A held message survives a restart of that session and expires after \
-               expire_s. Refused means not sent: not_agent, no_state, or a target that named no \
+               expire_s, or when you give none, after the receiving machine's configured \
+               default (agent_message_expire, 30 minutes unset); you then get a notice from \
+               zellij, in another session or on another machine too. A message that lands late \
+               tells the receiver how long ago it was queued. Refused means not sent: not_agent, no_state, or a target that named no \
                agent or several, with the candidates listed. The receiver reads, with your text, \
                an envelope that names you and the message id; it answers with reply_to=<id>. A \
                Claude Code receiver gets a cross-session message, shown collapsed when your text \
@@ -450,9 +453,10 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Int,
                 required: false,
                 from: Some(("action send-message", "--expire-s")),
-                describe: "How long a held message waits before it expires. 0 means deliver now \
-                           or not at all.",
-                default: Some("1800"),
+                describe: "Seconds a held message waits before it expires. 0 means deliver now \
+                           or not at all. Leave it out to use the receiving machine's configured \
+                           default.",
+                default: None,
             },
             ParamSpec {
                 name: "wait_s",

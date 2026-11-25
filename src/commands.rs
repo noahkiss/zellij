@@ -731,6 +731,21 @@ pub(crate) fn send_action_to_session(
     // rather than a miss
     // `send-message --all-sessions` looks for its target on the whole machine, so it too is
     // answered before a session is chosen
+    // `send-message --host` runs on another machine, which has its own sessions; a `--host` that
+    // names this machine is an ordinary send
+    if let zellij_utils::cli::CliAction::SendMessage {
+        host: Some(host), ..
+    } = &cli_action
+    {
+        if !crate::mcp::remote::is_local(host, zellij_utils::shared::short_hostname()) {
+            process::exit(send_message_on_host(
+                &cli_action,
+                requested_session_name.as_deref(),
+                host,
+                output_json,
+            ));
+        }
+    }
     if let zellij_utils::cli::CliAction::SendMessage {
         all_sessions: true, ..
     } = &cli_action
@@ -2016,7 +2031,7 @@ fn send_message(
             to: to.clone(),
             reply_to: reply_to.clone(),
             text: text.clone(),
-            expire_s: *expire_s,
+            expire_s: expire_s.unwrap_or_else(|| default_expire_s(config)),
             wait_s: *wait,
             from: from.clone(),
             from_name: from_name.clone(),
@@ -2025,13 +2040,167 @@ fn send_message(
                 person_name(config.and_then(|config| config.options.person_name.as_deref()))
             }),
             json: *json || output_json,
+            // a session's own notice goes to an agent's pane, and never starts one where none runs
             default_harness: CONFIG_PATH
                 .get()
                 .cloned()
                 .flatten()
-                .and_then(default_harness),
+                .and_then(default_harness)
+                .filter(|_| {
+                    !from
+                        .as_deref()
+                        .is_some_and(zellij_utils::agent_mail::is_session_sender)
+                }),
         },
     )
+}
+
+/// How long `send-message` holds a message that names no `--expire-s`: the config's
+/// `agent_message_expire`, or `agent_mail::DEFAULT_EXPIRE_S`. This CLI runs on the receiving
+/// machine, so that machine's config decides.
+fn default_expire_s(config: Option<&Config>) -> u64 {
+    config
+        .and_then(|config| config.options.agent_message_expire.as_deref())
+        .and_then(|value| zellij_utils::agent_mail::parse_expire(value).ok())
+        .unwrap_or(zellij_utils::agent_mail::DEFAULT_EXPIRE_S)
+}
+
+/// How long `send-message --host` waits for the other machine, in seconds, on top of any `--wait`.
+/// ssh gives up on a connection after five; the rest is that machine's `send-message`, which
+/// answers at once unless `--wait` asks it to wait.
+const SEND_ON_HOST_TIMEOUT_S: u64 = 20;
+
+/// fork addition: `send-message --host <host>`: the same command line, run by that machine's
+/// zellij over ssh, as `zellij_send` reaches another machine. Only a host in `remote_hosts` is
+/// tried, and only once; ssh never asks for a password or a host key.
+fn send_message_on_host(
+    cli_action: &zellij_utils::cli::CliAction,
+    session: Option<&str>,
+    host: &str,
+    output_json: bool,
+) -> i32 {
+    let path = CONFIG_PATH.get().cloned().flatten();
+    let hosts = crate::mcp::remote::RemoteHosts::load(path.as_deref());
+    let Some(remote) = hosts.find(host) else {
+        eprintln!(
+            "{} is not listed in remote_hosts in the config, so a message cannot be sent there.",
+            host
+        );
+        return 2;
+    };
+    let mut text = None;
+    if let zellij_utils::cli::CliAction::SendMessage { text: given, .. } = cli_action {
+        if given == "-" {
+            let mut read = String::new();
+            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut read) {
+                eprintln!("Could not read the message from stdin: {}", e);
+                return 1;
+            }
+            text = Some(read);
+        }
+    }
+    let Some(argv) = send_message_argv_for_host(cli_action, session, text, output_json) else {
+        return 1;
+    };
+    let wait_s = match cli_action {
+        zellij_utils::cli::CliAction::SendMessage { wait, .. } => wait.unwrap_or(0),
+        _ => 0,
+    };
+    let timeout_s = SEND_ON_HOST_TIMEOUT_S.saturating_add(wait_s);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Could not start the runtime that reaches {}: {}", host, e);
+            return 1;
+        },
+    };
+    let outcome = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(timeout_s),
+            crate::mcp::remote::run(remote, &argv),
+        )
+        .await
+    });
+    match outcome {
+        Ok(Ok(outcome)) => {
+            print!("{}", outcome.stdout);
+            eprint!("{}", outcome.stderr);
+            outcome.code
+        },
+        Ok(Err(message)) => {
+            eprintln!("{}", message);
+            1
+        },
+        Err(_) => {
+            eprintln!(
+                "{} did not answer within {} s; the message may or may not have been sent.",
+                host, timeout_s
+            );
+            1
+        },
+    }
+}
+
+/// The command line `send-message --host` runs on the other machine: the same flags, without
+/// `--host`. A `--to` with no `--session` looks for the target in every session there, as
+/// `zellij_send` does. `text` replaces a `-` that was read from stdin here.
+fn send_message_argv_for_host(
+    cli_action: &zellij_utils::cli::CliAction,
+    session: Option<&str>,
+    text: Option<String>,
+    output_json: bool,
+) -> Option<Vec<String>> {
+    let zellij_utils::cli::CliAction::SendMessage {
+        to,
+        reply_to,
+        text: given,
+        expire_s,
+        wait,
+        from,
+        from_name,
+        from_tab,
+        from_person,
+        all_sessions,
+        json,
+        ..
+    } = cli_action
+    else {
+        return None;
+    };
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(session) = session {
+        argv.extend(["--session".to_owned(), session.to_owned()]);
+    }
+    argv.extend(["action".to_owned(), "send-message".to_owned()]);
+    let pairs = [
+        ("--to", to.clone()),
+        ("--reply-to", reply_to.clone()),
+        ("--expire-s", expire_s.map(|s| s.to_string())),
+        ("--wait", wait.map(|s| s.to_string())),
+        ("--from", from.clone()),
+        ("--from-name", from_name.clone()),
+        ("--from-tab", from_tab.clone()),
+    ];
+    for (flag, value) in pairs {
+        if let Some(value) = value {
+            argv.extend([flag.to_owned(), value]);
+        }
+    }
+    if *from_person {
+        argv.push("--from-person".to_owned());
+    }
+    if *all_sessions || (session.is_none() && to.is_some()) {
+        argv.push("--all-sessions".to_owned());
+    }
+    if *json || output_json {
+        argv.push("--json".to_owned());
+    }
+    argv.push("--".to_owned());
+    argv.push(text.unwrap_or_else(|| given.clone()));
+    Some(argv)
 }
 
 /// The name `send-message --from-person` gives the person: the config's `person_name`, or `user`.
@@ -2060,6 +2229,82 @@ pub(crate) fn default_harness_in(config: &str) -> Option<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod send_message_on_host_tests {
+    use super::send_message_argv_for_host;
+    use zellij_utils::cli::CliAction;
+
+    fn send(to: &str, text: &str) -> CliAction {
+        CliAction::SendMessage {
+            to: Some(to.to_owned()),
+            reply_to: None,
+            text: text.to_owned(),
+            expire_s: None,
+            wait: None,
+            from: Some("boxb/-/zellij".to_owned()),
+            from_name: Some("zellij".to_owned()),
+            from_tab: None,
+            from_person: false,
+            all_sessions: false,
+            host: Some("boxa".to_owned()),
+            json: true,
+        }
+    }
+
+    #[test]
+    fn the_other_machine_runs_the_same_flags_without_host() {
+        assert_eq!(
+            send_message_argv_for_host(
+                &send("brisk-heron", "--looks like a flag"),
+                Some("work"),
+                None,
+                false
+            )
+            .unwrap(),
+            [
+                "--session",
+                "work",
+                "action",
+                "send-message",
+                "--to",
+                "brisk-heron",
+                "--from",
+                "boxb/-/zellij",
+                "--from-name",
+                "zellij",
+                "--json",
+                "--",
+                "--looks like a flag",
+            ]
+        );
+        // no session: the target is looked for in every session there. An unset --expire-s stays
+        // unset, so that machine's config decides it; a set one goes along
+        let mut action = send("develop", "-");
+        if let CliAction::SendMessage { expire_s, .. } = &mut action {
+            *expire_s = Some(0);
+        }
+        assert_eq!(
+            send_message_argv_for_host(&action, None, Some("read".into()), false).unwrap(),
+            [
+                "action",
+                "send-message",
+                "--to",
+                "develop",
+                "--expire-s",
+                "0",
+                "--from",
+                "boxb/-/zellij",
+                "--from-name",
+                "zellij",
+                "--all-sessions",
+                "--json",
+                "--",
+                "read",
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

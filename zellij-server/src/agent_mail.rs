@@ -585,6 +585,130 @@ impl Mailbox {
     }
 }
 
+/// How long a notice to a sender elsewhere may take before its `send-message` is killed. That
+/// command gives another machine 20 s (ssh gives up on a connection after 5); this is the bound
+/// past it.
+#[cfg(not(test))]
+const NOTICE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How many notices to senders elsewhere may be on their way at once. A burst of expiries past
+/// this is logged and dropped, so a sender's machine that does not answer never piles up threads.
+#[cfg(not(test))]
+const NOTICES_IN_FLIGHT_MAX: usize = 4;
+
+#[cfg(not(test))]
+static NOTICES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// The command lines a test's notices would have run.
+    pub static NOTICES_SENT: std::cell::RefCell<Vec<Vec<String>>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// fork addition: hands the notice that message `id` expired to a sender in another session, on
+/// this machine or another, by running `zellij <notice_argv>` on a short-lived thread. One try:
+/// a sender's machine that is asleep or unreachable costs one ssh timeout and a line in the log,
+/// never a retry. Nothing here blocks the screen thread.
+pub fn send_expiry_notice_elsewhere(id: &str, notice: &zellij_utils::agent_mail::ExpiryNotice) {
+    let Some(argv) = zellij_utils::agent_mail::notice_argv(notice) else {
+        return;
+    };
+    #[cfg(test)]
+    {
+        let _ = id;
+        NOTICES_SENT.with(|sent| sent.borrow_mut().push(argv));
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::atomic::Ordering;
+        if NOTICES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= NOTICES_IN_FLIGHT_MAX {
+            NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            log::info!(
+                "message {} expired; {} notices are already on their way, so its sender is not told",
+                id,
+                NOTICES_IN_FLIGHT_MAX
+            );
+            return;
+        }
+        let id = id.to_owned();
+        let started = std::thread::Builder::new()
+            .name("agent_mail_notice".to_owned())
+            .spawn(move || {
+                match run_notice(&argv) {
+                    Ok(()) => log::info!("message {} expired; its sender was told", id),
+                    Err(why) => {
+                        log::info!("message {} expired; its sender was not told: {}", id, why)
+                    },
+                }
+                NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            });
+        if let Err(e) = started {
+            NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            log::info!("message expired; no thread to tell its sender: {}", e);
+        }
+    }
+}
+
+/// The zellij binary a notice runs: this server's own, or `zellij` on the `PATH` when an upgrade
+/// has replaced the file this server started from.
+#[cfg(not(test))]
+fn zellij_program() -> std::ffi::OsString {
+    std::env::current_exe()
+        .ok()
+        .filter(|exe| exe.is_file())
+        .map(|exe| exe.into_os_string())
+        .unwrap_or_else(|| "zellij".into())
+}
+
+/// Runs `zellij <argv>` to [`NOTICE_DEADLINE`], outside any pane: the child carries none of the
+/// variables that make a command think it runs in one.
+#[cfg(not(test))]
+fn run_notice(argv: &[String]) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(zellij_program())
+        .args(argv)
+        .env_remove("ZELLIJ")
+        .env_remove("ZELLIJ_PANE_ID")
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run zellij: {}", e))?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < NOTICE_DEADLINE => {
+                std::thread::sleep(Duration::from_millis(100));
+            },
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "send-message took more than {} s",
+                    NOTICE_DEADLINE.as_secs()
+                ));
+            },
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    Err(format!(
+        "send-message exited {}: {}",
+        status.code().unwrap_or(-1),
+        stderr.trim()
+    ))
+}
+
 #[cfg(test)]
 #[path = "./unit/agent_mail_tests.rs"]
 mod agent_mail_tests;

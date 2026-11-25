@@ -8549,7 +8549,11 @@ impl Screen {
         attempt: OpenCodeAttempt,
     ) {
         let id = stored.record.id.clone();
-        let body = zellij_utils::agent_mail::opencode_synthetic(&stored.record, &stored.text);
+        let body = zellij_utils::agent_mail::opencode_synthetic_at(
+            &stored.record,
+            &stored.text,
+            crate::program_status::now_ms(),
+        );
         self.opencode_in_flight.insert(id.clone(), attempt);
         // a unit test drives the answer by hand: it never looks for a real server
         #[cfg(not(test))]
@@ -8805,19 +8809,26 @@ impl Screen {
     }
 
     /// fork addition: tells the sender of message `id`, which just expired, that it never went
-    /// in. Only a sender that is an agent's pane in this session is told; see
-    /// `agent_mail::expiry_notice`. The notice is a message like any other, from the session.
+    /// in; see `agent_mail::expiry_notice`. A sender that is an agent's pane in this session gets
+    /// the notice from this session, as a message like any other. A sender in another session, on
+    /// this machine or another, gets it through `send-message` run on a short-lived thread
+    /// (`agent_mail::send_expiry_notice_elsewhere`): one try, never retried.
     fn notify_expired_sender(&mut self, id: &str) {
+        use zellij_utils::agent_mail::NoticeTo;
         let Some(record) = self.agent_mail.get(id).map(|stored| stored.record.clone()) else {
             return;
         };
         let host = zellij_utils::shared::short_hostname();
-        let Some((handle, from, text)) =
+        let Some(notice) =
             zellij_utils::agent_mail::expiry_notice(&record, host, &self.session_name)
         else {
             return;
         };
-        let sender = self.agent_mail_pane(|info| !info.is_plugin && info.handle == handle);
+        let NoticeTo::Here { handle } = &notice.to else {
+            crate::agent_mail::send_expiry_notice_elsewhere(id, &notice);
+            return;
+        };
+        let sender = self.agent_mail_pane(|info| !info.is_plugin && &info.handle == handle);
         let Some((info, Some(_))) = sender else {
             log::info!(
                 "message {} expired; its sender {} runs no agent here to tell",
@@ -8828,8 +8839,8 @@ impl Screen {
         };
         self.send_agent_message(
             info.id,
-            text,
-            from,
+            notice.text,
+            notice.from,
             Some(zellij_utils::agent_mail::SESSION_SENDER.to_owned()),
             None,
             None,
@@ -8898,7 +8909,10 @@ impl Screen {
             return decision;
         }
         let mut paste = b"\x1b[200~".to_vec();
-        paste.extend_from_slice(agent_mail::pasted(&stored.record, &stored.text).as_bytes());
+        let now_ms = crate::program_status::now_ms();
+        paste.extend_from_slice(
+            agent_mail::pasted_at(&stored.record, &stored.text, now_ms).as_bytes(),
+        );
         paste.extend_from_slice(b"\x1b[201~");
         let sent = self
             .bus

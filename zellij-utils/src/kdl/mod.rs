@@ -3521,6 +3521,7 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "attention",
     // options
     "advanced_mouse_actions",
+    "agent_message_expire",
     "attach_to_session",
     "auto_layout",
     "bars_hidden_on_start",
@@ -3974,6 +3975,12 @@ impl Options {
         let person_name = kdl_property_first_arg_as_string_or_error!(kdl_options, "person_name")
             .map(|(name, _entry)| name.trim().to_string())
             .filter(|name| !name.is_empty());
+        let agent_message_expire = known_value_or_note(
+            "agent_message_expire",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "agent_message_expire"),
+            |value| crate::agent_mail::parse_expire(value).map(|_| value.trim().to_owned()),
+            "seconds, a number with s, m, h or d (\"4h\"), or never",
+        );
         let host_notification_protocol = known_value_or_note(
             "host_notification_protocol",
             kdl_property_first_arg_as_string_or_error!(kdl_options, "host_notification_protocol"),
@@ -4119,6 +4126,7 @@ impl Options {
             input_while_scrolled,
             command_pane_on_clean_exit,
             person_name,
+            agent_message_expire,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -6675,6 +6683,21 @@ impl Options {
         }
         Some(node)
     }
+    /// Written only when set; the commented sample is in the default config.
+    fn agent_message_expire_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        let expire = self.agent_message_expire.as_ref()?;
+        let mut node = KdlNode::new("agent_message_expire");
+        node.push(expire.to_owned());
+        if add_comments {
+            node.set_leading(format!(
+                "{}\n{}\n{}\n",
+                " ",
+                "// How long a message to a busy agent is held when its sender names no expiry:",
+                "// seconds, a number with s, m, h or d, or \"never\". Unset, 30 minutes",
+            ));
+        }
+        Some(node)
+    }
     fn host_notification_protocol_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         use crate::input::options::HostNotificationProtocol;
         let comment_text = format!(
@@ -7193,6 +7216,9 @@ impl Options {
         }
         if let Some(person_name) = self.person_name_to_kdl(add_comments) {
             nodes.push(person_name);
+        }
+        if let Some(expire) = self.agent_message_expire_to_kdl(add_comments) {
+            nodes.push(expire);
         }
         if let Some(host_notification_protocol) =
             self.host_notification_protocol_to_kdl(add_comments)
@@ -12500,6 +12526,38 @@ fn person_name_is_read_written_back_and_blank_reads_as_unset() {
     let blank = Config::from_kdl("person_name \"  \"", None).unwrap();
     assert_eq!(blank.options.person_name, None);
     assert!(Config::from_kdl("person_name 3", None).is_err());
+}
+
+#[test]
+fn agent_message_expire_config_parsing_and_round_trip() {
+    assert_eq!(
+        Config::from_kdl("", None)
+            .unwrap()
+            .options
+            .agent_message_expire,
+        None
+    );
+    for value in ["4h", "never", "1800"] {
+        let config =
+            Config::from_kdl(&format!("agent_message_expire \"{}\"", value), None).unwrap();
+        assert_eq!(config.options.agent_message_expire.as_deref(), Some(value));
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let serialized = config.to_string(false);
+        let deserialized = Config::from_kdl(&serialized, None).unwrap();
+        assert_eq!(deserialized.options, config.options);
+    }
+    // a value that is no span leaves the default, with a warning that names it
+    let config = Config::from_kdl("agent_message_expire \"soon\"", None).unwrap();
+    assert_eq!(config.options.agent_message_expire, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].contains("\"soon\""),
+        "{}",
+        config.warnings[0]
+    );
+    let zero = Config::from_kdl("agent_message_expire \"0\"", None).unwrap();
+    assert_eq!(zero.options.agent_message_expire, None);
+    assert!(Config::from_kdl("agent_message_expire 3", None).is_err());
 }
 
 #[test]

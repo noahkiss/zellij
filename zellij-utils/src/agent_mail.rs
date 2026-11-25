@@ -21,9 +21,73 @@ pub const RECORD_KEYS: &str = "id status reason pane_id handle session agent fro
 /// only covers the moment around a keystroke - a person about to type, or who just cleared a line.
 pub const QUIET_MS: u64 = 5_000;
 
-/// How long a held message waits before it expires, by default: 30 minutes. Long enough to
-/// outlast a long agent turn, short enough that a stale instruction does not land hours later.
+/// How long a held message waits before it expires, when neither `--expire-s` nor the config's
+/// `agent_message_expire` says: 30 minutes. A session's own expiry notice waits this long too.
 pub const DEFAULT_EXPIRE_S: u64 = 30 * 60;
+
+/// What `agent_message_expire "never"` holds a message for: about a hundred years. A finite span
+/// keeps `expires_at` well inside what a JSON reader holds exactly as a number.
+pub const NEVER_EXPIRE_S: u64 = 100 * 365 * 24 * 60 * 60;
+
+/// The config's `agent_message_expire`, in seconds: `"never"`, a whole number of seconds, or a
+/// number with one unit, `s`, `m`, `h` or `d` (`"90m"`, `"4h"`). Zero is refused: per message,
+/// `--expire-s 0` means deliver now or refuse, which is no default for every message.
+pub fn parse_expire(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("never") {
+        return Ok(NEVER_EXPIRE_S);
+    }
+    let (number, unit) = match value.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => value.split_at(at),
+        None => (value, "s"),
+    };
+    let scale = match unit.trim() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => 0,
+    };
+    let seconds = number
+        .parse::<u64>()
+        .ok()
+        .filter(|_| scale > 0)
+        .map(|n| n.saturating_mul(scale).min(NEVER_EXPIRE_S));
+    match seconds {
+        Some(0) => Err(format!(
+            "agent_message_expire \"{}\" would refuse every held message; give a span such as \
+             \"30m\" or \"4h\", or \"never\"",
+            value
+        )),
+        Some(seconds) => Ok(seconds),
+        None => Err(format!(
+            "agent_message_expire \"{}\" is not a span: give seconds (\"1800\"), a number with s, \
+             m, h or d (\"4h\"), or \"never\"",
+            value
+        )),
+    }
+}
+
+/// How long a message must have waited before its envelope says so: two minutes. A message that
+/// goes in sooner reads as fresh; one held longer may be stale by the time it lands.
+pub const LATE_MS: u64 = 2 * 60 * 1000;
+
+/// How long ago a message was queued, `47 min` or `3 h 5 min`, when it lands [`LATE_MS`] or more
+/// after it was queued; `None` for a message that goes in sooner.
+pub fn late_by(record: &MessageRecord, now_ms: u64) -> Option<String> {
+    let waited_ms = now_ms.saturating_sub(record.queued_at);
+    if waited_ms < LATE_MS {
+        return None;
+    }
+    let minutes = waited_ms / 60_000;
+    Some(if minutes < 60 {
+        format!("{} min", minutes)
+    } else if minutes % 60 == 0 {
+        format!("{} h", minutes / 60)
+    } else {
+        format!("{} h {} min", minutes / 60, minutes % 60)
+    })
+}
 
 /// Where a message stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +253,19 @@ pub fn envelope(
     from_person: Option<&str>,
     reply_to: Option<&str>,
 ) -> String {
+    envelope_aged(id, from, from_name, from_tab, from_person, reply_to, None)
+}
+
+/// [`envelope`], naming the message's age when it lands late: `queued 47 min ago`.
+fn envelope_aged(
+    id: &str,
+    from: &str,
+    from_name: Option<&str>,
+    from_tab: Option<&str>,
+    from_person: Option<&str>,
+    reply_to: Option<&str>,
+    late: Option<&str>,
+) -> String {
     let sender = Sender::of(from, from_name);
     let place = match (
         from_tab.filter(|tab| !tab.is_empty()),
@@ -202,6 +279,9 @@ pub fn envelope(
     let answering = reply_to
         .map(|id| format!(", answering {}", flatten(id)))
         .unwrap_or_default();
+    let age = late
+        .map(|late| format!("; queued {} ago", late))
+        .unwrap_or_default();
     let provenance = match person(from_person) {
         Some(person) => format!("directly from {}, sent through another session", person),
         None => "not from the person".to_owned(),
@@ -211,8 +291,8 @@ pub fn envelope(
         None => format!("zellij_send reply_to={}", id),
     };
     format!(
-        "[message {} from {}{}{}; {}. Reply: {}]",
-        id, sender.name, place, answering, provenance, back
+        "[message {} from {}{}{}{}; {}. Reply: {}]",
+        id, sender.name, place, answering, age, provenance, back
     )
 }
 
@@ -305,8 +385,17 @@ pub fn show_command(id: &str) -> String {
 /// <id>)`. Claude's wrapper then gains `full="zellij action message-show <id>"`. The id is this
 /// record's, given by the receiving session, so the receiver's own session resolves it.
 pub fn pasted(record: &MessageRecord, text: &str) -> String {
+    pasted_at(record, text, record.queued_at)
+}
+
+/// [`pasted`], for a paste made at `now_ms`: a message that lands [`LATE_MS`] or more after it was
+/// queued names its age, `queued 47 min ago` in the envelope line and `queued="47 min ago"` in
+/// Claude's wrapper, so the receiver can weigh an instruction that may be stale.
+pub fn pasted_at(record: &MessageRecord, text: &str, now_ms: u64) -> String {
+    let late = late_by(record, now_ms);
+    let late = late.as_deref();
     let text = sanitize(text);
-    let whole = shaped(record, &text, false);
+    let whole = shaped(record, &text, false, late);
     if whole.chars().count() <= PASTE_COLLAPSE_LIMIT {
         return whole;
     }
@@ -320,7 +409,7 @@ pub fn pasted(record: &MessageRecord, text: &str) -> String {
     loop {
         let head: String = first.chars().take(keep).collect();
         let stub = format!("{}{}", head.trim_end(), suffix);
-        let paste = shaped(record, stub.trim_start(), true);
+        let paste = shaped(record, stub.trim_start(), true, late);
         let over = paste.chars().count().saturating_sub(PASTE_COLLAPSE_LIMIT);
         if over == 0 || keep == 0 {
             return paste;
@@ -329,29 +418,31 @@ pub fn pasted(record: &MessageRecord, text: &str) -> String {
     }
 }
 
-/// The paste for `text`, already sanitized. `stub` adds Claude's `full` attribute.
-fn shaped(record: &MessageRecord, text: &str, stub: bool) -> String {
+/// The paste for `text`, already sanitized. `stub` adds Claude's `full` attribute; `late` is the
+/// message's age when it lands late.
+fn shaped(record: &MessageRecord, text: &str, stub: bool, late: Option<&str>) -> String {
     let claude = record
         .agent
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("claude"));
     if !claude {
-        let line = envelope(
+        let line = envelope_aged(
             &record.id,
             &record.from,
             record.from_name.as_deref(),
             record.from_tab.as_deref(),
             record.from_person.as_deref(),
             record.reply_to.as_deref(),
+            late,
         );
         return wrapped(&line, text);
     }
-    cross_session(record, text, stub)
+    cross_session(record, text, stub, late)
 }
 
 /// Claude Code's cross-session wrapper around `text`, already sanitized. `stub` adds the `full`
-/// attribute.
-fn cross_session(record: &MessageRecord, text: &str, stub: bool) -> String {
+/// attribute; `late` adds `queued`, the message's age when it lands late.
+fn cross_session(record: &MessageRecord, text: &str, stub: bool, late: Option<&str>) -> String {
     let sender = Sender::of(&record.from, record.from_name.as_deref());
     let from = match &sender.to {
         Some(to) => format!("zellij:{}", to),
@@ -371,6 +462,9 @@ fn cross_session(record: &MessageRecord, text: &str, stub: bool) -> String {
     attributes.push(("message", record.id.clone()));
     if let Some(answering) = record.reply_to.as_deref() {
         attributes.push(("answering", answering.to_owned()));
+    }
+    if let Some(late) = late {
+        attributes.push(("queued", format!("{} ago", late)));
     }
     attributes.push(("reply", format!("zellij_send reply_to={}", record.id)));
     if let Some(to) = &sender.to {
@@ -430,10 +524,17 @@ pub const SYNTHETIC_LINE_CHARS: usize = 80;
 /// - `delivery: queue` waits for a running turn to end; `resume: true` starts a turn on an idle
 ///   agent.
 pub fn opencode_synthetic(record: &MessageRecord, text: &str) -> serde_json::Value {
+    opencode_synthetic_at(record, text, record.queued_at)
+}
+
+/// [`opencode_synthetic`], posted at `now_ms`: a message that lands late names its age in the
+/// wrapper, as [`pasted_at`] does.
+pub fn opencode_synthetic_at(record: &MessageRecord, text: &str, now_ms: u64) -> serde_json::Value {
+    let late = late_by(record, now_ms);
     let text = sanitize(text);
     let sender = Sender::of(&record.from, record.from_name.as_deref());
     serde_json::json!({
-        "text": cross_session(record, &text, false),
+        "text": cross_session(record, &text, false, late.as_deref()),
         "description": synthetic_description(record, &text, &sender.name),
         "metadata": {
             "source": "subagent",
@@ -620,26 +721,58 @@ impl std::fmt::Display for Address {
 /// The name a notice from the session itself goes out under, and the handle in its address.
 pub const SESSION_SENDER: &str = "zellij";
 
-/// The notice that tells a sender its message expired undelivered: the sender's handle in this
-/// session, the notice's `from` address, and its text. `None` for a record that did not expire,
-/// or whose sender is not a pane in `session` on `host`: another session, another machine, the
-/// command line, or the session itself. A notice is sent from `host/-/zellij`, which is no pane,
-/// so a notice that expires in turn is dropped and never starts another.
-pub fn expiry_notice(
-    record: &MessageRecord,
-    host: &str,
-    session: &str,
-) -> Option<(String, String, String)> {
+/// Where an expiry notice goes: the sender's pane, here or elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeTo {
+    /// A pane in the session whose message expired: the session holds the notice itself.
+    Here { handle: String },
+    /// A pane in another session on this machine.
+    Session { session: String, handle: String },
+    /// A pane in a session on another machine.
+    Host {
+        host: String,
+        session: String,
+        handle: String,
+    },
+}
+
+/// The notice that tells a sender its message expired undelivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiryNotice {
+    pub to: NoticeTo,
+    /// The notice's own sender, `host/-/zellij`.
+    pub from: String,
+    pub text: String,
+}
+
+/// The notice that tells a sender its message expired undelivered, and where it goes. `None` for
+/// a record that did not expire, or whose sender is no pane: the command line, or a session
+/// itself. A notice is sent from `host/-/zellij`, which is no pane, so a notice that expires in
+/// turn is dropped and never starts another, wherever it was held.
+pub fn expiry_notice(record: &MessageRecord, host: &str, session: &str) -> Option<ExpiryNotice> {
     if record.status != Status::Expired {
         return None;
     }
     let sender = Address::parse(&record.from)?;
-    let same_host = sender.host.is_empty()
-        || sender.host == host
-        || sender.host.split('.').next() == Some(host);
-    if sender.session == "-" || sender.session != session || !same_host {
+    // the rule that ends every chain of notices: a session's own sender is told nothing
+    if sender.session == "-" {
         return None;
     }
+    let same_host = sender.host.is_empty() || host_label(&sender.host) == host_label(host);
+    let to = match (same_host, sender.session == session) {
+        (true, true) => NoticeTo::Here {
+            handle: sender.handle,
+        },
+        (true, false) => NoticeTo::Session {
+            session: sender.session,
+            handle: sender.handle,
+        },
+        (false, _) => NoticeTo::Host {
+            host: sender.host,
+            session: sender.session,
+            handle: sender.handle,
+        },
+    };
     let held_s = record.expires_at.saturating_sub(record.queued_at) / 1000;
     let held = if held_s >= 60 {
         format!("{} min", (held_s + 30) / 60)
@@ -659,11 +792,65 @@ pub fn expiry_notice(
          harness channel.",
         record.id, record.session, record.handle, held, why
     );
-    Some((
-        sender.handle,
-        format!("{}/-/{}", host, SESSION_SENDER),
+    Some(ExpiryNotice {
+        to,
+        from: format!("{}/-/{}", host, SESSION_SENDER),
         text,
-    ))
+    })
+}
+
+/// A host as one machine name: no `user@`, the first label only, in lower case. `boxa`,
+/// `BOXA.local` and `user@boxa.example.net` are one machine.
+fn host_label(host: &str) -> String {
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    host.split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// The command line that hands a notice to a sender outside this session, run as `zellij
+/// <argv>` on this machine: `send-message` in the sender's session, with `--host` for a sender on
+/// another machine. `None` for a sender in this session, which the session tells itself. No
+/// `--expire-s`: the notice waits as long as the receiving config's `agent_message_expire` says.
+pub fn notice_argv(notice: &ExpiryNotice) -> Option<Vec<String>> {
+    let (host, session, handle) = match &notice.to {
+        NoticeTo::Here { .. } => return None,
+        NoticeTo::Session { session, handle } => (None, session, handle),
+        NoticeTo::Host {
+            host,
+            session,
+            handle,
+        } => (Some(host), session, handle),
+    };
+    let mut argv: Vec<String> = vec![
+        "--session".into(),
+        session.clone(),
+        "action".into(),
+        "send-message".into(),
+    ];
+    if let Some(host) = host {
+        argv.extend(["--host".into(), host.clone()]);
+    }
+    argv.extend([
+        "--to".into(),
+        handle.clone(),
+        "--from".into(),
+        notice.from.clone(),
+        "--from-name".into(),
+        SESSION_SENDER.into(),
+        "--json".into(),
+        "--".into(),
+        notice.text.clone(),
+    ]);
+    Some(argv)
+}
+
+/// Whether `from` is a session's own sender, `host/-/zellij`: its message must never start a
+/// coding agent in a pane that runs none, and is never answered with a notice.
+pub fn is_session_sender(from: &str) -> bool {
+    Address::parse(from)
+        .is_some_and(|address| address.session == "-" && address.handle == SESSION_SENDER)
 }
 
 #[cfg(test)]
@@ -798,31 +985,164 @@ mod tests {
         expired.reason = Some(Reason::Working);
         expired.queued_at = 1_000;
         expired.expires_at = 1_000 + DEFAULT_EXPIRE_S * 1000;
-        let (to, from, text) = expiry_notice(&expired, "boxa", "work").unwrap();
-        assert_eq!(to, "brisk-heron");
-        assert_eq!(from, "boxa/-/zellij");
+        let notice = expiry_notice(&expired, "boxa", "work").unwrap();
         assert_eq!(
-            text,
+            notice.to,
+            NoticeTo::Here {
+                handle: "brisk-heron".into()
+            }
+        );
+        assert_eq!(notice.from, "boxa/-/zellij");
+        assert_eq!(
+            notice.text,
             "message 7 to work/sunny-otter expired undelivered after 30 min: the agent stayed \
              busy. Resend it, or use the agent's harness channel."
         );
-        // the notice itself, expired in turn, has nobody to tell
-        let mut notice = expired.clone();
-        notice.from = from;
-        notice.handle = to;
-        assert_eq!(expiry_notice(&notice, "boxa", "work"), None);
-        // only an expired message, and only a sender in this session on this machine
+        // the session tells a sender of its own itself, with no command line
+        assert_eq!(notice_argv(&notice), None);
+        // the notice itself, expired in turn, has nobody to tell, here or on any other machine
+        let mut expired_notice = expired.clone();
+        expired_notice.from = notice.from.clone();
+        expired_notice.handle = "brisk-heron".into();
+        assert_eq!(expiry_notice(&expired_notice, "boxa", "work"), None);
+        assert_eq!(expiry_notice(&expired_notice, "boxb", "other"), None);
+        // only an expired message
         let mut held = expired.clone();
         held.status = Status::Queued;
         assert_eq!(expiry_notice(&held, "boxa", "work"), None);
-        assert_eq!(expiry_notice(&expired, "boxb", "work"), None);
-        assert_eq!(expiry_notice(&expired, "boxa", "other"), None);
+        // the command line is no pane to tell
         let mut cli = expired.clone();
         cli.from = "boxa/-/cli".into();
         assert_eq!(expiry_notice(&cli, "boxa", "work"), None);
-        let mut no_host = expired;
-        no_host.from = "/work/brisk-heron".into();
-        assert!(expiry_notice(&no_host, "boxa", "work").is_some());
+        // this machine, however its address spells it
+        for from in [
+            "/work/brisk-heron",
+            "BOXA/work/brisk-heron",
+            "user@boxa.example.net/work/brisk-heron",
+        ] {
+            let mut here = expired.clone();
+            here.from = from.into();
+            assert!(
+                matches!(
+                    expiry_notice(&here, "boxa", "work").unwrap().to,
+                    NoticeTo::Here { .. }
+                ),
+                "{from}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sender_in_another_session_or_on_another_machine_is_told_through_send_message() {
+        let mut expired = record(Some("claude"), None);
+        expired.from = "boxa/work/brisk-heron".into();
+        expired.status = Status::Expired;
+        expired.queued_at = 1_000;
+        expired.expires_at = 1_000 + 4 * 60 * 60 * 1000;
+        // another session on this machine
+        let notice = expiry_notice(&expired, "boxa", "other").unwrap();
+        assert_eq!(
+            notice.to,
+            NoticeTo::Session {
+                session: "work".into(),
+                handle: "brisk-heron".into()
+            }
+        );
+        assert!(notice.text.contains("after 240 min"), "{}", notice.text);
+        assert_eq!(
+            notice_argv(&notice).unwrap(),
+            [
+                "--session",
+                "work",
+                "action",
+                "send-message",
+                "--to",
+                "brisk-heron",
+                "--from",
+                "boxa/-/zellij",
+                "--from-name",
+                "zellij",
+                "--json",
+                "--",
+                notice.text.as_str(),
+            ]
+        );
+        // another machine: the same, carried there with --host
+        let notice = expiry_notice(&expired, "boxb", "work").unwrap();
+        assert_eq!(
+            notice.to,
+            NoticeTo::Host {
+                host: "boxa".into(),
+                session: "work".into(),
+                handle: "brisk-heron".into()
+            }
+        );
+        let argv = notice_argv(&notice).unwrap();
+        assert_eq!(
+            argv[..6],
+            [
+                "--session",
+                "work",
+                "action",
+                "send-message",
+                "--host",
+                "boxa"
+            ]
+        );
+        assert!(argv.contains(&"boxb/-/zellij".to_owned()));
+        // the notice's sender is the session itself, whose message never starts an agent
+        assert!(is_session_sender(&notice.from));
+        assert!(!is_session_sender("boxa/work/brisk-heron"));
+        assert!(!is_session_sender("boxa/-/cli"));
+    }
+
+    #[test]
+    fn the_config_default_is_a_span_or_never_and_never_zero() {
+        assert_eq!(parse_expire("1800"), Ok(1800));
+        assert_eq!(parse_expire("45s"), Ok(45));
+        assert_eq!(parse_expire("90m"), Ok(90 * 60));
+        assert_eq!(parse_expire("4h"), Ok(4 * 60 * 60));
+        assert_eq!(parse_expire(" 2d "), Ok(2 * 24 * 60 * 60));
+        assert_eq!(parse_expire("never"), Ok(NEVER_EXPIRE_S));
+        assert_eq!(parse_expire("Never"), Ok(NEVER_EXPIRE_S));
+        for bad in ["0", "0h", "", "h", "4 hours", "-5m", "1.5h", "forever"] {
+            assert!(parse_expire(bad).is_err(), "{bad}");
+        }
+        // never, from now, stays a number a JSON reader holds exactly
+        let now_ms: u64 = 1_800_000_000_000;
+        assert!(now_ms.saturating_add(NEVER_EXPIRE_S * 1000) < 1 << 53);
+    }
+
+    #[test]
+    fn a_message_that_lands_late_names_its_age() {
+        let mut late = record(None, None);
+        late.queued_at = 1_000;
+        let at = |minutes: u64| 1_000 + minutes * 60_000;
+        // under two minutes: no age, the envelope as before
+        assert_eq!(pasted_at(&late, "Done.", at(1)), pasted(&late, "Done."));
+        assert_eq!(late_by(&late, at(2)).as_deref(), Some("2 min"));
+        assert_eq!(late_by(&late, at(120)).as_deref(), Some("2 h"));
+        assert_eq!(late_by(&late, at(185)).as_deref(), Some("3 h 5 min"));
+        assert_eq!(
+            pasted_at(&late, "Done.", at(47)),
+            "[message 7 from builder (tab develop, boxa), answering 6; queued 47 min ago; not \
+             from the person. Reply: zellij_send reply_to=7, or to=boxa/work/brisk-heron]\nDone."
+        );
+        late.agent = Some("claude".into());
+        let paste = pasted_at(&late, "Done.", at(47));
+        assert!(
+            paste.contains(" answering=\"6\" queued=\"47 min ago\" reply="),
+            "{paste}"
+        );
+        let body = opencode_synthetic_at(&late, "Done.", at(47));
+        assert!(body["text"]
+            .as_str()
+            .unwrap()
+            .contains("queued=\"47 min ago\""));
+        // the age counts toward the paste limit: a long late message is still one stub
+        let long = pasted_at(&late, &"x".repeat(700), at(47));
+        assert!(long.chars().count() <= PASTE_COLLAPSE_LIMIT, "{long}");
+        assert!(long.contains("queued=\"47 min ago\""));
     }
 
     #[test]

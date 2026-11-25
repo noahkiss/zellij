@@ -3215,9 +3215,10 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(value_parser)]
         text: String,
 
-        /// Seconds a held message waits before it expires
-        #[clap(long, value_parser, default_value = "1800")]
-        expire_s: u64,
+        /// Seconds a held message waits before it expires. 0 delivers now or refuses. Unset, the
+        /// config's `agent_message_expire` decides, and 1800 without it
+        #[clap(long, value_parser)]
+        expire_s: Option<u64>,
 
         /// Block until the message is delivered, for at most this many seconds. It waits for
         /// delivery only, never for an answer: a reply arrives in the sender's own prompt
@@ -3245,6 +3246,12 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// Look for the target in every live session on this machine, not one
         #[clap(long, value_parser)]
         all_sessions: bool,
+
+        /// Run this command on another machine, over ssh: a host listed in `remote_hosts` in this
+        /// config. The rest of the command line runs there as given, so that machine's config
+        /// decides an unset --expire-s. A host that names this machine sends here
+        #[clap(long, value_parser)]
+        host: Option<String>,
 
         /// Output as JSON
         #[clap(short, long, value_parser)]
@@ -4246,6 +4253,34 @@ mod tests {
         match cli.command {
             Some(Command::Action { action, .. }) => *action,
             other => panic!("Expected Action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn send_message_leaves_an_unset_expiry_to_the_config_and_takes_a_host() {
+        match parse_action(&["send-message", "--to", "develop", "--", "Done."]) {
+            CliAction::SendMessage { expire_s, host, .. } => {
+                assert_eq!(expire_s, None);
+                assert_eq!(host, None);
+            },
+            other => panic!("expected send-message, got {:?}", other),
+        }
+        match parse_action(&[
+            "send-message",
+            "--to",
+            "develop",
+            "--expire-s",
+            "0",
+            "--host",
+            "boxa",
+            "--",
+            "Done.",
+        ]) {
+            CliAction::SendMessage { expire_s, host, .. } => {
+                assert_eq!(expire_s, Some(0));
+                assert_eq!(host.as_deref(), Some("boxa"));
+            },
+            other => panic!("expected send-message, got {:?}", other),
         }
     }
 

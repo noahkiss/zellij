@@ -1323,6 +1323,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             command_pane_on_clean_exit: None,
             // read by the sending CLI from its own config; the server never needs it
             person_name: None,
+            agent_message_expire: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

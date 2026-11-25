@@ -102,6 +102,8 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-message-show-cancel",
     // send-message starts the config's default_harness in a target tab or pane with no agent
     "send-default-harness",
+    // agent_message_expire; expiry notices reach other sessions and machines; late messages name their age
+    "agent-message-expire",
 ];
 
 /// The version, split into the parts that can actually be compared.
