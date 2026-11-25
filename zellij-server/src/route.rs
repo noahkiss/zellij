@@ -2706,6 +2706,7 @@ fn route_action_with_origin(
             from_person,
             reply_to,
             expire_s,
+            receipt,
         } => {
             use crossbeam::channel::unbounded;
             let (response_sender, response_receiver) = unbounded();
@@ -2719,6 +2720,7 @@ fn route_action_with_origin(
                     from_person,
                     reply_to,
                     expire_s,
+                    receipt,
                     response_channel: response_sender,
                 })
                 .with_context(err_context)?;

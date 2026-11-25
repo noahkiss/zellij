@@ -3243,6 +3243,13 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(long, value_parser)]
         from_person: bool,
 
+        /// Tell the sender when a held message is delivered: a one-line notice from zellij, as an
+        /// expiry notice comes. A message delivered at once gets none; its record already says so.
+        /// It costs the sender a turn, so ask only when the timing matters; `message-status <id>`
+        /// polls instead
+        #[clap(long, value_parser)]
+        receipt: bool,
+
         /// Look for the target in every live session on this machine, not one
         #[clap(long, value_parser)]
         all_sessions: bool,

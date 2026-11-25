@@ -776,9 +776,10 @@ pub enum NoticeTo {
     },
 }
 
-/// The notice that tells a sender its message expired undelivered.
+/// A notice the session sends a message's sender: that it expired undelivered, or that it was
+/// delivered after it was held (a receipt).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpiryNotice {
+pub struct Notice {
     pub to: NoticeTo,
     /// The notice's own sender, `host/-/zellij`.
     pub from: String,
@@ -789,30 +790,11 @@ pub struct ExpiryNotice {
 /// a record that did not expire, or whose sender is no pane: the command line, or a session
 /// itself. A notice is sent from `host/-/zellij`, which is no pane, so a notice that expires in
 /// turn is dropped and never starts another, wherever it was held.
-pub fn expiry_notice(record: &MessageRecord, host: &str, session: &str) -> Option<ExpiryNotice> {
+pub fn expiry_notice(record: &MessageRecord, host: &str, session: &str) -> Option<Notice> {
     if record.status != Status::Expired {
         return None;
     }
-    let sender = Address::parse(&record.from)?;
-    // the rule that ends every chain of notices: a session's own sender is told nothing
-    if sender.session == "-" {
-        return None;
-    }
-    let same_host = sender.host.is_empty() || host_label(&sender.host) == host_label(host);
-    let to = match (same_host, sender.session == session) {
-        (true, true) => NoticeTo::Here {
-            handle: sender.handle,
-        },
-        (true, false) => NoticeTo::Session {
-            session: sender.session,
-            handle: sender.handle,
-        },
-        (false, _) => NoticeTo::Host {
-            host: sender.host,
-            session: sender.session,
-            handle: sender.handle,
-        },
-    };
+    let to = notice_to(record, host, session)?;
     let held_s = record.expires_at.saturating_sub(record.queued_at) / 1000;
     let held = if held_s >= 60 {
         format!("{} min", (held_s + 30) / 60)
@@ -832,11 +814,81 @@ pub fn expiry_notice(record: &MessageRecord, host: &str, session: &str) -> Optio
          harness channel.",
         record.id, record.session, record.handle, held, why
     );
-    Some(ExpiryNotice {
+    Some(Notice {
         to,
         from: format!("{}/-/{}", host, SESSION_SENDER),
         text,
     })
+}
+
+/// Where a notice about `record` goes: its sender's pane, in this session, another session here,
+/// or another machine. `None` for a sender that is no pane: the command line, or a session itself.
+fn notice_to(record: &MessageRecord, host: &str, session: &str) -> Option<NoticeTo> {
+    let sender = Address::parse(&record.from)?;
+    // the rule that ends every chain of notices: a session's own sender is told nothing
+    if sender.session == "-" {
+        return None;
+    }
+    let same_host = sender.host.is_empty() || host_label(&sender.host) == host_label(host);
+    Some(match (same_host, sender.session == session) {
+        (true, true) => NoticeTo::Here {
+            handle: sender.handle,
+        },
+        (true, false) => NoticeTo::Session {
+            session: sender.session,
+            handle: sender.handle,
+        },
+        (false, _) => NoticeTo::Host {
+            host: sender.host,
+            session: sender.session,
+            handle: sender.handle,
+        },
+    })
+}
+
+/// fork addition: the receipt for a message that was held and then delivered, when its sender
+/// asked for one (`send-message --receipt`): `message 3 to work/sunny-otter delivered after 12
+/// min`. It goes where an expiry notice goes, from the same `host/-/zellij`. `None` for a record
+/// not delivered, and for a sender that is no pane - so a notice, sent from `host/-/zellij`, never
+/// gets a receipt. Whether the message was held, and whether a receipt was asked for, is the
+/// caller's to know: a message delivered at once gets none, since the send already said so.
+pub fn delivery_receipt(record: &MessageRecord, host: &str, session: &str) -> Option<Notice> {
+    if record.status != Status::Delivered {
+        return None;
+    }
+    let to = notice_to(record, host, session)?;
+    let waited_ms = record
+        .delivered_at
+        .unwrap_or(record.queued_at)
+        .saturating_sub(record.queued_at);
+    let text = format!(
+        "message {} to {}/{} delivered after {}",
+        record.id,
+        record.session,
+        record.handle,
+        waited_words(waited_ms)
+    );
+    Some(Notice {
+        to,
+        from: format!("{}/-/{}", host, SESSION_SENDER),
+        text,
+    })
+}
+
+/// A wait in words: `40 s`, `12 min`, `3 h 5 min`.
+fn waited_words(waited_ms: u64) -> String {
+    let seconds = waited_ms / 1000;
+    if seconds < 60 {
+        return format!("{} s", seconds);
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        format!("{} min", minutes)
+    } else if minutes % 60 == 0 {
+        format!("{} h", minutes / 60)
+    } else {
+        format!("{} h {} min", minutes / 60, minutes % 60)
+    }
 }
 
 /// A host as one machine name: no `user@`, the first label only, in lower case. `boxa`,
@@ -853,7 +905,7 @@ fn host_label(host: &str) -> String {
 /// <argv>` on this machine: `send-message` in the sender's session, with `--host` for a sender on
 /// another machine. `None` for a sender in this session, which the session tells itself. No
 /// `--expire-s`: the notice waits as long as the receiving config's `agent_message_expire` says.
-pub fn notice_argv(notice: &ExpiryNotice) -> Option<Vec<String>> {
+pub fn notice_argv(notice: &Notice) -> Option<Vec<String>> {
     let (host, session, handle) = match &notice.to {
         NoticeTo::Here { .. } => return None,
         NoticeTo::Session { session, handle } => (None, session, handle),
@@ -1107,6 +1159,53 @@ mod tests {
                 "{from}"
             );
         }
+    }
+
+    #[test]
+    fn a_receipt_names_the_wait_goes_where_a_notice_goes_and_never_to_a_session_sender() {
+        let mut delivered = record(Some("claude"), None);
+        delivered.from = "boxb/work/brisk-heron".into();
+        delivered.status = Status::Delivered;
+        delivered.queued_at = 1_000;
+        delivered.delivered_at = Some(1_000 + 12 * 60 * 1000 + 30_000);
+        let receipt = delivery_receipt(&delivered, "boxa", "work").unwrap();
+        assert_eq!(
+            receipt.to,
+            NoticeTo::Host {
+                host: "boxb".into(),
+                session: "work".into(),
+                handle: "brisk-heron".into()
+            }
+        );
+        assert_eq!(receipt.from, "boxa/-/zellij");
+        assert_eq!(
+            receipt.text,
+            format!(
+                "message {} to {}/{} delivered after 12 min",
+                delivered.id, delivered.session, delivered.handle
+            )
+        );
+        // the command line it goes out on asks for no receipt of its own
+        let argv = notice_argv(&receipt).unwrap();
+        assert!(!argv.iter().any(|word| word == "--receipt"), "{argv:?}");
+        // seconds and hours read as such
+        delivered.delivered_at = Some(1_000 + 40_000);
+        assert!(delivery_receipt(&delivered, "boxa", "work")
+            .unwrap()
+            .text
+            .ends_with("after 40 s"));
+        delivered.delivered_at = Some(1_000 + 185 * 60 * 1000);
+        assert!(delivery_receipt(&delivered, "boxa", "work")
+            .unwrap()
+            .text
+            .ends_with("after 3 h 5 min"));
+        // a notice from a session itself never gets one, and nor does an undelivered message
+        let mut notice = delivered.clone();
+        notice.from = "boxb/-/zellij".into();
+        assert_eq!(delivery_receipt(&notice, "boxa", "work"), None);
+        let mut held = delivered.clone();
+        held.status = Status::Queued;
+        assert_eq!(delivery_receipt(&held, "boxa", "work"), None);
     }
 
     #[test]

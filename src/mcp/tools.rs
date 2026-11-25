@@ -397,12 +397,17 @@ pub const TOOLS: &[ToolSpec] = &[
         reports: &["action send-message", "action message-cancel"],
         tips: "The receiving session types the message in as one paste and an Enter only when the \
                agent reported idle, done or error, no unsent text is in its prompt, and no key \
-               reached the pane in the last 5 seconds. Otherwise it holds the message and tries \
+               reached the pane in the quiet window (5 seconds unless the receiving machine's \
+               agent_message_quiet says otherwise). Otherwise it holds the message and tries \
                again each second: status queued, with reason working, blocked, draft, typing or \
                starting. A held message survives a restart of that session and expires after \
                expire_s, or when you give none, after the receiving machine's configured \
                default (agent_message_expire, 30 minutes unset); you then get a notice from \
-               zellij, in another session or on another machine too. A message that lands late \
+               zellij, in another session or on another machine too. receipt=true asks for a \
+               one-line notice from zellij when a held message is delivered; a message delivered \
+               at once gets none, since this call already says delivered. A receipt costs you a \
+               turn when it arrives, so ask only when the timing matters; `zellij action \
+               message-status <id>` in that session polls instead. A message that lands late \
                tells the receiver how long ago it was queued. Refused means not sent: not_agent, no_state, or a target that named no \
                agent or several, with the candidates listed. The receiver reads, with your text, \
                an envelope that names you and the message id; it answers with reply_to=<id>. A \
@@ -476,6 +481,16 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "Set it only when the text is the person's own words or request, which \
                            you relay for them: the receiver is told it comes directly from that \
                            person, by name. Never set it for your own messages.",
+                default: None,
+            },
+            ParamSpec {
+                name: "receipt",
+                kind: ParamKind::Bool,
+                required: false,
+                from: Some(("action send-message", "--receipt")),
+                describe: "Be told, by a one-line notice from zellij, when a message that was \
+                           held is delivered. It costs you a turn; leave it out unless the \
+                           timing matters. A message delivered at once gets no receipt.",
                 default: None,
             },
             ParamSpec {

@@ -163,6 +163,9 @@ pub fn argv(
     if flag(args, "from_person") {
         argv.push(FROM_PERSON.to_owned());
     }
+    if flag(args, "receipt") {
+        argv.push(RECEIPT.to_owned());
+    }
     if let Some(reply_to) = args.get("reply_to").and_then(Value::as_str) {
         argv.extend(["--reply-to".to_owned(), reply_to.to_owned()]);
     }
@@ -210,9 +213,14 @@ pub const FROM_TAB: &str = "--from-tab";
 /// not from the person.
 pub const FROM_PERSON: &str = "--from-person";
 
+/// The flag that asks for a receipt when a held message is delivered. A receiving build from
+/// before it refuses the flag; the message is then sent again without it, and no receipt comes.
+pub const RECEIPT: &str = "--receipt";
+
 /// The flags a receiving build may not know yet, each with whether it takes a value. clap names
 /// one unknown flag per refusal, so a build that knows none of them refuses once for each.
-pub const NEWER_FLAGS: &[(&str, bool)] = &[(FROM_TAB, true), (FROM_PERSON, false)];
+pub const NEWER_FLAGS: &[(&str, bool)] =
+    &[(FROM_TAB, true), (FROM_PERSON, false), (RECEIPT, false)];
 
 /// The command line without the one flag of [`NEWER_FLAGS`] the receiving build refused, when it
 /// refused that flag and nothing else. `None` when the refusal was about something else, or the
@@ -352,6 +360,16 @@ mod tests {
         assert!(!argv(&r, &sender, &args)
             .unwrap()
             .contains(&FROM_PERSON.to_owned()));
+        // a receipt, asked for
+        let args: Map<String, Value> =
+            serde_json::from_value(json!({"text": "hi", "receipt": true})).unwrap();
+        assert!(argv(&r, &sender, &args)
+            .unwrap()
+            .contains(&RECEIPT.to_owned()));
+        let args: Map<String, Value> = serde_json::from_value(json!({"text": "hi"})).unwrap();
+        assert!(!argv(&r, &sender, &args)
+            .unwrap()
+            .contains(&RECEIPT.to_owned()));
         let r = route("develop", Some("work"), &hosts(), "here").unwrap();
         let args: Map<String, Value> = serde_json::from_value(json!({"text": "hi"})).unwrap();
         assert_eq!(

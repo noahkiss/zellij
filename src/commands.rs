@@ -2013,6 +2013,7 @@ fn send_message(
         from_name,
         from_tab,
         from_person,
+        receipt,
         json,
         ..
     } = cli_action
@@ -2039,6 +2040,11 @@ fn send_message(
             from_person: from_person.then(|| {
                 person_name(config.and_then(|config| config.options.person_name.as_deref()))
             }),
+            // a session's own notice never asks for a receipt
+            receipt: *receipt
+                && !from
+                    .as_deref()
+                    .is_some_and(zellij_utils::agent_mail::is_session_sender),
             json: *json || output_json,
             // a session's own notice goes to an agent's pane, and never starts one where none runs
             default_harness: CONFIG_PATH
@@ -2160,6 +2166,7 @@ fn send_message_argv_for_host(
         from_name,
         from_tab,
         from_person,
+        receipt,
         all_sessions,
         json,
         ..
@@ -2188,6 +2195,9 @@ fn send_message_argv_for_host(
     }
     if *from_person {
         argv.push("--from-person".to_owned());
+    }
+    if *receipt {
+        argv.push("--receipt".to_owned());
     }
     if *all_sessions || (session.is_none() && to.is_some()) {
         argv.push("--all-sessions".to_owned());
@@ -2244,6 +2254,7 @@ mod send_message_on_host_tests {
             from_name: Some("zellij".to_owned()),
             from_tab: None,
             from_person: false,
+            receipt: false,
             all_sessions: false,
             host: Some("boxa".to_owned()),
             json: true,

@@ -920,6 +920,8 @@ pub enum ScreenInstruction {
         from_person: Option<String>,
         reply_to: Option<String>,
         expire_s: u64,
+        /// The sender asks to be told when a held message is delivered.
+        receipt: bool,
         response_channel: crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>,
     },
     /// fork addition: `message-status`: one message's record, or every record. `None` answers an
@@ -8388,6 +8390,7 @@ impl Screen {
         from_person: Option<String>,
         reply_to: Option<String>,
         expire_s: u64,
+        receipt: bool,
     ) -> zellij_utils::agent_mail::MessageRecord {
         self.send_agent_message_replying(
             terminal_id,
@@ -8398,6 +8401,7 @@ impl Screen {
             from_person,
             reply_to,
             expire_s,
+            receipt,
             None,
         )
     }
@@ -8415,11 +8419,14 @@ impl Screen {
         from_person: Option<String>,
         reply_to: Option<String>,
         expire_s: u64,
+        receipt: bool,
         reply: Option<crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>>,
     ) -> zellij_utils::agent_mail::MessageRecord {
         use zellij_utils::agent_mail::{MessageRecord, Status};
         let now_ms = crate::program_status::now_ms();
         let pane = self.agent_mail_pane(|info| !info.is_plugin && info.id == terminal_id);
+        // a session's own notice never asks for a receipt, whatever an older client sent
+        let receipt = receipt && !zellij_utils::agent_mail::is_session_sender(&from);
         let stored = crate::agent_mail::Stored {
             record: MessageRecord {
                 id: self.agent_mail.new_id(),
@@ -8445,6 +8452,7 @@ impl Screen {
                 via: None,
             },
             text,
+            receipt,
         };
         if let Some((_, agent)) = &pane {
             if let Some(route) = self.opencode_route(terminal_id, agent.as_ref(), &stored) {
@@ -8651,6 +8659,7 @@ impl Screen {
                     .is_some()
                 {
                     log::info!("message {} posted to opencode on port {}", id, port);
+                    self.send_delivery_receipt(&id);
                 } else {
                     log::info!(
                         "message {} posted to opencode on port {} after it was settled here",
@@ -8802,6 +8811,7 @@ impl Screen {
             Decision::Deliver => {
                 self.agent_mail
                     .delivered(&stored.record.id, pane_id, now_ms);
+                self.send_delivery_receipt(&stored.record.id);
             },
             Decision::Refuse(Reason::NoState) => {
                 // the agent outlived its startup window without a word: it never will say
@@ -8827,9 +8837,8 @@ impl Screen {
     /// in; see `agent_mail::expiry_notice`. A sender that is an agent's pane in this session gets
     /// the notice from this session, as a message like any other. A sender in another session, on
     /// this machine or another, gets it through `send-message` run on a short-lived thread
-    /// (`agent_mail::send_expiry_notice_elsewhere`): one try, never retried.
+    /// (`agent_mail::send_notice_elsewhere`): one try, never retried.
     fn notify_expired_sender(&mut self, id: &str) {
-        use zellij_utils::agent_mail::NoticeTo;
         let Some(record) = self.agent_mail.get(id).map(|stored| stored.record.clone()) else {
             return;
         };
@@ -8839,16 +8848,49 @@ impl Screen {
         else {
             return;
         };
+        self.tell_sender(id, &record.from, notice, "expired");
+    }
+
+    /// fork addition: sends the receipt for message `id`, which was held and just delivered, when
+    /// its sender asked for one (`send-message --receipt`); see `agent_mail::delivery_receipt`.
+    /// Called only from the paths that deliver a HELD message: a message delivered at its first
+    /// try gets no receipt, since its send already answered `delivered`.
+    fn send_delivery_receipt(&mut self, id: &str) {
+        let Some(stored) = self.agent_mail.get(id).filter(|stored| stored.receipt) else {
+            return;
+        };
+        let record = stored.record.clone();
+        let host = zellij_utils::shared::short_hostname();
+        let Some(receipt) =
+            zellij_utils::agent_mail::delivery_receipt(&record, host, &self.session_name)
+        else {
+            return;
+        };
+        self.tell_sender(id, &record.from, receipt, "delivered");
+    }
+
+    /// fork addition: hands `notice` about message `id` to its sender `from`: from this session
+    /// when the sender is an agent's pane here, through `send-message` otherwise. `what` names the
+    /// event in the log.
+    fn tell_sender(
+        &mut self,
+        id: &str,
+        from: &str,
+        notice: zellij_utils::agent_mail::Notice,
+        what: &str,
+    ) {
+        use zellij_utils::agent_mail::NoticeTo;
         let NoticeTo::Here { handle } = &notice.to else {
-            crate::agent_mail::send_expiry_notice_elsewhere(id, &notice);
+            crate::agent_mail::send_notice_elsewhere(id, &notice, what);
             return;
         };
         let sender = self.agent_mail_pane(|info| !info.is_plugin && &info.handle == handle);
         let Some((info, Some(_))) = sender else {
             log::info!(
-                "message {} expired; its sender {} runs no agent here to tell",
+                "message {} {}; its sender {} runs no agent here to tell",
                 id,
-                record.from
+                what,
+                from
             );
             return;
         };
@@ -8861,6 +8903,7 @@ impl Screen {
             None,
             None,
             zellij_utils::agent_mail::DEFAULT_EXPIRE_S,
+            false,
         );
     }
 
@@ -14287,6 +14330,7 @@ pub(crate) fn screen_thread_main(
                 from_person,
                 reply_to,
                 expire_s,
+                receipt,
                 response_channel,
             } => {
                 // answered here, or once a post to an OpenCode agent's server comes back
@@ -14299,6 +14343,7 @@ pub(crate) fn screen_thread_main(
                     from_person,
                     reply_to,
                     expire_s,
+                    receipt,
                     Some(response_channel),
                 );
             },

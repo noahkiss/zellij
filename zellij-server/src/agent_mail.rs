@@ -274,6 +274,11 @@ pub struct Stored {
     #[serde(flatten)]
     pub record: MessageRecord,
     pub text: String,
+    /// The sender asked to be told when the message, held, is delivered (`send-message
+    /// --receipt`). Kept in the held message's file, so it outlives a restart; a file from before
+    /// it reads as false. Not in the record `send-message` prints.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub receipt: bool,
 }
 
 /// The session's messages: the held ones, oldest first, and the ones settled lately.
@@ -620,17 +625,18 @@ thread_local! {
         std::cell::RefCell::new(Vec::new());
 }
 
-/// fork addition: hands the notice that message `id` expired to a sender in another session, on
-/// this machine or another, by running `zellij <notice_argv>` on a short-lived thread. One try:
-/// a sender's machine that is asleep or unreachable costs one ssh timeout and a line in the log,
-/// never a retry. Nothing here blocks the screen thread.
-pub fn send_expiry_notice_elsewhere(id: &str, notice: &zellij_utils::agent_mail::ExpiryNotice) {
+/// fork addition: hands a notice about message `id` - that it expired, or a receipt that it was
+/// delivered - to a sender in another session, on this machine or another, by running `zellij
+/// <notice_argv>` on a short-lived thread. One try: a sender's machine that is asleep or
+/// unreachable costs one ssh timeout and a line in the log, never a retry. Nothing here blocks the
+/// screen thread. `what` names the event in the log.
+pub fn send_notice_elsewhere(id: &str, notice: &zellij_utils::agent_mail::Notice, what: &str) {
     let Some(argv) = zellij_utils::agent_mail::notice_argv(notice) else {
         return;
     };
     #[cfg(test)]
     {
-        let _ = id;
+        let _ = (id, what);
         NOTICES_SENT.with(|sent| sent.borrow_mut().push(argv));
     }
     #[cfg(not(test))]
@@ -639,27 +645,29 @@ pub fn send_expiry_notice_elsewhere(id: &str, notice: &zellij_utils::agent_mail:
         if NOTICES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= NOTICES_IN_FLIGHT_MAX {
             NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             log::info!(
-                "message {} expired; {} notices are already on their way, so its sender is not told",
+                "message {} {}; {} notices are already on their way, so its sender is not told",
                 id,
+                what,
                 NOTICES_IN_FLIGHT_MAX
             );
             return;
         }
         let id = id.to_owned();
+        let event = what.to_owned();
         let started = std::thread::Builder::new()
             .name("agent_mail_notice".to_owned())
             .spawn(move || {
                 match run_notice(&argv) {
-                    Ok(()) => log::info!("message {} expired; its sender was told", id),
+                    Ok(()) => log::info!("message {} {}; its sender was told", id, event),
                     Err(why) => {
-                        log::info!("message {} expired; its sender was not told: {}", id, why)
+                        log::info!("message {} {}; its sender was not told: {}", id, event, why)
                     },
                 }
                 NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             });
         if let Err(e) = started {
             NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-            log::info!("message expired; no thread to tell its sender: {}", e);
+            log::info!("message {}; no thread to tell its sender: {}", what, e);
         }
     }
 }

@@ -919,6 +919,10 @@ pub struct SendMessageAction {
     /// the person whose own words the message relays; absent for an agent's own message
     #[prost(string, optional, tag="8")]
     pub from_person: ::core::option::Option<::prost::alloc::string::String>,
+    /// fork addition: the sender asks to be told when a held message is delivered. A server from
+    /// before it ignores the field; a client from before it never sets it, which reads as false
+    #[prost(bool, tag="9")]
+    pub receipt: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

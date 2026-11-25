@@ -708,6 +708,8 @@ pub enum Action {
         reply_to: Option<String>,
         /// How long a held message waits before it expires.
         expire_s: u64,
+        /// The sender asks for a receipt when the message is held and then delivered.
+        receipt: bool,
     },
     /// fork addition: the record of one message this session holds or delivered, or of all of
     /// them. JSON.

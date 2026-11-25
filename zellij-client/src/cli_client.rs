@@ -3413,6 +3413,8 @@ pub struct SendMessageRequest {
     pub from_tab: Option<String>,
     /// The person whose own words the message relays, by name; `None` for the agent's own.
     pub from_person: Option<String>,
+    /// The sender asks to be told when a held message is delivered.
+    pub receipt: bool,
     pub json: bool,
     /// The config's `default_harness`: started in a target tab or pane that runs no agent.
     pub default_harness: Option<String>,
@@ -3789,6 +3791,7 @@ fn deliver_message(
         from_person: request.from_person.clone(),
         reply_to: request.reply_to.clone(),
         expire_s: request.expire_s,
+        receipt: request.receipt,
     };
     let mut record = match ask(make_os_input(), &session, action, "the message").and_then(|lines| {
         serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(

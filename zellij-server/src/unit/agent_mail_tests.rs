@@ -117,7 +117,31 @@ fn message(id: &str, handle: &str, queued_at: u64, expires_at: u64) -> Stored {
             via: None,
         },
         text: "Run the tests.".into(),
+        receipt: false,
     }
+}
+
+/// fork addition: the receipt flag is kept in a held message's file and comes back after a
+/// restart; a file written before the flag existed reads as no receipt.
+#[test]
+fn a_held_message_keeps_its_receipt_flag_and_an_older_file_reads_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mailbox = Mailbox::open(dir.path().to_path_buf(), 0);
+    let mut asked = message("1", "sunny-otter", 10, u64::MAX);
+    asked.receipt = true;
+    mailbox.hold(asked);
+    mailbox.hold(message("2", "sunny-otter", 20, u64::MAX));
+    let reopened = Mailbox::open(dir.path().to_path_buf(), 0);
+    assert!(reopened.get("1").unwrap().receipt);
+    assert!(!reopened.get("2").unwrap().receipt);
+    // a file without the key is the file an older build wrote, and a file without the flag set
+    // does not write the key
+    let written = std::fs::read_to_string(dir.path().join("2.json")).unwrap();
+    assert!(!written.contains("receipt"), "{}", written);
+    let older: Stored = serde_json::from_str(&written).unwrap();
+    assert!(!older.receipt);
+    let with_flag = std::fs::read_to_string(dir.path().join("1.json")).unwrap();
+    assert!(with_flag.contains("\"receipt\":true"), "{}", with_flag);
 }
 
 #[test]

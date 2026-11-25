@@ -9589,6 +9589,22 @@ reads stdin).
     `default_harness`.
   - A notice is held and expires like any message; a notice that expires is dropped, since its
     sender is no pane. So a notice never starts another, on any machine.
+- **A receipt says when a held message went in.** `send-message --receipt` (`zellij_send
+  receipt: true`) asks the receiving session to tell the sender once a message it HELD is
+  delivered: `message 3 to work/sunny-otter delivered after 12 min`. It goes the way an expiry
+  notice goes, from `host/-/zellij`: from the session itself to a sender's pane there, through
+  `send-message` to another session, and with `--host` to another machine, one try each, inside
+  the same cap of 4 in flight. Only the two paths that deliver a held message send one: the
+  once-a-second retry and an OpenCode post of a held message. A message delivered at its first
+  try gets none, since its send already answered `delivered`; with `--wait`, a message held for
+  part of the wait gets both the delivered record and the receipt. A message from
+  `host/-/zellij` never asks for one: the CLI drops the flag for such a sender, the server drops
+  it again whatever an older client sent, and no notice's command line carries it. So a receipt
+  never starts another. The flag is kept in the held message's file (`receipt: true`, written
+  only when set), so it survives a restart of the server; a file from an older build reads as no
+  receipt. It is not in the record `send-message` prints. A receipt costs the sender a turn when it
+  lands, so the tool tips say to ask only when the timing matters, and name `message-status
+  <id>` as the way to poll instead.
 - **`send-message --host <host>`** runs the rest of the command line on another machine, over the
   same ssh `zellij_send` uses: only a host listed in `remote_hosts` in this config, given 20 s
   (`connect_timeout` plus 15 s) plus any `--wait`. It passes `--session`, or `--all-sessions` for a `--to` with no session, and
@@ -9773,11 +9789,17 @@ cannot send them; a fork client against a stock server of the same contract gets
 actions. `SendMessageAction` gained `optional string from_tab = 7`, a field of a message the
 fork owns; a server from before it ignores the field and names no tab. It gained `optional
 string from_person = 8` the same way; a server from before it ignores the field and says "not
-from the person". No plugin-API change.
+from the person". `--receipt` is `bool receipt = 9`, new and optional in the same sense: a proto3
+bool, absent when false. A server from before it skips the unknown field and sends no receipt; a
+client from before it never sets it, which reads as false. No existing field changes or moves, so
+the contract version stays and a fork build and a stock build of the same contract still share
+sessions. `zellij_send` drops `--receipt` for a receiving CLI that refuses it, as it does for
+`--from-tab`. No plugin-API change.
 Capabilities: `agent-send-message`; `agent-message-show-cancel` for the stub, `message-show`,
 `message-cancel` and `zellij_send cancel`; `agent-message-expire` for `agent_message_expire`,
 notices to other sessions and machines, `send-message --host` and the age;
-`agent-message-timings` for `agent_startup_grace` and `agent_message_quiet`.
+`agent-message-timings` for `agent_startup_grace` and `agent_message_quiet`;
+`agent-message-receipt` for `--receipt`.
 
 Limits:
 
@@ -9797,7 +9819,11 @@ Limits:
 - A sender's machine on a build from before `agent_message_expire` does not know that a
   `host/-/zellij` message must never start `default_harness`. With that key set there, a notice
   to a sender whose agent has left its pane can start a harness in it.
-- A burst of more than 4 expiries in one round tells only the first 4 senders elsewhere.
+- A burst of more than 4 expiries or receipts in one round tells only the first 4 senders
+  elsewhere.
+- A receipt asked of a receiving server from before `--receipt` never comes, and nothing says
+  so: the old server ignores the field. A receiving CLI from before it refuses the flag, and
+  `zellij_send` sends again without it.
 
 Files: `zellij-utils/src/agent_mail.rs` (record, envelope, stub, guard, address),
 `input/actions.rs`, `cli.rs`, `cli_surface.rs`, `capabilities.rs`, `data.rs`

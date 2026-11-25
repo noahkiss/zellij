@@ -1301,6 +1301,7 @@ fn test_client_messages() {
             from_person: Some("Sam".to_owned()),
             reply_to: Some("m1a2b3c".to_owned()),
             expire_s: 1800,
+            receipt: true,
         },
         terminal_id: None,
         client_id: Some(100),

@@ -25283,15 +25283,25 @@ fn person_types(screen: &mut Screen, bytes: &[u8]) {
 }
 
 fn send(screen: &mut Screen, text: &str) -> zellij_utils::agent_mail::MessageRecord {
+    send_from(screen, text, "boxa/work/brisk-heron", false)
+}
+
+fn send_from(
+    screen: &mut Screen,
+    text: &str,
+    from: &str,
+    receipt: bool,
+) -> zellij_utils::agent_mail::MessageRecord {
     screen.send_agent_message(
         1,
         text.to_owned(),
-        "boxa/work/brisk-heron".to_owned(),
+        from.to_owned(),
         Some("builder".to_owned()),
         Some("develop".to_owned()),
         None,
         None,
         60,
+        receipt,
     )
 }
 
@@ -25349,6 +25359,7 @@ fn a_message_to_opencode_is_posted_not_typed_and_answered_when_the_post_succeeds
         None,
         None,
         60,
+        false,
         Some(reply),
     );
     assert_eq!(record.status, Status::Queued, "{record:?}");
@@ -25385,6 +25396,7 @@ fn a_failed_post_to_opencode_types_the_message_in_once_through_the_guard() {
         None,
         None,
         60,
+        false,
         Some(reply),
     );
     assert!(pty_writes(&writes).is_empty());
@@ -25552,6 +25564,94 @@ fn an_expired_message_from_another_machine_tells_its_sender_there() {
     );
 }
 
+/// fork addition: `send-message --receipt`. A held message that is then delivered tells its
+/// sender, here through `send-message --host` to the sender's machine.
+#[test]
+fn a_held_message_with_a_receipt_tells_its_sender_once_it_is_delivered() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, _writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "working");
+    let record = send_from(&mut screen, "Run the tests.", "boxa/work/brisk-heron", true);
+    assert_eq!(record.status, Status::Queued);
+    assert!(screen.agent_mail.get(&record.id).unwrap().receipt);
+    crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow_mut().clear());
+    // still held: no receipt yet
+    screen.drain_agent_messages();
+    assert!(crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow().is_empty()));
+    screen
+        .agent_mail
+        .held_mut_for_test(&record.id)
+        .record
+        .queued_at -= 12 * 60 * 1000;
+    agent_reports(&mut screen, "idle");
+    screen.drain_agent_messages();
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+    let sent = crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow().clone());
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0][..6],
+        [
+            "--session",
+            "work",
+            "action",
+            "send-message",
+            "--host",
+            "boxa"
+        ]
+    );
+    assert!(!sent[0].contains(&"--receipt".to_owned()), "{sent:?}");
+    assert_eq!(
+        sent[0].last().unwrap(),
+        &format!(
+            "message {} to {}/{} delivered after 12 min",
+            record.id, record.session, record.handle
+        )
+    );
+}
+
+#[test]
+fn a_receipt_is_sent_only_for_a_held_message_and_never_for_a_session_sender() {
+    use zellij_utils::agent_mail::Status;
+    // delivered at once: the send already said delivered, so no receipt
+    let (mut screen, _writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow_mut().clear());
+    let record = send_from(&mut screen, "Now.", "boxa/work/brisk-heron", true);
+    assert_eq!(record.status, Status::Delivered);
+    screen.drain_agent_messages();
+    assert!(crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow().is_empty()));
+
+    // held and delivered without asking: no receipt
+    let (mut screen, _writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "working");
+    let record = send_from(&mut screen, "Later.", "boxa/work/brisk-heron", false);
+    assert_eq!(record.status, Status::Queued);
+    agent_reports(&mut screen, "idle");
+    screen.drain_agent_messages();
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+    assert!(crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow().is_empty()));
+
+    // a notice from host/-/zellij that asks for one never gets one: the flag is dropped
+    let (mut screen, _writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "working");
+    let record = send_from(&mut screen, "message 3 expired", "boxa/-/zellij", true);
+    assert_eq!(record.status, Status::Queued);
+    assert!(!screen.agent_mail.get(&record.id).unwrap().receipt);
+    agent_reports(&mut screen, "idle");
+    screen.drain_agent_messages();
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+    assert!(crate::agent_mail::NOTICES_SENT.with(|sent| sent.borrow().is_empty()));
+}
+
 #[test]
 fn a_held_message_that_lands_late_names_its_age() {
     use zellij_utils::agent_mail::Status;
@@ -25668,8 +25768,17 @@ fn a_working_or_blocked_agent_holds_and_a_shell_or_no_wait_refuses() {
     agent_reports(&mut screen, "blocked");
     assert_eq!(send(&mut screen, "b").reason, Some(Reason::Blocked));
     // expire_s 0: deliver now or not at all
-    let now_only =
-        screen.send_agent_message(1, "c".into(), "x/y/z".into(), None, None, None, None, 0);
+    let now_only = screen.send_agent_message(
+        1,
+        "c".into(),
+        "x/y/z".into(),
+        None,
+        None,
+        None,
+        None,
+        0,
+        false,
+    );
     assert_eq!(now_only.status, Status::Refused);
     assert_eq!(now_only.reason, Some(Reason::Blocked));
     assert!(pty_writes(&writes).is_empty());

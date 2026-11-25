@@ -2599,6 +2599,7 @@ impl From<crate::input::actions::Action>
                 from_person,
                 reply_to,
                 expire_s,
+                receipt,
             } => ActionType::SendMessage(SendMessageAction {
                 terminal_id,
                 text,
@@ -2608,6 +2609,7 @@ impl From<crate::input::actions::Action>
                 expire_s,
                 from_tab,
                 from_person,
+                receipt,
             }),
             crate::input::actions::Action::MessageStatus { id } => {
                 ActionType::MessageStatus(MessageStatusAction { id })
@@ -3760,6 +3762,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 from_person: a.from_person,
                 reply_to: a.reply_to,
                 expire_s: a.expire_s,
+                receipt: a.receipt,
             }),
             ActionType::MessageStatus(a) => {
                 Ok(crate::input::actions::Action::MessageStatus { id: a.id })

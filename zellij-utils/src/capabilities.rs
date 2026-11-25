@@ -113,6 +113,8 @@ pub const CAPABILITIES: &[&str] = &[
     // mcp_wait_timeout: zellij_wait_for's default wait, in its description and its command line
     "mcp-wait-timeout",
     "pane-frame-handle", // pane_frame_handle false: no handle on the frame
+    // send-message --receipt, zellij_send receipt: a notice when a held message is delivered
+    "agent-message-receipt",
 ];
 
 /// The version, split into the parts that can actually be compared.

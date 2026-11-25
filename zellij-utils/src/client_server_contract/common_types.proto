@@ -498,6 +498,9 @@ message SendMessageAction {
   optional string from_tab = 7;
   // the person whose own words the message relays; absent for an agent's own message
   optional string from_person = 8;
+  // fork addition: the sender asks to be told when a held message is delivered. A server from
+  // before it ignores the field; a client from before it never sets it, which reads as false
+  bool receipt = 9;
 }
 message MessageStatusAction {
   optional string id = 1;
