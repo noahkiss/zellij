@@ -5265,6 +5265,12 @@ new build. Two unit tests cover the suffix and the fallback.
 `keys` took several keys, but the whole string is one `send-keys` argument, so it is one key per
 call. A test now parses every backticked key in the tool's text.
 
+**Every `reason` an answer carries is in the output schema (nkmk.47).** A `zellij_create` that
+waited and whose shell was not ready answered `reason: not_ready`, which the schema's enum lacked.
+A client that validates `structuredContent` then dropped the answer, and with it the handle of a
+pane that exists. The reasons now live in one list, `tools::reason`, the enum is built from it, and
+a test reads the `src/mcp` source and fails on a reason written as a bare literal.
+
 ### `session up` comes back with the shape the session had
 
 ```

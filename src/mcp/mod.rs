@@ -36,6 +36,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Map, Value};
+use tools::reason;
 use zellij_utils::consts::VERSION;
 
 /// What a client is told this server is, before it asks for anything.
@@ -127,7 +128,7 @@ impl ZellijMcp {
                 return failed(
                     "scope=fleet lists every session on every host: pass it without `session`."
                         .to_owned(),
-                    json!({"reason": "bad_arguments"}),
+                    json!({"reason": reason::BAD_ARGUMENTS}),
                 );
             }
             return fleet::overview(&self.remote_hosts(), local).await;
@@ -147,7 +148,7 @@ impl ZellijMcp {
         };
         let target = match remote::route(&mut arguments, &hosts, local) {
             Ok(target) => target,
-            Err(message) => return failed(message, json!({"reason": "bad_arguments"})),
+            Err(message) => return failed(message, json!({"reason": reason::BAD_ARGUMENTS})),
         };
         let plan =
             match invoke::plan(name, &arguments, self.ambient_session.as_deref(), &target).await {
@@ -155,14 +156,17 @@ impl ZellijMcp {
                 // a call that could not be turned into a command line never ran, and the caller is
                 // told what was missing rather than being handed an empty result
                 Err(message) => {
-                    return with_host(failed(message, json!({"reason": "bad_arguments"})), &target)
+                    return with_host(
+                        failed(message, json!({"reason": reason::BAD_ARGUMENTS})),
+                        &target,
+                    )
                 },
             };
         let then_type = plan.then_type;
         let (argv, mut outcome) = match self.run_plan(plan.call, &target).await {
             Ok(ran) => ran,
             Err(message) => {
-                return with_host(failed(message, json!({"reason": "not_run"})), &target)
+                return with_host(failed(message, json!({"reason": reason::NOT_RUN})), &target)
             },
         };
         if let (Some(view), false) = (&plan.agents, outcome.is_error()) {
@@ -211,7 +215,7 @@ impl ZellijMcp {
         let hosts = self.remote_hosts();
         let local_name = hosts.local_name(local);
         let ambient = self.ambient_session.clone();
-        let bad = |message: String| failed(message, json!({"reason": "bad_arguments"}));
+        let bad = |message: String| failed(message, json!({"reason": reason::BAD_ARGUMENTS}));
         if let Some(id) = arguments.get("cancel").and_then(Value::as_str) {
             return self.cancel(arguments, id, local).await;
         }
@@ -227,7 +231,7 @@ impl ZellijMcp {
                 let caller = invoke::ambient_session().or_else(|| ambient.clone());
                 let argv = match reply_lookup_argv(id, caller.as_deref()) {
                     Ok(argv) => argv,
-                    Err(message) => return failed(message, json!({"reason": "miss"})),
+                    Err(message) => return failed(message, json!({"reason": reason::MISS})),
                 };
                 let record = match invoke::run_on(&remote::Target::Local, &argv).await {
                     Ok(outcome) if !outcome.is_error() => {
@@ -248,7 +252,7 @@ impl ZellijMcp {
                             id,
                             caller.as_deref().unwrap_or_default()
                         ),
-                        json!({"reason": "miss"}),
+                        json!({"reason": reason::MISS}),
                     );
                 };
                 if address.host.is_empty() || remote::is_local(&address.host, local) {
@@ -259,7 +263,7 @@ impl ZellijMcp {
                             "Message {} came from {}, which is not listed in remote_hosts in config.kdl, so a reply cannot reach it. Its sender is {}.",
                             id, address.host, address
                         ),
-                        json!({"reason": "bad_arguments", "from": address.to_string()}),
+                        json!({"reason": reason::BAD_ARGUMENTS, "from": address.to_string()}),
                     );
                 } else {
                     address.to_string()
@@ -303,7 +307,10 @@ impl ZellijMcp {
         let mut outcome = match invoke::run_on(&route.target, &argv).await {
             Ok(outcome) => outcome,
             Err(message) => {
-                return with_host(failed(message, json!({"reason": "not_run"})), &route.target)
+                return with_host(
+                    failed(message, json!({"reason": reason::NOT_RUN})),
+                    &route.target,
+                )
             },
         };
         // a receiving build from before `--from-tab` or `--from-person`: the same message, without
@@ -318,7 +325,7 @@ impl ZellijMcp {
                     Ok(outcome) => outcome,
                     Err(message) => {
                         return with_host(
-                            failed(message, json!({"reason": "not_run"})),
+                            failed(message, json!({"reason": reason::NOT_RUN})),
                             &route.target,
                         )
                     },
@@ -335,7 +342,7 @@ impl ZellijMcp {
                         "{} runs a zellij without send-message, so the message was not sent. Nothing was typed: a message pasted without the guard can land in a person's half-written prompt. Upgrade zellij there, or type it yourself with zellij_write_input after checking the pane with zellij_read_pane.",
                         host
                     ),
-                    json!({"reason": "remote_too_old"}),
+                    json!({"reason": reason::REMOTE_TOO_OLD}),
                 ),
                 &route.target,
             );
@@ -357,7 +364,7 @@ impl ZellijMcp {
         id: &str,
         local: &str,
     ) -> CallToolResult {
-        let bad = |message: String| failed(message, json!({"reason": "bad_arguments"}));
+        let bad = |message: String| failed(message, json!({"reason": reason::BAD_ARGUMENTS}));
         let session = match send::cancel_session(arguments) {
             Ok(session) => session,
             Err(message) => return bad(message),
@@ -376,7 +383,7 @@ impl ZellijMcp {
         let outcome = match invoke::run_on(&target, &argv).await {
             Ok(outcome) => outcome,
             Err(message) => {
-                return with_host(failed(message, json!({"reason": "not_run"})), &target)
+                return with_host(failed(message, json!({"reason": reason::NOT_RUN})), &target)
             },
         };
         // a failed cancel keeps the CLI's own line, which says why
@@ -606,7 +613,7 @@ impl ZellijMcp {
         // and the caller made it and has to close it
         if waited && outcome.is_miss() && invoke::reported_pane_id(&outcome.stdout).is_some() {
             // nothing was typed into a shell that had not said it was listening
-            structured.insert("reason".to_owned(), json!("not_ready"));
+            structured.insert("reason".to_owned(), json!(reason::NOT_READY));
             if let Some(pane_id) = report_value(&outcome.stdout, "pane_id") {
                 structured.insert("pane_id".to_owned(), json!(pane_id));
             }
@@ -653,7 +660,11 @@ impl ZellijMcp {
             // is no id here to invent
             structured.insert(
                 "reason".to_owned(),
-                json!(if outcome.is_miss() { "miss" } else { "error" }),
+                json!(if outcome.is_miss() {
+                    reason::MISS
+                } else {
+                    reason::ERROR
+                }),
             );
             let said = first_words(&outcome.stderr, &outcome.stdout);
             let message = if outcome.is_miss() {

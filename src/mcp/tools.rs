@@ -685,6 +685,51 @@ pub fn tool_list() -> Vec<Tool> {
 /// described, so the description promises the bound the command line is given.
 pub const WAIT_TIMEOUT_PLACEHOLDER: &str = "{wait_timeout_s}";
 
+/// Every `reason` an answer can carry, in one place.
+///
+/// The output schema's enum is built from these lists, and the code that puts a reason on an
+/// answer names one of these constants rather than a string. A client that validates
+/// `structuredContent` drops an answer whose reason the enum lacks, and it did, twice:
+/// `every_reason_the_code_writes_is_a_constant_the_schema_lists` reads the source and fails on a
+/// reason written as a bare literal.
+pub mod reason {
+    /// Exit 2: a well-formed request about something that is not there.
+    pub const MISS: &str = "miss";
+    /// The CLI ran and failed.
+    pub const ERROR: &str = "error";
+    /// The call could not be turned into a command line.
+    pub const BAD_ARGUMENTS: &str = "bad_arguments";
+    /// The command line could not be run at all.
+    pub const NOT_RUN: &str = "not_run";
+    /// The other machine's zellij has no `send-message`.
+    pub const REMOTE_TOO_OLD: &str = "remote_too_old";
+    /// A create whose pane was made, but whose shell was not ready in time.
+    pub const NOT_READY: &str = "not_ready";
+
+    /// Every reason this server writes itself.
+    pub const ALL: &[&str] = &[
+        MISS,
+        ERROR,
+        BAD_ARGUMENTS,
+        NOT_RUN,
+        REMOTE_TOO_OLD,
+        NOT_READY,
+    ];
+
+    /// Why a receiving session holds or refused a message: `agent_mail::Reason`, which the
+    /// record of a `zellij_send` carries up to the top of the answer.
+    pub const HELD: &[&str] = &[
+        "working",
+        "blocked",
+        "draft",
+        "typing",
+        "starting",
+        "not_agent",
+        "no_state",
+        "pane_gone",
+    ];
+}
+
 /// The shape of every tool's `structuredContent`, which is the same for all seven.
 ///
 /// One schema rather than seven, because every tool is the same child process reported the same
@@ -727,14 +772,14 @@ fn output_schema() -> JsonObject {
         "reason".to_owned(),
         json!({
             "type": "string",
-            "enum": [
-                "miss", "error", "bad_arguments", "not_run", "remote_too_old",
+            "enum": reason::ALL
+                .iter()
                 // zellij_send: why the receiving session holds or refused the message
-                "working", "blocked", "draft", "typing", "starting",
-                "not_agent", "no_state", "pane_gone",
-            ],
-            "description": "On a failed call, which kind it was. On zellij_send, why the \
-                            message is held or was refused.",
+                .chain(reason::HELD.iter())
+                .collect::<Vec<_>>(),
+            "description": "On a failed call, which kind it was. not_ready is a zellij_create \
+                            whose pane was made but whose shell was not ready in time. On \
+                            zellij_send, why the message is held or was refused.",
         }),
     );
     let mut schema = Map::new();
@@ -973,6 +1018,95 @@ mod tests {
                 reason.as_str()
             );
         }
+        for reason in super::reason::ALL {
+            assert!(
+                allowed.iter().any(|v| v == reason),
+                "{} is missing from the reason enum",
+                reason
+            );
+        }
+    }
+
+    /// The string literals in `text` that are values rather than object keys.
+    fn value_literals(text: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut chars = text.char_indices().peekable();
+        while let Some((start, c)) = chars.next() {
+            if c != '"' {
+                continue;
+            }
+            let mut literal = String::new();
+            let mut end = start;
+            while let Some((at, c)) = chars.next() {
+                end = at;
+                match c {
+                    '\\' => {
+                        chars.next();
+                    },
+                    '"' => break,
+                    c => literal.push(c),
+                }
+            }
+            let is_key = text[end + 1..].trim_start().starts_with(':');
+            if !is_key {
+                found.push(literal);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn every_reason_the_code_writes_is_a_constant_the_schema_lists() {
+        // `not_ready` was written as a literal the enum lacked, and a client that validates the
+        // answer hid the handle of a pane that exists. Every reason now goes through
+        // `reason::*`, which the enum is built from; a literal beside `"reason"` fails here
+        let sources = [
+            ("mod.rs", include_str!("mod.rs")),
+            ("invoke.rs", include_str!("invoke.rs")),
+            ("send.rs", include_str!("send.rs")),
+            ("fleet.rs", include_str!("fleet.rs")),
+            ("remote.rs", include_str!("remote.rs")),
+        ];
+        let mut sites = 0;
+        for (file, source) in sources {
+            let code = source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source);
+            for (at, _) in code.match_indices("\"reason\"") {
+                let rest = &code[at + "\"reason\"".len()..];
+                let statement = &rest[..rest.find(';').unwrap_or(rest.len())];
+                let literals = value_literals(statement);
+                assert!(
+                    literals.is_empty(),
+                    "{} writes the reason {:?} as a literal: name a `reason::` constant, \
+                     and add it to `reason::ALL` if it is new",
+                    file,
+                    literals,
+                );
+                if statement.contains("reason::") {
+                    sites += 1;
+                }
+            }
+        }
+        // the scan found the code it guards, rather than passing on nothing
+        assert!(sites >= 10, "found only {} reason sites", sites);
+        let schema = super::output_schema();
+        let allowed = schema["properties"]["reason"]["enum"].as_array().unwrap();
+        assert!(allowed.iter().any(|v| v == "not_ready"));
+    }
+
+    #[test]
+    fn a_literal_beside_a_reason_is_caught() {
+        assert_eq!(
+            value_literals(r#": "not_ready"));"#),
+            vec!["not_ready".to_owned()]
+        );
+        assert!(value_literals(r#": reason::MISS, "from": address})"#).is_empty());
+        assert_eq!(
+            value_literals(r#"json!(if miss { "miss" } else { reason::ERROR })"#),
+            vec!["miss".to_owned()]
+        );
     }
 
     use super::*;
