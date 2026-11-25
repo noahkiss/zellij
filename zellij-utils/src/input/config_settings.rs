@@ -205,6 +205,7 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         remote_timeouts: _,
         agent_startup_grace: _,
         agent_message_quiet: _,
+        mcp_wait_timeout: _,
     } = options;
     let entries = [
         (SettingKey::SimplifiedUi, display_text(simplified_ui)),

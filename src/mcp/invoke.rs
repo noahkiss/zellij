@@ -26,11 +26,38 @@ use serde_json::{Map, Value};
 
 use super::remote::{self, Target};
 
-/// How long `zellij_wait_for` waits when the caller did not say.
-///
-/// The same string the tool's `timeout_s` parameter documents as its default - one constant, so a
-/// description that promises a bound and a command line that has none cannot drift apart.
-pub const WAIT_TIMEOUT_DEFAULT_S: &str = "300";
+/// How long `zellij_wait_for` waits when the caller did not say and the config's
+/// `mcp_wait_timeout` does not either.
+pub const WAIT_TIMEOUT_DEFAULT_S: u64 = 300;
+
+/// What either says: the config's `mcp_wait_timeout`, read once when the server starts, or
+/// [`WAIT_TIMEOUT_DEFAULT_S`].
+static WAIT_TIMEOUT_S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// The bounds of `mcp_wait_timeout`: whole seconds, as `wait --timeout` takes them, from 1 s to a
+/// day. Zero is refused: to `wait` it means no bound at all.
+pub const WAIT_TIMEOUT_BOUNDS: zellij_utils::config_span::SpanBounds =
+    zellij_utils::config_span::SpanBounds {
+        min: std::time::Duration::from_secs(1),
+        max: std::time::Duration::from_secs(24 * 60 * 60),
+        zero: false,
+        whole_seconds: true,
+    };
+
+/// Sets the wait every `zellij_wait_for` without `timeout_s` gets, from the config's
+/// `mcp_wait_timeout`. Only the first call counts: the tool's description, which a client caches,
+/// names the same number the command line is given.
+pub fn set_wait_timeout_s(value: Option<&str>) {
+    let seconds = value
+        .and_then(|value| zellij_utils::config_span::parse_span(value, WAIT_TIMEOUT_BOUNDS).ok())
+        .map_or(WAIT_TIMEOUT_DEFAULT_S, |span| span.duration.as_secs());
+    let _ = WAIT_TIMEOUT_S.set(seconds);
+}
+
+/// The wait a `zellij_wait_for` without `timeout_s` gets, and the one its description promises.
+pub fn wait_timeout_s() -> u64 {
+    *WAIT_TIMEOUT_S.get().unwrap_or(&WAIT_TIMEOUT_DEFAULT_S)
+}
 
 /// How long `zellij_create` waits for a new pane's shell to be ready, in seconds.
 ///
@@ -876,7 +903,7 @@ fn argv_in(
             rest.push("--timeout".to_owned());
             rest.push(
                 args.string("timeout_s")
-                    .unwrap_or_else(|| WAIT_TIMEOUT_DEFAULT_S.to_owned()),
+                    .unwrap_or_else(|| env.wait_timeout_s.to_string()),
             );
             Ok(scoped(rest))
         },
@@ -1090,6 +1117,8 @@ struct CallEnv {
     /// The call goes to a session on another machine, where this one's `$SHELL`, paths and
     /// files mean nothing.
     remote: bool,
+    /// How long a `zellij_wait_for` without `timeout_s` waits: [`wait_timeout_s`].
+    wait_timeout_s: u64,
 }
 
 impl CallEnv {
@@ -1104,6 +1133,7 @@ impl CallEnv {
                 .filter(|pane| !pane.trim().is_empty()),
             var: Box::new(|name| std::env::var(name).ok()),
             remote: false,
+            wait_timeout_s: wait_timeout_s(),
         }
     }
 }
@@ -1214,6 +1244,7 @@ mod tests {
             pane: None,
             var: Box::new(move |name| vars.get(name).cloned()),
             remote: false,
+            wait_timeout_s: WAIT_TIMEOUT_DEFAULT_S,
         }
     }
 
@@ -1559,13 +1590,28 @@ mod tests {
     fn a_wait_is_always_bounded_and_the_bound_is_the_one_advertised() {
         // an unbounded wait is a child process that outlives the client that asked for it. The
         // default is the one the tool's own parameter description promises
-        assert_eq!(
-            crate::mcp::tools::tool_spec("zellij_wait_for")
-                .and_then(|spec| spec.params.iter().find(|p| p.name == "timeout_s"))
-                .and_then(|param| param.default),
-            Some(WAIT_TIMEOUT_DEFAULT_S)
-        );
+        let spec = crate::mcp::tools::tool_spec("zellij_wait_for").unwrap();
+        let advertised = |seconds: u64| {
+            crate::mcp::tools::input_schema_with(spec, seconds)["properties"]["timeout_s"]
+                ["default"]
+                .clone()
+        };
+        assert_eq!(advertised(WAIT_TIMEOUT_DEFAULT_S), json!(300));
         assert!(line("zellij_wait_for", json!({"pane": "3"}), None).contains("--timeout 300"));
+        // the config's mcp_wait_timeout moves both: what is advertised, and what is applied
+        let mut env = a_shell_env();
+        env.wait_timeout_s = 50;
+        assert!(built("zellij_wait_for", json!({"pane": "3"}), None, &env)
+            .join(" ")
+            .contains("--timeout 50"));
+        assert_eq!(advertised(50), json!(50));
+        let described = crate::mcp::tools::description_with(spec, 50);
+        assert!(
+            described.contains("gives up after 50 seconds"),
+            "{}",
+            described
+        );
+        assert!(!described.contains("300"), "{}", described);
         assert!(line(
             "zellij_wait_for",
             json!({"pane": "3", "timeout_s": 5}),

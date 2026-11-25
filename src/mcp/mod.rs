@@ -93,6 +93,16 @@ pub struct ZellijMcp {
 
 impl ZellijMcp {
     pub fn new(session: Option<String>, config_path: Option<PathBuf>) -> Self {
+        // `mcp_wait_timeout`, read once: the tool list a client caches names it. A config that
+        // does not parse leaves the default, and the server starts all the same
+        invoke::set_wait_timeout_s(
+            config_path
+                .as_deref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| zellij_utils::input::config::Config::from_kdl(&text, None).ok())
+                .and_then(|config| config.options.mcp_wait_timeout)
+                .as_deref(),
+        );
         let server = ZellijMcp {
             ambient_session: session.or_else(invoke::ambient_session),
             config_path,

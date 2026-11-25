@@ -3554,6 +3554,7 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "keybinds_dir",
     "layout_dir",
     "live_view_release_key",
+    "mcp_wait_timeout",
     "mirror_resizes_source_pane",
     "mirror_session",
     "mode_hints_when_bars_hidden",
@@ -4036,6 +4037,19 @@ impl Options {
             crate::agent_mail::QUIET_BOUNDS,
             "0, or a span up to 60s, such as \"10s\"",
         );
+        // the MCP server's own key: the bounds are its, and it reads the value as `wait --timeout`
+        // takes it, whole seconds
+        let mcp_wait_timeout = span_or_note(
+            "mcp_wait_timeout",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "mcp_wait_timeout"),
+            crate::config_span::SpanBounds {
+                min: std::time::Duration::from_secs(1),
+                max: std::time::Duration::from_secs(24 * 60 * 60),
+                zero: false,
+                whole_seconds: true,
+            },
+            "whole seconds from 1s to 24h, such as \"50s\"",
+        );
         let host_notification_protocol = known_value_or_note(
             "host_notification_protocol",
             kdl_property_first_arg_as_string_or_error!(kdl_options, "host_notification_protocol"),
@@ -4185,6 +4199,7 @@ impl Options {
             remote_timeouts,
             agent_startup_grace,
             agent_message_quiet,
+            mcp_wait_timeout,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -7350,6 +7365,15 @@ impl Options {
              // Unset, 5 seconds",
         ) {
             nodes.push(quiet);
+        }
+        if let Some(wait) = Self::span_option_to_kdl(
+            "mcp_wait_timeout",
+            self.mcp_wait_timeout.as_ref(),
+            add_comments,
+            "// How long zellij_wait_for waits when its caller gives no timeout_s: 1s to 24h.\n\
+             // Unset, 300 seconds",
+        ) {
+            nodes.push(wait);
         }
         if let Some(host_notification_protocol) =
             self.host_notification_protocol_to_kdl(add_comments)
@@ -12774,6 +12798,33 @@ fn agent_startup_grace_and_agent_message_quiet_parse_cap_warn_and_round_trip() {
     assert_eq!(capped.options.agent_message_quiet.as_deref(), Some("60s"));
     assert_eq!(capped.warnings.len(), 2, "{:?}", capped.warnings);
     assert!(Config::from_kdl("agent_startup_grace 60", None).is_err());
+}
+
+#[test]
+fn mcp_wait_timeout_parses_refuses_zero_and_round_trips() {
+    let read = |kdl: &str| Config::from_kdl(kdl, None).unwrap();
+    assert_eq!(read("").options.mcp_wait_timeout, None);
+    let config = read("mcp_wait_timeout \"50s\"");
+    assert_eq!(config.options.mcp_wait_timeout.as_deref(), Some("50s"));
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    assert_eq!(read(&config.to_string(false)).options, config.options);
+    // zero means no bound to `wait`, and a fraction is no whole second: both keep the default
+    for kdl in [
+        "mcp_wait_timeout \"0\"",
+        "mcp_wait_timeout \"1500ms\"",
+        "mcp_wait_timeout \"x\"",
+    ] {
+        let config = read(kdl);
+        assert_eq!(config.options.mcp_wait_timeout, None, "{}", kdl);
+        assert_eq!(config.warnings.len(), 1, "{} {:?}", kdl, config.warnings);
+    }
+    assert_eq!(
+        read("mcp_wait_timeout \"48h\"")
+            .options
+            .mcp_wait_timeout
+            .as_deref(),
+        Some("86400s")
+    );
 }
 
 #[test]

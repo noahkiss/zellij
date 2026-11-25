@@ -110,6 +110,8 @@ pub const CAPABILITIES: &[&str] = &[
     "remote-hosts-timeouts",
     // agent_startup_grace and agent_message_quiet: the agent-message guard's two windows
     "agent-message-timings",
+    // mcp_wait_timeout: zellij_wait_for's default wait, in its description and its command line
+    "mcp-wait-timeout",
 ];
 
 /// The version, split into the parts that can actually be compared.

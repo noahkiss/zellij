@@ -236,7 +236,7 @@ pub const TOOLS: &[ToolSpec] = &[
                right after typing does not count. Use it after zellij_write_input sends a line \
                to a shell; read `ready_by` (prompt, or quiet for a shell without OSC 133 marks, \
                where quiet_ms is the window). Every wait is bounded: without timeout_s it gives \
-               up after 300 seconds rather than blocking for the life of the pane. If your MCP \
+               up after {wait_timeout_s} seconds rather than blocking for the life of the pane. If your MCP \
                client cuts a request off sooner (many do at 60 seconds), pass a timeout_s under \
                that deadline and wait again. \
                Start the child, then wait for agent-change in the background; never poll the screen. \
@@ -308,7 +308,7 @@ pub const TOOLS: &[ToolSpec] = &[
                            seconds under your MCP client's own request deadline, which is often \
                            60 seconds: a client that gives up first returns a request error \
                            instead of this tool's answer. To wait longer, wait again.",
-                default: Some("300"),
+                default: Some(WAIT_TIMEOUT_PLACEHOLDER),
             },
         ],
         read_only: true,
@@ -665,6 +665,11 @@ pub fn tool_list() -> Vec<Tool> {
     TOOLS.iter().map(describe).collect()
 }
 
+/// Where the table names `zellij_wait_for`'s own default wait, which the config's
+/// `mcp_wait_timeout` sets: in the tips, and as `timeout_s`'s default. Filled in when a tool is
+/// described, so the description promises the bound the command line is given.
+pub const WAIT_TIMEOUT_PLACEHOLDER: &str = "{wait_timeout_s}";
+
 /// The shape of every tool's `structuredContent`, which is the same for all seven.
 ///
 /// One schema rather than seven, because every tool is the same child process reported the same
@@ -726,10 +731,11 @@ fn output_schema() -> JsonObject {
 
 /// One tool, description and schema alike.
 fn describe(spec: &'static ToolSpec) -> Tool {
+    let wait_timeout_s = invoke::wait_timeout_s();
     let mut tool = Tool::new(
         Cow::Borrowed(spec.name),
-        Cow::Owned(description(spec)),
-        Arc::new(input_schema(spec)),
+        Cow::Owned(description_with(spec, wait_timeout_s)),
+        Arc::new(input_schema_with(spec, wait_timeout_s)),
     )
     .with_raw_output_schema(Arc::new(output_schema()));
     tool.annotations = Some(
@@ -748,14 +754,23 @@ fn describe(spec: &'static ToolSpec) -> Tool {
 ///
 /// Four of the five lines are written in the table above. `Returns:` is the fifth, and it is
 /// generated from the surface map so that it says what the command actually prints.
+#[cfg(test)]
 pub fn description(spec: &ToolSpec) -> String {
+    description_with(spec, invoke::WAIT_TIMEOUT_DEFAULT_S)
+}
+
+/// [`description`], naming `wait_timeout_s` as `zellij_wait_for`'s default wait.
+pub fn description_with(spec: &ToolSpec, wait_timeout_s: u64) -> String {
     let mut out = String::from(spec.summary);
     out.push_str("\n\n");
     out.push_str(&format!("Best for: {}\n", spec.best_for));
     out.push_str(&format!("Returns: {}\n", returns_for(spec)));
     out.push_str(&format!("Not for: {}\n", spec.not_for));
     if !spec.tips.is_empty() {
-        out.push_str(&format!("Notes: {}\n", spec.tips));
+        let tips = spec
+            .tips
+            .replace(WAIT_TIMEOUT_PLACEHOLDER, &wait_timeout_s.to_string());
+        out.push_str(&format!("Notes: {}\n", tips));
     }
     if let Some(follow_up) = spec.follow_up {
         out.push_str(&format!("Follow up with {}.\n", follow_up));
@@ -836,11 +851,18 @@ fn normalize(keys: &str) -> String {
 
 /// The tool's JSON Schema, with each property described by whatever describes the flag it stands
 /// for.
+#[cfg(test)]
 pub fn input_schema(spec: &ToolSpec) -> JsonObject {
+    input_schema_with(spec, invoke::WAIT_TIMEOUT_DEFAULT_S)
+}
+
+/// [`input_schema`], with `wait_timeout_s` as `zellij_wait_for`'s `timeout_s` default.
+pub fn input_schema_with(spec: &ToolSpec, wait_timeout_s: u64) -> JsonObject {
     let mut properties = Map::new();
     let mut required: Vec<Value> = Vec::new();
+    let wait_timeout = wait_timeout_s.to_string();
     for param in spec.params {
-        properties.insert(param.name.to_owned(), property(param));
+        properties.insert(param.name.to_owned(), property(param, &wait_timeout));
         if param.required {
             required.push(json!(param.name));
         }
@@ -853,7 +875,7 @@ pub fn input_schema(spec: &ToolSpec) -> JsonObject {
     schema
 }
 
-fn property(param: &ParamSpec) -> Value {
+fn property(param: &ParamSpec, wait_timeout: &str) -> Value {
     let mut property = Map::new();
     match param.kind {
         ParamKind::Str => {
@@ -872,6 +894,11 @@ fn property(param: &ParamSpec) -> Value {
     }
     property.insert("description".to_owned(), json!(param_description(param)));
     if let Some(default) = param.default {
+        let default = if default == WAIT_TIMEOUT_PLACEHOLDER {
+            wait_timeout
+        } else {
+            default
+        };
         // the table writes every default as a string, because that is what a command line takes.
         // An integer property whose `default` is a string is not valid against its own schema, so
         // it is put back into the type the property declares

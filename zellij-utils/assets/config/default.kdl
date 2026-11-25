@@ -746,6 +746,13 @@ context_menu {
 //
 // agent_message_quiet "10s"
 
+// How long zellij_wait_for (zellij mcp) waits when its caller gives no timeout_s. Lower it for an
+// MCP client that cuts a request off sooner. Read when zellij mcp starts
+// Whole seconds, or a number with s, m or h, from 1s to 24h
+// Default: 300 seconds
+//
+// mcp_wait_timeout "50s"
+
 // How long a call to another machine waits (zellij mcp, send-message --host), inside the
 // remote_hosts block: ssh's connection timeout, and how long zellij_overview scope=fleet waits for
 // one host. Whole seconds, or a number with s, m or h, from 1s to 120s. fleet_timeout must exceed

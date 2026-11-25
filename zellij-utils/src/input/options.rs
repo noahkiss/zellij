@@ -946,6 +946,12 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub agent_message_quiet: Option<String>,
+    /// How long `zellij_wait_for` waits when its caller gives no `timeout_s`: whole seconds, or a
+    /// number with `s`, `m` or `h`, from 1 s to a day. Read by `zellij mcp` when it starts, which builds
+    /// the tool's description from it. Unset means 300 s
+    #[clap(skip)]
+    #[serde(default)]
+    pub mcp_wait_timeout: Option<String>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1210,6 +1216,9 @@ impl Options {
         let agent_message_quiet = other
             .agent_message_quiet
             .or_else(|| self.agent_message_quiet.clone());
+        let mcp_wait_timeout = other
+            .mcp_wait_timeout
+            .or_else(|| self.mcp_wait_timeout.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1312,6 +1321,7 @@ impl Options {
             remote_timeouts,
             agent_startup_grace,
             agent_message_quiet,
+            mcp_wait_timeout,
         }
     }
 
@@ -1514,6 +1524,9 @@ impl Options {
         let agent_message_quiet = other
             .agent_message_quiet
             .or_else(|| self.agent_message_quiet.clone());
+        let mcp_wait_timeout = other
+            .mcp_wait_timeout
+            .or_else(|| self.mcp_wait_timeout.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1616,6 +1629,7 @@ impl Options {
             remote_timeouts,
             agent_startup_grace,
             agent_message_quiet,
+            mcp_wait_timeout,
         }
     }
 

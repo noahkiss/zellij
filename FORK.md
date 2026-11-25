@@ -5165,6 +5165,22 @@ pane, which is the default its own schema has always advertised. That bound is t
 the client's: a client whose request deadline is shorter (often 60 seconds) gives up first, so
 `timeout_s` tells the caller to stay under that deadline and wait again.
 
+**`mcp_wait_timeout` moves that default**, for a client that cuts a request off before 300
+seconds, so an agent that omits `timeout_s` is not cut off by its own client:
+
+```kdl
+mcp_wait_timeout "50s"
+```
+
+Whole seconds or a number with `s`, `m` or `h`, from 1 s to a day. `zellij mcp` reads it once,
+when it starts, and builds `zellij_wait_for`'s description and its `timeout_s` default from the
+same number it applies, so the two cannot drift apart. A client that cached the tool list sees a
+new value after it reconnects. Zero is refused, because to `wait --timeout` it means no bound; it,
+a fraction of a second and a value that is no span warn in `setup --check` and keep 300 s. A value
+past a day is cut to a day, with a warning. A config that does not parse leaves 300 s and the
+server starts all the same. An older build warns about an unknown top-level key and keeps 300 s.
+Capability: `mcp-wait-timeout`.
+
 **Every tool declares the shape of what it returns**, and it is the same shape for all six: the
 CLI's exit code, what it printed - parsed when that was JSON - what it wrote to stderr, and on a
 failure whether it was a miss or an error. The per-operation part stays in the `Returns:` line,
