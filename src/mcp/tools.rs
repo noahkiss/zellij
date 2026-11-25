@@ -26,6 +26,8 @@ pub enum ParamKind {
     Int,
     /// A closed set, written out here because the tool's own values need not be the CLI's.
     Enum(&'static [&'static str]),
+    /// One string, or a list of them taken in order.
+    StrOrList,
 }
 
 /// One parameter of one tool.
@@ -334,7 +336,8 @@ pub const TOOLS: &[ToolSpec] = &[
         // flag: a tool that multiplexes says what each of its commands returns
         reports: &["action send-keys", "action write-chars"],
         tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
-               text is written literally and presses nothing. Pass one of keys or text. This \
+               a list of keys presses them in order in one call. text is written literally and \
+               presses nothing. Pass one of keys or text. This \
                is the cheap way to do more work in a pane you already made: reach for it before \
                zellij_create. To message a coding agent, use zellij_send: it waits until the \
                agent is idle and nobody is typing there. Successful input to an agent adds that \
@@ -355,12 +358,14 @@ pub const TOOLS: &[ToolSpec] = &[
             },
             ParamSpec {
                 name: "keys",
-                kind: ParamKind::Str,
+                kind: ParamKind::StrOrList,
                 required: false,
                 from: Some(("action send-keys", "keys")),
                 describe: "One key to press, after any modifiers, space separated: `Enter`, \
                            `Ctrl c`, `Alt Shift x`, `F1`. Modifiers are Ctrl, Alt, Shift and Super; \
-                           `C-c` and `Ctrl-c` are not keys. One key per call.",
+                           `C-c` and `Ctrl-c` are not keys. A list presses its keys in order, one \
+                           entry per key: a list of `Down` then `Enter` moves down and submits. \
+                           One string is one key, so put two keys in a list, not one string.",
                 default: None,
             },
             ParamSpec {
@@ -1010,6 +1015,15 @@ fn property(param: &ParamSpec, wait_timeout: &str) -> Value {
             property.insert("type".to_owned(), json!("string"));
             property.insert("enum".to_owned(), json!(values));
         },
+        ParamKind::StrOrList => {
+            property.insert(
+                "oneOf".to_owned(),
+                json!([
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                ]),
+            );
+        },
     }
     property.insert("description".to_owned(), json!(param_description(param)));
     if let Some(default) = param.default {
@@ -1201,6 +1215,20 @@ mod tests {
         // an old client's cached schema still sends it, and it is not reported as ignored
         let given = json!({"operation": "close_pane", "pane": "sunny-otter"});
         assert!(ignored_parameters("zellij_close", given.as_object().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn keys_takes_one_key_or_a_list_of_them() {
+        let tool = tool_spec("zellij_write_input").unwrap();
+        let schema = input_schema(tool);
+        assert_eq!(
+            schema["properties"]["keys"]["oneOf"],
+            json!([
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            ])
+        );
+        assert!(schema["properties"]["keys"].get("type").is_none());
     }
 
     #[test]

@@ -5262,8 +5262,8 @@ new build. Two unit tests cover the suffix and the fallback.
 
 **The key and handle docs say what the CLI accepts (nkmk.26, 2026-10-02).** `zellij_write_input` taught
 `C-c` and `Escape`, and the key parser refuses both: it takes `Ctrl c` and `Esc`. It also said
-`keys` took several keys, but the whole string is one `send-keys` argument, so it is one key per
-call. A test now parses every backticked key in the tool's text.
+`keys` took several keys, but the whole string is one `send-keys` argument, so one string is one
+key; a list takes several (nkmk.47). A test now parses every backticked key in the tool's text.
 
 **Every `reason` an answer carries is in the output schema (nkmk.47).** A `zellij_create` that
 waited and whose shell was not ready answered `reason: not_ready`, which the schema's enum lacked.
@@ -5309,6 +5309,12 @@ command. An MCP call cannot run in the background, and `agent-change` is not the
 instructions now say to wait rather than poll, under the session paragraph, with `until=agent_change`
 and the note that a wait holds the call open, so `timeout_s` stays under the client's deadline. The
 `zellij_wait_for` tips lost the same line.
+
+**`zellij_write_input` `keys` takes a list (nkmk.47).** `keys` is one string or a list of strings,
+pressed in order in one call: `["Down", "Enter"]`. Down followed by Enter was the commonest pair of
+adjacent calls in agent transcripts, and one agent already sent a list. Each entry is one
+`send-keys` argument, so each is one key with its modifiers. A string still works. An empty list,
+or an entry that is not a non-empty string, is refused. The schema says `oneOf` string or array.
 
 ### `session up` comes back with the shape the session had
 

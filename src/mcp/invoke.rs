@@ -162,6 +162,31 @@ impl<'a> Args<'a> {
             .and_then(|value| value.as_bool())
             .unwrap_or(default)
     }
+    /// `keys`: one key as a string, or a list of keys pressed in order. `None` when it was not
+    /// given.
+    fn keys(&self) -> Result<Option<Vec<String>>, String> {
+        match self.values.get("keys") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Array(list)) => {
+                let keys: Option<Vec<String>> = list
+                    .iter()
+                    .map(|key| {
+                        key.as_str()
+                            .filter(|key| !key.is_empty())
+                            .map(str::to_owned)
+                    })
+                    .collect();
+                match keys {
+                    Some(keys) if !keys.is_empty() => Ok(Some(keys)),
+                    Some(_) => Err("`keys` is an empty list: name at least one key.".to_owned()),
+                    None => Err("`keys` is a list of key names, each a non-empty string, \
+                         like Down then Enter."
+                        .to_owned()),
+                }
+            },
+            Some(_) => Ok(self.string("keys").map(|key| vec![key])),
+        }
+    }
     fn enumerated(&self, name: &str, default: &str) -> String {
         self.string(name).unwrap_or_else(|| default.to_owned())
     }
@@ -701,7 +726,7 @@ fn write_input_call(
             key.to_owned(),
         ])
     };
-    if args.string("keys").is_some() {
+    if args.keys()?.is_some() {
         return Err("`submit` sends text: pass text, not keys.".to_owned());
     }
     let text = args
@@ -944,20 +969,24 @@ fn argv_in(
         },
         "zellij_write_input" => {
             let pane = args.required("pane")?;
-            match (args.string("keys"), args.string("text")) {
+            match (args.keys()?, args.string("text")) {
                 (Some(_), Some(_)) => Err(
                     "Pass `keys` or `text`, not both: one presses keys and the other writes \
                      characters."
                         .to_owned(),
                 ),
-                (Some(keys), None) => Ok(scoped(vec![
-                    "action".to_owned(),
-                    "send-keys".to_owned(),
-                    "--pane-id".to_owned(),
-                    pane,
-                    "--".to_owned(),
-                    keys,
-                ])),
+                // `send-keys` takes one key per argument and presses them in order
+                (Some(keys), None) => {
+                    let mut rest = vec![
+                        "action".to_owned(),
+                        "send-keys".to_owned(),
+                        "--pane-id".to_owned(),
+                        pane,
+                        "--".to_owned(),
+                    ];
+                    rest.extend(keys);
+                    Ok(scoped(rest))
+                },
                 (None, Some(text)) => Ok(scoped(vec![
                     "action".to_owned(),
                     "write-chars".to_owned(),
@@ -2218,6 +2247,44 @@ mod tests {
             ),
             "action close-tab-by-id 2"
         );
+    }
+
+    #[test]
+    fn keys_presses_one_key_or_a_list_in_order() {
+        assert_eq!(
+            line(
+                "zellij_write_input",
+                json!({"pane": "3", "keys": "Ctrl c"}),
+                None
+            ),
+            "action send-keys --pane-id 3 -- Ctrl c"
+        );
+        let built = built(
+            "zellij_write_input",
+            json!({"pane": "3", "keys": ["Down", "Enter"]}),
+            None,
+            &a_shell_env(),
+        );
+        assert_eq!(&built[built.len() - 3..], ["--", "Down", "Enter"]);
+        assert!(
+            refusal("zellij_write_input", json!({"pane": "3", "keys": []})).contains("empty list")
+        );
+        assert!(refusal(
+            "zellij_write_input",
+            json!({"pane": "3", "keys": ["Down", 3]})
+        )
+        .contains("non-empty string"));
+        // a list is still keys, and submit still refuses keys
+        let submitted = args(json!({"pane": "3", "keys": ["Enter"], "submit": true, "text": "x"}));
+        assert!(matches!(
+            write_input_call(&Args::new(&submitted), None),
+            Err(said) if said.contains("pass text, not keys")
+        ));
+        assert!(refusal(
+            "zellij_write_input",
+            json!({"pane": "3", "keys": ["Enter"], "text": "x"})
+        )
+        .contains("not both"));
     }
 
     #[test]
