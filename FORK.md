@@ -9455,7 +9455,7 @@ reads stdin).
   |---|---|---|
   | the agent's `OSC 7501` state is `idle`, `done` or `error` | - | its turn is over; `error` reads as idle, as `wait --for agent-idle` reads it |
   | no unsent text in its prompt | - | the original failure |
-  | no key reached the pane lately | 5 s | outlasts the pauses of a person typing; a draft holds a message however old it is, so this only covers the moment around a key |
+  | no key reached the pane lately | 5 s (`agent_message_quiet`) | outlasts the pauses of a person typing; a draft holds a message however old it is, so this only covers the moment around a key |
 
   `working` holds (`reason: working`), `blocked` holds (`blocked`: a permission or question
   prompt is open and an Enter would answer it). An agent of any harness that has not reported
@@ -9473,6 +9473,23 @@ reads stdin).
   held as `starting` until it reports again. A state the pane already shows when the session
   first sees the agent counts as one of its reports, so an agent that reported before the first
   process tick is never refused as silent either.
+- **The two windows are config keys**, read by the session server at start and at every reload:
+
+  ```kdl
+  agent_startup_grace "90s"   // how long a new agent has to report a state; 5s to 10m, 60s unset
+  agent_message_quiet "10s"   // how long the pane must have had no key; 0 to 60s, 5s unset
+  ```
+
+  A cold machine whose claude loads many MCP servers can take more than a minute to report, and
+  its messages are refused as `no_state` when they should be held; a fleet with hooks everywhere
+  can learn of a missing hook sooner. A person who pauses longer before typing can widen the quiet
+  window. `agent_message_quiet "0"` drops the typing check; a draft in the prompt still holds a
+  message. Each value is a span (`"90s"`, `"2m"`, `"750ms"`). A value under the bounds (a grace
+  under 5 s, which would refuse an agent still loading), or one that is no span, warns in `setup
+  --check` and keeps the default; one past the bounds is cut to the bound, with a warning. A
+  reload reaches the screen thread as `SetAgentMailTimings`; a message already held is judged by
+  the new windows at its next try. Neither crosses the contract (`None` in the protobuf
+  `Options`). An older build warns about an unknown top-level key and keeps 60 s and 5 s.
 - **Claude's own status.** A Claude Code turn that ends while background shells or subagents
   still run keeps its `OSC 7501` report `working` (msg `2 shells still running`) until the last
   of them ends, though its prompt takes input. So for a `claude` agent the guard also reads the
@@ -9735,7 +9752,8 @@ string from_person = 8` the same way; a server from before it ignores the field 
 from the person". No plugin-API change.
 Capabilities: `agent-send-message`; `agent-message-show-cancel` for the stub, `message-show`,
 `message-cancel` and `zellij_send cancel`; `agent-message-expire` for `agent_message_expire`,
-notices to other sessions and machines, `send-message --host` and the age.
+notices to other sessions and machines, `send-message --host` and the age;
+`agent-message-timings` for `agent_startup_grace` and `agent_message_quiet`.
 
 Limits:
 

@@ -21,6 +21,23 @@ pub const RECORD_KEYS: &str = "id status reason pane_id handle session agent fro
 /// only covers the moment around a keystroke - a person about to type, or who just cleared a line.
 pub const QUIET_MS: u64 = 5_000;
 
+/// What the config's `agent_message_quiet` takes: zero, which drops the typing check and leaves
+/// the draft check alone, or a span up to a minute.
+pub const QUIET_BOUNDS: crate::config_span::SpanBounds = crate::config_span::SpanBounds {
+    min: std::time::Duration::from_millis(1),
+    max: std::time::Duration::from_secs(60),
+    zero: true,
+    whole_seconds: false,
+};
+
+/// The guard's quiet window from the config's `agent_message_quiet`, in milliseconds;
+/// [`QUIET_MS`] when it is unset or not a span.
+pub fn configured_quiet_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| crate::config_span::parse_span(value, QUIET_BOUNDS).ok())
+        .map_or(QUIET_MS, |span| span.duration.as_millis() as u64)
+}
+
 /// How long a held message waits before it expires, when neither `--expire-s` nor the config's
 /// `agent_message_expire` says: 30 minutes. A session's own expiry notice waits this long too.
 pub const DEFAULT_EXPIRE_S: u64 = 30 * 60;
@@ -603,6 +620,9 @@ pub struct GuardFacts<'a> {
     /// Milliseconds since a key last reached the pane, when one ever did.
     pub since_input_ms: Option<u64>,
     pub quiet_ms: u64,
+    /// How long a new agent has to report a state before it is refused as `no_state`:
+    /// [`STARTUP_MS`], or the config's `agent_startup_grace`.
+    pub startup_ms: u64,
     /// What the harness's own record says of its main loop, when it keeps one and the session
     /// could read it: `Some(true)` free for input, `Some(false)` mid-turn. Claude Code's
     /// per-process record, read through [`claude_status_free`]. It speaks over a `working` state,
@@ -650,7 +670,9 @@ pub fn guard(facts: &GuardFacts) -> Decision {
     }
     match facts.state {
         None if facts.reported_before
-            || facts.agent_age_ms.map_or(true, |age| age < STARTUP_MS) =>
+            || facts
+                .agent_age_ms
+                .map_or(true, |age| age < facts.startup_ms) =>
         {
             return Decision::Hold(Reason::Starting)
         },
@@ -685,6 +707,24 @@ pub fn guard(facts: &GuardFacts) -> Decision {
 /// half a minute on a cold machine. A minute covers that with room to spare, and still tells a
 /// sender within a minute that the agent will never say it is idle.
 pub const STARTUP_MS: u64 = 60_000;
+
+/// What the config's `agent_startup_grace` takes: 5 seconds to 10 minutes. Less would refuse a
+/// healthy agent that is still loading; more would keep a sender waiting that long to hear an
+/// agent has no hooks.
+pub const STARTUP_GRACE_BOUNDS: crate::config_span::SpanBounds = crate::config_span::SpanBounds {
+    min: std::time::Duration::from_secs(5),
+    max: std::time::Duration::from_secs(600),
+    zero: false,
+    whole_seconds: false,
+};
+
+/// The guard's startup window from the config's `agent_startup_grace`, in milliseconds;
+/// [`STARTUP_MS`] when it is unset or not a span.
+pub fn configured_startup_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| crate::config_span::parse_span(value, STARTUP_GRACE_BOUNDS).ok())
+        .map_or(STARTUP_MS, |span| span.duration.as_millis() as u64)
+}
 
 /// A sender's address, `host/session/handle`, taken apart. The host may be empty for a sender on
 /// the receiver's own machine.
@@ -866,6 +906,7 @@ mod tests {
             draft_pending: false,
             since_input_ms: None,
             quiet_ms: QUIET_MS,
+            startup_ms: STARTUP_MS,
             harness_free: None,
         }
     }
@@ -905,6 +946,42 @@ mod tests {
         for (kind, state, expected) in cases {
             assert_eq!(guard(&facts(kind, state)), expected, "{kind:?} {state:?}");
         }
+    }
+
+    #[test]
+    fn a_configured_startup_grace_moves_the_window_and_a_configured_quiet_the_typing_check() {
+        let grace = configured_startup_ms(Some("15s"));
+        assert_eq!(grace, 15_000);
+        let mut silent = facts(Some("claude"), None);
+        silent.startup_ms = grace;
+        silent.agent_age_ms = Some(grace - 1);
+        assert_eq!(guard(&silent), Decision::Hold(Reason::Starting));
+        silent.agent_age_ms = Some(grace);
+        assert_eq!(guard(&silent), Decision::Refuse(Reason::NoState));
+        // with the default, the same age is still starting
+        silent.startup_ms = configured_startup_ms(None);
+        assert_eq!(guard(&silent), Decision::Hold(Reason::Starting));
+        // a value under 5 s is refused, so the default stands; one past 10 min is cut to it
+        assert_eq!(configured_startup_ms(Some("1s")), STARTUP_MS);
+        assert_eq!(configured_startup_ms(Some("soon")), STARTUP_MS);
+        assert_eq!(configured_startup_ms(Some("2h")), 600_000);
+
+        // quiet 0 drops the typing check: a key a moment ago no longer holds the message
+        let mut typing = facts(Some("claude"), Some("idle"));
+        typing.since_input_ms = Some(10);
+        typing.quiet_ms = configured_quiet_ms(Some("0"));
+        assert_eq!(typing.quiet_ms, 0);
+        assert_eq!(guard(&typing), Decision::Deliver);
+        // but a draft in the prompt still holds it
+        typing.draft_pending = true;
+        assert_eq!(guard(&typing), Decision::Hold(Reason::Draft));
+        typing.draft_pending = false;
+        typing.quiet_ms = configured_quiet_ms(Some("20s"));
+        typing.since_input_ms = Some(19_999);
+        assert_eq!(guard(&typing), Decision::Hold(Reason::Typing));
+        assert_eq!(configured_quiet_ms(None), QUIET_MS);
+        assert_eq!(configured_quiet_ms(Some("5m")), 60_000);
+        assert_eq!(configured_quiet_ms(Some("750ms")), 750);
     }
 
     #[test]

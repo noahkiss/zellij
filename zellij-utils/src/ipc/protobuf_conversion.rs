@@ -1325,6 +1325,8 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             person_name: None,
             agent_message_expire: None,
             remote_timeouts: None,
+            agent_startup_grace: None,
+            agent_message_quiet: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

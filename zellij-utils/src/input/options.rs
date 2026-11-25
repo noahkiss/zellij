@@ -934,6 +934,18 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub remote_timeouts: Option<crate::remote_timeouts::RemoteTimeouts>,
+    /// How long a new coding agent has to report its first state before a message to it is refused as
+    /// `no_state` rather than held as `starting`: a span from 5 s to 10 min. Read by the session server,
+    /// at start and on reload. Unset means 60 s (`agent_mail::STARTUP_MS`)
+    #[clap(skip)]
+    #[serde(default)]
+    pub agent_startup_grace: Option<String>,
+    /// How long an agent's pane must have had no key before a message goes in: a span up to 60 s, or 0
+    /// to drop the typing check (a draft in the prompt still holds a message). Read by the session
+    /// server, at start and on reload. Unset means 5 s (`agent_mail::QUIET_MS`)
+    #[clap(skip)]
+    #[serde(default)]
+    pub agent_message_quiet: Option<String>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1192,6 +1204,12 @@ impl Options {
             .agent_message_expire
             .or_else(|| self.agent_message_expire.clone());
         let remote_timeouts = other.remote_timeouts.or(self.remote_timeouts);
+        let agent_startup_grace = other
+            .agent_startup_grace
+            .or_else(|| self.agent_startup_grace.clone());
+        let agent_message_quiet = other
+            .agent_message_quiet
+            .or_else(|| self.agent_message_quiet.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1292,6 +1310,8 @@ impl Options {
             person_name,
             agent_message_expire,
             remote_timeouts,
+            agent_startup_grace,
+            agent_message_quiet,
         }
     }
 
@@ -1488,6 +1508,12 @@ impl Options {
             .agent_message_expire
             .or_else(|| self.agent_message_expire.clone());
         let remote_timeouts = other.remote_timeouts.or(self.remote_timeouts);
+        let agent_startup_grace = other
+            .agent_startup_grace
+            .or_else(|| self.agent_startup_grace.clone());
+        let agent_message_quiet = other
+            .agent_message_quiet
+            .or_else(|| self.agent_message_quiet.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1588,6 +1614,8 @@ impl Options {
             person_name,
             agent_message_expire,
             remote_timeouts,
+            agent_startup_grace,
+            agent_message_quiet,
         }
     }
 

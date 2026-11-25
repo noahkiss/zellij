@@ -1433,6 +1433,16 @@ impl SessionMetaData {
                 ));
             let _ = self
                 .senders
+                .send_to_screen(ScreenInstruction::SetAgentMailTimings {
+                    quiet_ms: zellij_utils::agent_mail::configured_quiet_ms(
+                        new_config.options.agent_message_quiet.as_deref(),
+                    ),
+                    startup_ms: zellij_utils::agent_mail::configured_startup_ms(
+                        new_config.options.agent_startup_grace.as_deref(),
+                    ),
+                });
+            let _ = self
+                .senders
                 .send_to_screen(ScreenInstruction::SetModeHintsWhenBarsHidden(
                     new_config
                         .options

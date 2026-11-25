@@ -6747,6 +6747,8 @@ Config {
         person_name: None,
         agent_message_expire: None,
         remote_timeouts: None,
+        agent_startup_grace: None,
+        agent_message_quiet: None,
     },
     themes: {},
     plugins: PluginAliases {

@@ -3522,6 +3522,8 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     // options
     "advanced_mouse_actions",
     "agent_message_expire",
+    "agent_message_quiet",
+    "agent_startup_grace",
     "attach_to_session",
     "auto_layout",
     "bars_hidden_on_start",
@@ -3639,6 +3641,38 @@ fn note_unknown_value(option: &str, value: &str, entry: &KdlEntry, expected: &st
             value, option, expected
         ),
     );
+}
+
+/// fork addition: a span option held to `bounds` - the value as written, or the bound a longer
+/// one is cut down to - or, for a value that is no span or is under the bounds, `None`, with a
+/// note. A value of the wrong TYPE is still an error, raised before this is reached.
+fn span_or_note(
+    option: &str,
+    found: Option<(&str, &KdlEntry)>,
+    bounds: crate::config_span::SpanBounds,
+    expected: &str,
+) -> Option<String> {
+    let (value, entry) = found?;
+    match crate::config_span::parse_span(value, bounds) {
+        Ok(span) => {
+            if span.capped {
+                note_unknown(
+                    entry.span().offset(),
+                    format!(
+                        "{} {:?} is longer than {}, which is used instead",
+                        option,
+                        value,
+                        crate::config_span::format_span(span.duration)
+                    ),
+                );
+            }
+            Some(crate::config_span::canonical(value, span))
+        },
+        Err(_) => {
+            note_unknown_value(option, value, entry, expected);
+            None
+        },
+    }
 }
 
 /// The value of a string option parsed by `parse`, or - for a value it does not know - `None`,
@@ -3990,6 +4024,18 @@ impl Options {
             }
             timeouts
         });
+        let agent_startup_grace = span_or_note(
+            "agent_startup_grace",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "agent_startup_grace"),
+            crate::agent_mail::STARTUP_GRACE_BOUNDS,
+            "a span from 5s to 10m, such as \"90s\"",
+        );
+        let agent_message_quiet = span_or_note(
+            "agent_message_quiet",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "agent_message_quiet"),
+            crate::agent_mail::QUIET_BOUNDS,
+            "0, or a span up to 60s, such as \"10s\"",
+        );
         let host_notification_protocol = known_value_or_note(
             "host_notification_protocol",
             kdl_property_first_arg_as_string_or_error!(kdl_options, "host_notification_protocol"),
@@ -4137,6 +4183,8 @@ impl Options {
             person_name,
             agent_message_expire,
             remote_timeouts,
+            agent_startup_grace,
+            agent_message_quiet,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -6748,6 +6796,21 @@ impl Options {
         }
         Some(node)
     }
+    /// A span option, written only when set; the commented sample is in the default config.
+    fn span_option_to_kdl(
+        name: &str,
+        value: Option<&String>,
+        add_comments: bool,
+        comment: &str,
+    ) -> Option<KdlNode> {
+        let value = value?;
+        let mut node = KdlNode::new(name);
+        node.push(value.to_owned());
+        if add_comments {
+            node.set_leading(format!(" \n{}\n", comment));
+        }
+        Some(node)
+    }
     fn host_notification_protocol_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         use crate::input::options::HostNotificationProtocol;
         let comment_text = format!(
@@ -7269,6 +7332,24 @@ impl Options {
         }
         if let Some(expire) = self.agent_message_expire_to_kdl(add_comments) {
             nodes.push(expire);
+        }
+        if let Some(grace) = Self::span_option_to_kdl(
+            "agent_startup_grace",
+            self.agent_startup_grace.as_ref(),
+            add_comments,
+            "// How long a new coding agent has to report a state before a message to it is refused:\n\
+             // 5s to 10m. Unset, 60 seconds",
+        ) {
+            nodes.push(grace);
+        }
+        if let Some(quiet) = Self::span_option_to_kdl(
+            "agent_message_quiet",
+            self.agent_message_quiet.as_ref(),
+            add_comments,
+            "// How long an agent's pane must have had no key before a message goes in: 0 to 60s.\n\
+             // Unset, 5 seconds",
+        ) {
+            nodes.push(quiet);
         }
         if let Some(host_notification_protocol) =
             self.host_notification_protocol_to_kdl(add_comments)
@@ -12642,6 +12723,57 @@ fn remote_hosts_timeouts_are_read_for_the_server_and_warn_on_a_bad_value() {
         "{}",
         bad.warnings[0]
     );
+}
+
+#[test]
+fn agent_startup_grace_and_agent_message_quiet_parse_cap_warn_and_round_trip() {
+    let read = |kdl: &str| Config::from_kdl(kdl, None).unwrap();
+    let unset = read("");
+    assert_eq!(unset.options.agent_startup_grace, None);
+    assert_eq!(unset.options.agent_message_quiet, None);
+    for (kdl, grace, quiet) in [
+        ("agent_startup_grace \"90s\"", Some("90s"), None),
+        ("agent_message_quiet \"0\"", None, Some("0")),
+        (
+            "agent_startup_grace \"2m\"\nagent_message_quiet \"750ms\"",
+            Some("2m"),
+            Some("750ms"),
+        ),
+    ] {
+        let config = read(kdl);
+        assert_eq!(
+            config.options.agent_startup_grace.as_deref(),
+            grace,
+            "{}",
+            kdl
+        );
+        assert_eq!(
+            config.options.agent_message_quiet.as_deref(),
+            quiet,
+            "{}",
+            kdl
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let again = read(&config.to_string(false));
+        assert_eq!(again.options, config.options);
+    }
+    // under the bounds, or no span: the default, with a warning that names the option
+    for kdl in [
+        "agent_startup_grace \"2s\"",
+        "agent_startup_grace \"0\"",
+        "agent_message_quiet \"soon\"",
+    ] {
+        let config = read(kdl);
+        assert_eq!(config.options.agent_startup_grace, None, "{}", kdl);
+        assert_eq!(config.options.agent_message_quiet, None, "{}", kdl);
+        assert_eq!(config.warnings.len(), 1, "{} {:?}", kdl, config.warnings);
+    }
+    // past the bound: cut to it, said, and written back as the bound
+    let capped = read("agent_startup_grace \"1h\"\nagent_message_quiet \"2m\"");
+    assert_eq!(capped.options.agent_startup_grace.as_deref(), Some("600s"));
+    assert_eq!(capped.options.agent_message_quiet.as_deref(), Some("60s"));
+    assert_eq!(capped.warnings.len(), 2, "{:?}", capped.warnings);
+    assert!(Config::from_kdl("agent_startup_grace 60", None).is_err());
 }
 
 #[test]

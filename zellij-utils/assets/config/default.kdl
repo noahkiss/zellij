@@ -732,6 +732,20 @@ context_menu {
 //
 // agent_message_expire "4h"
 
+// How long a new coding agent has to report its first state before a message to it is refused as
+// no_state, rather than held as starting. Read by the session; a reload applies it
+// A span from 5s to 10m, such as "90s" or "2m"
+// Default: 60 seconds
+//
+// agent_startup_grace "90s"
+
+// How long a coding agent's pane must have had no key before a message goes in. "0" drops this
+// check; unsent text in the agent's prompt still holds a message. Read by the session; a reload
+// applies it. A span up to 60s, such as "10s" or "750ms"
+// Default: 5 seconds
+//
+// agent_message_quiet "10s"
+
 // How long a call to another machine waits (zellij mcp, send-message --host), inside the
 // remote_hosts block: ssh's connection timeout, and how long zellij_overview scope=fleet waits for
 // one host. Whole seconds, or a number with s, m or h, from 1s to 120s. fleet_timeout must exceed

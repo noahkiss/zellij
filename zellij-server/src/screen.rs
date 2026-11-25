@@ -1121,6 +1121,12 @@ pub enum ScreenInstruction {
     ShowBars(ClientId, Option<NotificationEnd>),
     HideBarByPaneId(PaneId, ClientId, Option<NotificationEnd>),
     SetHiddenBarsNotification(bool),
+    /// fork addition: the agent-message guard's windows from the config, at a reload:
+    /// `agent_message_quiet` and `agent_startup_grace`, in milliseconds.
+    SetAgentMailTimings {
+        quiet_ms: u64,
+        startup_ms: u64,
+    },
     SetModeHintsWhenBarsHidden(bool),
     SetGraphemeClusters(bool),
     GetSessionPreview {
@@ -1760,6 +1766,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::SetHiddenBarsNotification(..) => {
                 ScreenContext::SetHiddenBarsNotification
             },
+            ScreenInstruction::SetAgentMailTimings { .. } => ScreenContext::SetAgentMailTimings,
             ScreenInstruction::SetModeHintsWhenBarsHidden(..) => {
                 ScreenContext::SetModeHintsWhenBarsHidden
             },
@@ -2480,8 +2487,12 @@ pub(crate) struct Screen {
     agent_mail: crate::agent_mail::Mailbox,
     /// fork addition: whether the thread that drives `DrainAgentMessages` runs.
     agent_mail_ticking: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// fork addition: the guard's quiet window; `agent_mail::QUIET_MS` outside tests.
+    /// fork addition: the guard's quiet window: the config's `agent_message_quiet`, or
+    /// `agent_mail::QUIET_MS`.
     agent_mail_quiet_ms: u64,
+    /// fork addition: how long a new agent has to report a state: the config's
+    /// `agent_startup_grace`, or `agent_mail::STARTUP_MS`.
+    agent_mail_startup_ms: u64,
     /// fork addition: messages posted to an OpenCode agent's own server whose answer has not come
     /// back, by id. None of them is typed in while it is here; see `crate::opencode_api`.
     opencode_in_flight: HashMap<String, OpenCodeAttempt>,
@@ -2935,6 +2946,7 @@ impl Screen {
             agent_mail: Default::default(),
             agent_mail_ticking: Default::default(),
             agent_mail_quiet_ms: zellij_utils::agent_mail::QUIET_MS,
+            agent_mail_startup_ms: zellij_utils::agent_mail::STARTUP_MS,
             opencode_in_flight: HashMap::new(),
             opencode_typed: HashSet::new(),
             pending_reopen_handles: HashMap::new(),
@@ -8902,6 +8914,7 @@ impl Screen {
                 .and_then(|prompt| prompt.since_input)
                 .map(|since| since.as_millis() as u64),
             quiet_ms: self.agent_mail_quiet_ms,
+            startup_ms: self.agent_mail_startup_ms,
             harness_free,
         };
         let decision = agent_mail::guard(&facts);
@@ -13130,6 +13143,12 @@ pub(crate) fn screen_thread_main(
         .clone()
         .unwrap_or_default();
     screen.hidden_bars_notification = config_options.hidden_bars_notification.unwrap_or(true);
+    screen.agent_mail_quiet_ms = zellij_utils::agent_mail::configured_quiet_ms(
+        config_options.agent_message_quiet.as_deref(),
+    );
+    screen.agent_mail_startup_ms = zellij_utils::agent_mail::configured_startup_ms(
+        config_options.agent_startup_grace.as_deref(),
+    );
     screen.mode_hints_when_bars_hidden = config_options.mode_hints_when_bars_hidden.unwrap_or(true);
     screen.set_host_notification_protocol(host_notification_protocol);
     screen
@@ -18228,6 +18247,13 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::SetHiddenBarsNotification(enabled) => {
                 screen.hidden_bars_notification = enabled;
+            },
+            ScreenInstruction::SetAgentMailTimings {
+                quiet_ms,
+                startup_ms,
+            } => {
+                screen.agent_mail_quiet_ms = quiet_ms;
+                screen.agent_mail_startup_ms = startup_ms;
             },
             ScreenInstruction::SetModeHintsWhenBarsHidden(enabled) => {
                 screen.mode_hints_when_bars_hidden = enabled;

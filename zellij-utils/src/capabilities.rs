@@ -108,6 +108,8 @@ pub const CAPABILITIES: &[&str] = &[
     "upgrade-restart-clientless-for",
     // remote_hosts { connect_timeout fleet_timeout }, and the bounds derived from them
     "remote-hosts-timeouts",
+    // agent_startup_grace and agent_message_quiet: the agent-message guard's two windows
+    "agent-message-timings",
 ];
 
 /// The version, split into the parts that can actually be compared.
