@@ -1373,7 +1373,10 @@ impl SessionMetaData {
                     mouse_hover_effects: new_config.options.mouse_hover_effects.unwrap_or(true),
                     mouse_hover_tips: new_config.options.mouse_hover_tips.unwrap_or(true),
                     visual_bell: new_config.options.visual_bell.unwrap_or(true),
-                    bell_clear_delay_ms: new_config.options.bell_clear_delay_ms.unwrap_or(0),
+                    bell_clear_delay_ms: new_config
+                        .options
+                        .bell_clear_delay_ms
+                        .unwrap_or(crate::bell_dwell::DEFAULT_BELL_CLEAR_DELAY_MS),
                     focus_follows_mouse: new_config.options.focus_follows_mouse.unwrap_or(false),
                     mouse_click_through: new_config.options.mouse_click_through.unwrap_or(false),
                     context_menu_enabled: new_config.options.context_menu_enabled.unwrap_or(true),

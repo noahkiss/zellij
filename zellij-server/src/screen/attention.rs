@@ -244,6 +244,17 @@ impl Screen {
                     delay_ms,
                 ));
         }
+        // a look started under `bell_clear_delay_ms`: re-sync once it has lasted the dwell. The
+        // bell's dwell job carries it, and its handler re-syncs attention visibility.
+        for (pane_id, delay_ms) in self.attention.take_dwell_checks() {
+            let _ =
+                self.bus
+                    .senders
+                    .send_to_background_jobs(BackgroundJob::ClearPaneBellAfterDwell(
+                        pane_id.into(),
+                        delay_ms,
+                    ));
+        }
         let changed: Vec<zellij_utils::data::PaneId> =
             self.attention.take_changed().into_iter().collect();
         let events = self.attention.take_events();

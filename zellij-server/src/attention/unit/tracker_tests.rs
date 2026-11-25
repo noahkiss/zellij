@@ -1083,3 +1083,140 @@ fn a_shell_in_the_foreground_does_not_forget_a_reporting_pane() {
     assert_eq!(status(&tracker), AttentionStatus::NeedsYou);
     assert_eq!(remembered(&tracker), Some(AttentionStatus::NeedsYou));
 }
+
+const DWELL_MS: u64 = 1_000;
+
+fn dwell_tracker() -> AttentionTracker {
+    let mut tracker = tracker();
+    tracker.set_look_dwell_ms(DWELL_MS);
+    tracker
+}
+
+fn done_at(tracker: &mut AttentionTracker, now: u64) {
+    tracker.on_signals(PANE, vec![report("state=done")], now);
+    assert_eq!(status(tracker), AttentionStatus::Done);
+    assert!(frame(tracker).is_some());
+}
+
+#[test]
+fn a_zero_dwell_clears_on_the_first_look_and_schedules_nothing() {
+    let mut tracker = tracker();
+    tracker.set_look_dwell_ms(0);
+    done_at(&mut tracker, 2_000);
+    visible(&mut tracker, 2_001);
+    assert_eq!(status(&tracker), AttentionStatus::Idle);
+    assert!(frame(&tracker).is_some());
+    focused(&mut tracker, 2_002);
+    assert!(frame(&tracker).is_none());
+    assert!(tracker.take_dwell_checks().is_empty());
+}
+
+#[test]
+fn a_look_shorter_than_the_dwell_keeps_done() {
+    let mut tracker = dwell_tracker();
+    done_at(&mut tracker, 2_000);
+    focused(&mut tracker, 3_000);
+    focused(&mut tracker, 3_999);
+    assert_eq!(status(&tracker), AttentionStatus::Done);
+    assert!(frame(&tracker).is_some());
+    hidden(&mut tracker, 4_100);
+    assert_eq!(status(&tracker), AttentionStatus::Done);
+    assert!(frame(&tracker).is_some());
+}
+
+#[test]
+fn a_look_that_lasts_the_dwell_clears_done() {
+    let mut tracker = dwell_tracker();
+    done_at(&mut tracker, 2_000);
+    visible(&mut tracker, 3_000);
+    visible(&mut tracker, 4_000);
+    assert_eq!(status(&tracker), AttentionStatus::Idle);
+    assert!(
+        frame(&tracker).is_some(),
+        "on screen is seen, not acknowledged"
+    );
+    focused(&mut tracker, 4_500);
+    assert!(frame(&tracker).is_some());
+    focused(&mut tracker, 5_500);
+    assert!(frame(&tracker).is_none());
+}
+
+#[test]
+fn an_interrupted_look_restarts_the_dwell() {
+    let mut tracker = dwell_tracker();
+    done_at(&mut tracker, 2_000);
+    focused(&mut tracker, 3_000);
+    hidden(&mut tracker, 3_500);
+    focused(&mut tracker, 3_600);
+    focused(&mut tracker, 4_500);
+    assert_eq!(status(&tracker), AttentionStatus::Done);
+    focused(&mut tracker, 4_600);
+    assert_eq!(status(&tracker), AttentionStatus::Idle);
+    assert!(frame(&tracker).is_none());
+}
+
+#[test]
+fn a_look_asks_for_one_dwell_check_when_it_starts() {
+    let mut tracker = dwell_tracker();
+    visible(&mut tracker, 3_000);
+    assert_eq!(
+        tracker.take_dwell_checks(),
+        vec![(PANE, DWELL_MS + COMMAND_CHECK_SLACK_MS)]
+    );
+    visible(&mut tracker, 3_500);
+    assert!(tracker.take_dwell_checks().is_empty());
+    focused(&mut tracker, 3_600);
+    assert_eq!(tracker.take_dwell_checks().len(), 1);
+}
+
+#[test]
+fn mark_seen_clears_in_the_middle_of_a_dwell() {
+    let mut tracker = dwell_tracker();
+    done_at(&mut tracker, 2_000);
+    focused(&mut tracker, 3_000);
+    assert!(tracker.mark_seen(PANE, 3_100));
+    assert_eq!(status(&tracker), AttentionStatus::Idle);
+    assert!(frame(&tracker).is_none());
+
+    let mut tracker = dwell_tracker();
+    done_at(&mut tracker, 2_000);
+    tracker.mark_all_seen(2_100);
+    assert_eq!(status(&tracker), AttentionStatus::Idle);
+    assert!(frame(&tracker).is_none());
+}
+
+#[test]
+fn a_dwell_does_not_clear_working_or_blocked() {
+    let mut tracker = dwell_tracker();
+    tracker.on_signals(PANE, vec![report("state=working")], 2_000);
+    focused(&mut tracker, 3_000);
+    focused(&mut tracker, 5_000);
+    assert_eq!(status(&tracker), AttentionStatus::Working);
+    tracker.on_signals(PANE, vec![report("state=blocked:kind=question")], 5_100);
+    focused(&mut tracker, 7_000);
+    let attention = tracker.attention(&PANE).unwrap();
+    assert_eq!(attention.status, AttentionStatus::NeedsYou);
+    assert!(attention.seen);
+}
+
+#[test]
+fn unseen_output_before_a_look_stays_until_the_dwell() {
+    let mut tracker = dwell_tracker();
+    tracker.on_output(PANE, 5_000);
+    assert_eq!(status(&tracker), AttentionStatus::NewOutput);
+    visible(&mut tracker, 5_500);
+    assert_eq!(status(&tracker), AttentionStatus::NewOutput);
+    assert!(tracker.unseen_output_since(&PANE).is_some());
+    visible(&mut tracker, 6_500);
+    assert_eq!(status(&tracker), AttentionStatus::Idle);
+    assert!(tracker.unseen_output_since(&PANE).is_none());
+}
+
+#[test]
+fn output_on_a_pane_on_screen_is_not_unseen_during_the_dwell() {
+    let mut tracker = dwell_tracker();
+    visible(&mut tracker, 5_000);
+    tracker.on_output(PANE, 5_100);
+    assert!(tracker.unseen_output_since(&PANE).is_none());
+    assert_eq!(status(&tracker), AttentionStatus::Idle);
+}

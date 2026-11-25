@@ -118,6 +118,12 @@ struct PaneTrack {
     first_unseen_output_ms: Option<u64>,
     last_visible_ms: Option<u64>,
     last_focused_ms: Option<u64>,
+    /// Since when the pane has been on screen, and focused, without a break. With a look
+    /// dwell set, `visible` and `focused` only turn true once these are a dwell old.
+    on_screen_since_ms: Option<u64>,
+    focused_since_ms: Option<u64>,
+    /// On screen right now, whether or not the look has lasted the dwell yet.
+    on_screen: bool,
     visible: bool,
     viewed_elsewhere: bool,
     focused: bool,
@@ -276,6 +282,10 @@ pub struct AttentionTracker {
     idle_checks: Vec<(PaneId, u64)>,
     changed: BTreeSet<PaneId>,
     summary_stale: bool,
+    /// `bell_clear_delay_ms`: how long a pane must stay on screen (or focused) before a look
+    /// clears its markers. 0 is upstream: a look clears at once.
+    look_dwell_ms: u64,
+    dwell_checks: BTreeSet<PaneId>,
 }
 
 impl Default for AttentionTracker {
@@ -296,7 +306,21 @@ impl AttentionTracker {
             idle_checks: vec![],
             changed: BTreeSet::new(),
             summary_stale: false,
+            look_dwell_ms: 0,
+            dwell_checks: BTreeSet::new(),
         }
+    }
+    pub fn set_look_dwell_ms(&mut self, dwell_ms: u64) {
+        self.look_dwell_ms = dwell_ms;
+    }
+    /// Panes whose look started at this sync. Each wants a fresh `sync_panes` once the dwell
+    /// has passed, returned with the delay to wait.
+    pub fn take_dwell_checks(&mut self) -> Vec<(PaneId, u64)> {
+        let delay_ms = self.look_dwell_ms + COMMAND_CHECK_SLACK_MS;
+        std::mem::take(&mut self.dwell_checks)
+            .into_iter()
+            .map(|p| (p, delay_ms))
+            .collect()
     }
     pub fn config(&self) -> &AttentionConfig {
         &self.config
@@ -335,6 +359,7 @@ impl AttentionTracker {
         }
         self.pane_tabs.remove(&pane_id);
         self.changed.remove(&pane_id);
+        self.dwell_checks.remove(&pane_id);
     }
     pub fn take_summary_stale(&mut self) -> bool {
         std::mem::take(&mut self.summary_stale)
@@ -487,11 +512,36 @@ impl AttentionTracker {
             self.remove_pane(pane_id);
         }
         let mut to_resolve = vec![];
+        let dwell_ms = self.look_dwell_ms;
         for (pane_id, tab_id) in panes {
             let previous_tab = self.pane_tabs.insert(*pane_id, *tab_id);
             let track = self.track(*pane_id, now);
-            let is_visible = visible.contains(pane_id);
-            let is_focused = focused.contains(pane_id);
+            let on_screen = visible.contains(pane_id);
+            let has_focus = focused.contains(pane_id);
+            track.on_screen = on_screen;
+            let (is_visible, is_focused) = if dwell_ms == 0 {
+                track.on_screen_since_ms = None;
+                track.focused_since_ms = None;
+                (on_screen, has_focus)
+            } else {
+                let looks_started = (on_screen && track.on_screen_since_ms.is_none())
+                    || (has_focus && track.focused_since_ms.is_none());
+                track.on_screen_since_ms =
+                    on_screen.then(|| track.on_screen_since_ms.unwrap_or(now));
+                track.focused_since_ms = has_focus.then(|| track.focused_since_ms.unwrap_or(now));
+                if looks_started {
+                    self.dwell_checks.insert(*pane_id);
+                }
+                let track = self.panes.get_mut(pane_id).unwrap();
+                let dwelled = |since: Option<u64>| {
+                    since.map_or(false, |since| now.saturating_sub(since) >= dwell_ms)
+                };
+                (
+                    dwelled(track.on_screen_since_ms),
+                    dwelled(track.focused_since_ms),
+                )
+            };
+            let track = self.panes.get_mut(pane_id).unwrap();
             let changed = track.visible != is_visible
                 || track.focused != is_focused
                 || previous_tab != Some(*tab_id);
@@ -547,7 +597,9 @@ impl AttentionTracker {
         if redraw {
             return;
         }
+        // output that arrives while the pane is on screen is watched as it lands, dwell or not
         if !track.is_looked_at()
+            && !track.on_screen
             && now.saturating_sub(track.created_ms) >= STARTUP_OUTPUT_GRACE_MS
             && track.first_unseen_output_ms.is_none()
         {
@@ -663,7 +715,7 @@ impl AttentionTracker {
                 AttentionDetail::default(),
                 now,
             );
-        } else if !track.visible {
+        } else if !track.visible && !track.on_screen {
             track.quiet_ms = Some(now);
         }
         self.resolve(pane_id, now);

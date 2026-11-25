@@ -3599,8 +3599,28 @@ has been focused, without interruption, for that many milliseconds - counted fro
 focus and the last ring. Flicking past a pane keeps its notification; a pane that rings again while
 you sit on it restarts the dwell, so the ring is never lost.
 
-Default is 0, which is upstream's behaviour to the byte: the focus paths clear the bell
-synchronously as they always have, and no timer is involved.
+**The same key governs the attention markers.** Upstream's attention system (frame markers, tab
+markers, the session inbox) clears a pane's done, failed, new-output, bell and notification markers
+the instant the pane is looked at - so skipping past panes or tabs erased them exactly as it erased
+the bell. With the dwell set, a look only counts once it has lasted the dwell without a break.
+Upstream's two tiers are kept, each with the dwell:
+
+| Looked at for the dwell | Counts as | Clears |
+|---|---|---|
+| On screen in a client's active tab, while that client's terminal has focus | seen | the pane's status in the tab marker and the inbox; unseen output |
+| Focused | acknowledged | the pane's frame marker |
+
+So switching through a tab for under the dwell clears nothing in it, and skipping past a pane keeps
+its frame marker. "On screen" is the rule for the status because it is upstream's rule for "seen";
+a focus-only rule would keep a visible, unfocused pane's status forever. Output that lands while a
+pane is on screen is never counted as unseen, dwell or not. `mark-pane-seen` and `mark-all-seen`
+still clear at once, and a state a look does not clear (working, blocked on approval) is unchanged.
+A pane watched through a mirror in another session (`viewed_elsewhere`) still counts as seen at
+once.
+
+**Default is 1000.** Before nkmk.47 the default was 0. 0 is upstream's behaviour to the byte: the
+focus paths clear the bell synchronously, the attention tracker takes upstream's code path, and no
+timer is involved. Set `bell_clear_delay_ms 0` to get it back.
 
 How it works: `Screen` keeps a `BellDwellTracker` (`zellij-server/src/bell_dwell.rs`) of what each
 client has focused since when, and of the last ring per pane. The focus paths, and a ring on a pane
@@ -3609,6 +3629,12 @@ the job comes due, the tracker decides: it clears only if some client has held t
 the whole dwell and it has not rung inside it. A job overtaken by a refocus or a new ring finds the
 answer is no and does nothing. Multiple clients count independently - any one of them dwelling is
 enough.
+
+The attention side lives in `AttentionTracker` (`zellij-server/src/attention/tracker.rs`): with a
+dwell set, `sync_panes` records since when each pane has been on screen and focused, and reports it
+visible or focused only once that is a dwell old. Everything downstream of those two flags is
+upstream's code. A look that starts asks for the same `ClearPaneBellAfterDwell` job; its handler
+re-syncs attention visibility, which clears what the look has earned.
 
 ### A pane uuid that outlives id reuse
 
