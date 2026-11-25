@@ -662,6 +662,22 @@ impl ZellijMcp {
         if !outcome.stderr.trim().is_empty() {
             structured.insert("diagnostics".to_owned(), json!(outcome.stderr.trim()));
         }
+        // a wait that ran out of time answered the question it was asked: nothing happened in
+        // time. That is an outcome to act on - read the pane, or wait again - not a failure, so
+        // it is not an error. A pane that is gone or a session that cannot be reached still is
+        if let Some(waited_s) = timed_out_wait(argv, &outcome) {
+            structured.insert("reason".to_owned(), json!(reason::MISS));
+            structured.insert("timed_out".to_owned(), json!(true));
+            let message = format!(
+                "Timed out after {} s: {}",
+                waited_s,
+                first_words(&outcome.stderr, &outcome.stdout)
+            );
+            return with_structure(
+                CallToolResult::success(vec![ContentBlock::text(message)]),
+                structured,
+            );
+        }
         if outcome.is_error() {
             // exit 2 is the fork's "well-formed request about something that is not there". It is
             // the reason a create tool can be honest: a pane that was not made says so, and there
@@ -878,6 +894,30 @@ fn same_dir(a: &str, b: &str, target: &remote::Target) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
+}
+
+/// The seconds an `action wait` was given, when it missed because they ran out.
+///
+/// Read from the CLI's own words: every way `action wait` gives up on its deadline says "timed
+/// out", and a wait that missed for any other reason - the pane closed, the agent ended its turn
+/// without asking - does not.
+fn timed_out_wait(argv: &[String], outcome: &invoke::Outcome) -> Option<String> {
+    let waiting = argv
+        .windows(2)
+        .any(|pair| pair[0] == "action" && pair[1] == "wait");
+    if !waiting || !outcome.is_miss() || !outcome.stderr.contains("timed out") {
+        return None;
+    }
+    let seconds = argv
+        .windows(2)
+        .find(|pair| pair[0] == "--timeout")
+        .map(|pair| pair[1].clone())
+        .or_else(|| {
+            argv.iter()
+                .find_map(|word| word.strip_prefix("--timeout="))
+                .map(str::to_owned)
+        });
+    Some(seconds.unwrap_or_else(|| "its timeout".to_owned()))
 }
 
 /// The value of one `key: value` line of a CLI report.
@@ -1590,6 +1630,45 @@ mod tests {
         note_ignored(&mut plain, "zellij_create", &[]);
         assert_eq!(plain.content.len(), before);
         assert!(plain.structured_content.unwrap().get("ignored").is_none());
+    }
+
+    #[test]
+    fn a_wait_that_times_out_is_an_outcome_and_says_how_long_it_waited() {
+        let wait: Vec<String> = "-s work action wait sunny-otter --for match --match done \
+                                 --timeout 50"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let result = ZellijMcp::default().report(
+            &wait,
+            outcome(
+                2,
+                "",
+                "The wait on terminal_3 timed out: no new line matched the regex `done`.\n",
+            ),
+            None,
+        );
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(structured["reason"], json!("miss"));
+        assert_eq!(structured["timed_out"], json!(true));
+        let text = serde_json::to_value(&result.content[0]).unwrap();
+        let text = text["text"].as_str().unwrap();
+        assert!(text.starts_with("Timed out after 50 s: "), "{}", text);
+        // a wait that missed for another reason is still a failure, and says nothing matched
+        let gone =
+            ZellijMcp::default().report(&wait, outcome(2, "", "terminal_3 is gone.\n"), None);
+        assert_eq!(gone.is_error, Some(true));
+        let structured = gone.structured_content.unwrap();
+        assert!(structured.get("timed_out").is_none());
+        assert_eq!(structured["reason"], json!("miss"));
+        // and only a wait is read this way
+        let send: Vec<String> = "action send-message --to a --wait 5 -- hi"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let held = ZellijMcp::default().report(&send, outcome(2, "", "the wait timed out\n"), None);
+        assert_eq!(held.is_error, Some(true));
     }
 
     #[test]

@@ -5294,6 +5294,14 @@ so the agent tried again without a pane to show for it. It now makes the pane an
 ``ignored: `name` (only kind=tab takes a name; pane handles are generated; this pane's is
 sunny-otter)``, which points the agent at the handle it has to use.
 
+**A `zellij_wait_for` that times out is an outcome, not an error (nkmk.47).** Timeouts were 80%
+of wait errors in agent transcripts, and an agent read each one as a fault. A wait that runs out of
+time now succeeds (`isError` false) with `reason: miss` and `timed_out: true`, and its text starts
+`Timed out after N s:` in place of `Nothing matched:`. A wait that missed for another reason - the
+pane closed, the agent ended its turn without asking - and a wait that could not run stay errors.
+The server tells a timeout by the CLI's own words: every way `action wait` gives up on its deadline
+says "timed out", so a change to that wording in the client changes this.
+
 ### `session up` comes back with the shape the session had
 
 ```

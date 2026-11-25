@@ -225,7 +225,10 @@ pub const TOOLS: &[ToolSpec] = &[
         tips:
             "The exit_code of THIS call says whether the wait succeeded, not whether the command \
                did. A command that failed still returns exit_code 0 here: read `exit_status` in \
-               the result. A wait that times out is a miss, not an error, and says so. until=match \
+               the result. A wait that times out is an outcome to act on, not a failure: the call \
+               succeeds with reason miss and timed_out true, and its text starts `Timed out \
+               after N s`. Read the pane, or wait again. A pane that is gone or a session that \
+               cannot be reached is still an error. until=match \
                needs a pattern, a regex tested line by line (^ and $ anchor to the line); until=quiet \
                takes the window in quiet_ms. until=match sees only lines that arrive AFTER the \
                wait began: text already on screen never matches, and neither does a line identical \
@@ -805,6 +808,14 @@ fn output_schema() -> JsonObject {
         json!({
             "type": "string",
             "description": "Anything the command wrote to stderr.",
+        }),
+    );
+    properties.insert(
+        "timed_out".to_owned(),
+        json!({
+            "type": "boolean",
+            "description": "zellij_wait_for: true when the wait ran out of time. The call \
+                            succeeds with reason miss: nothing happened in time.",
         }),
     );
     properties.insert(
