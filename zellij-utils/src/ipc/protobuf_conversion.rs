@@ -1328,6 +1328,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             agent_startup_grace: None,
             agent_message_quiet: None,
             mcp_wait_timeout: None,
+            pane_frame_handle: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

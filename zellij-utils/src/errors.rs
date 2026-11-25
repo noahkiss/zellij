@@ -488,6 +488,7 @@ pub enum ScreenContext {
     HideBarByPaneId,
     SetHiddenBarsNotification,
     SetAgentMailTimings,
+    SetPaneFrameHandle,
     SetModeHintsWhenBarsHidden,
     SetGraphemeClusters,
     GetSessionPreview,

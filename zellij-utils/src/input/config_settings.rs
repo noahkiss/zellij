@@ -206,6 +206,7 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         agent_startup_grace: _,
         agent_message_quiet: _,
         mcp_wait_timeout: _,
+        pane_frame_handle: _,
     } = options;
     let entries = [
         (SettingKey::SimplifiedUi, display_text(simplified_ui)),

@@ -3570,6 +3570,7 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "osc8_hyperlinks",
     "pane_env_drop",
     "pane_frame_agent_name",
+    "pane_frame_handle",
     "pane_frame_style",
     "pane_frames",
     "person_name",
@@ -3841,6 +3842,9 @@ impl Options {
         };
         let pane_frame_agent_name =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frame_agent_name")
+                .map(|(v, _)| v);
+        let pane_frame_handle =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frame_handle")
                 .map(|(v, _)| v);
         let detect_agents =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "detect_agents").map(|(v, _)| v);
@@ -4200,6 +4204,7 @@ impl Options {
             agent_startup_grace,
             agent_message_quiet,
             mcp_wait_timeout,
+            pane_frame_handle,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -7130,6 +7135,11 @@ impl Options {
         if let Some(enabled) = self.pane_frame_agent_name {
             let mut node = KdlNode::new("pane_frame_agent_name");
             node.push(KdlValue::Bool(enabled));
+            nodes.push(node);
+        }
+        if let Some(shown) = self.pane_frame_handle {
+            let mut node = KdlNode::new("pane_frame_handle");
+            node.push(KdlValue::Bool(shown));
             nodes.push(node);
         }
         if let Some(detect_agents) = self.detect_agents_to_kdl() {
@@ -15315,6 +15325,16 @@ fn plugin_permissions_reject_what_expansion_produces_too() {
         }
     "#;
     assert!(Config::from_kdl(expands_to_a_wildcard, None).is_err());
+}
+
+#[test]
+fn pane_frame_handle_config_roundtrips_and_defaults_on() {
+    assert_eq!(Options::default().pane_frame_handle.unwrap_or(true), true);
+    let config = Config::from_kdl("pane_frame_handle false", None).unwrap();
+    assert_eq!(config.options.pane_frame_handle, Some(false));
+    let restored = Config::from_kdl(&config.to_string(false), None).unwrap();
+    assert_eq!(restored.options.pane_frame_handle, Some(false));
+    assert!(Config::from_kdl("pane_frame_handle \"no\"", None).is_err());
 }
 
 #[test]

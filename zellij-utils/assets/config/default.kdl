@@ -252,6 +252,13 @@ context_menu {
 // Defaults to false; Claude Code names are available.
 // pane_frame_agent_name false
 
+// Whether the pane frame shows the pane's handle (sunny-otter) at the right of its title row
+// false gives the title the room in narrow panes; the handle still names the pane everywhere else
+// (list-panes, zellij mcp, --pane). A reload applies it
+// Default: true
+//
+// pane_frame_handle false
+
 // Set the pane frame style when pane_frames is enabled
 // Options:
 //   - titles (default - draw a title above each pane)

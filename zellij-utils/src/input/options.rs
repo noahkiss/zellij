@@ -952,6 +952,12 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub mcp_wait_timeout: Option<String>,
+    /// Whether the pane frame shows the pane's handle at the right of its title row. Unset means true.
+    /// `false` hides it on the frame only: `list-panes` and every other surface still name the handle.
+    /// Read by the session server, at start and on reload
+    #[clap(skip)]
+    #[serde(default)]
+    pub pane_frame_handle: Option<bool>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1219,6 +1225,7 @@ impl Options {
         let mcp_wait_timeout = other
             .mcp_wait_timeout
             .or_else(|| self.mcp_wait_timeout.clone());
+        let pane_frame_handle = other.pane_frame_handle.or(self.pane_frame_handle);
 
         Options {
             stacked_pane_list_orientation,
@@ -1322,6 +1329,7 @@ impl Options {
             agent_startup_grace,
             agent_message_quiet,
             mcp_wait_timeout,
+            pane_frame_handle,
         }
     }
 
@@ -1527,6 +1535,7 @@ impl Options {
         let mcp_wait_timeout = other
             .mcp_wait_timeout
             .or_else(|| self.mcp_wait_timeout.clone());
+        let pane_frame_handle = other.pane_frame_handle.or(self.pane_frame_handle);
 
         Options {
             stacked_pane_list_orientation,
@@ -1630,6 +1639,7 @@ impl Options {
             agent_startup_grace,
             agent_message_quiet,
             mcp_wait_timeout,
+            pane_frame_handle,
         }
     }
 

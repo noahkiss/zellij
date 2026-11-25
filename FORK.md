@@ -851,6 +851,14 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
   shows none of it — there is no short form.
 - A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
   counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
+- **`pane_frame_handle false` takes it off the frame**, for someone who never types handles and
+  wants the title's room back in narrow panes. The handle stays the pane's address: `list-panes`,
+  `zellij mcp`, `--pane` and a layout still name it. Default true. The session server reads the
+  key at start and at every reload (`ScreenInstruction::SetPaneFrameHandle`, which redraws). The
+  flag is a thread-local on the screen thread, which draws every frame, so no tab or pane list
+  carries a field for it. It is not on the contract (`None` in the protobuf `Options`). An older
+  build warns about an unknown top-level key and keeps drawing the handle. Capability:
+  `pane-frame-handle`.
 
 #### Testing
 

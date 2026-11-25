@@ -529,6 +529,7 @@ fn test_client_messages() {
                 agent_startup_grace: None,
                 agent_message_quiet: None,
                 mcp_wait_timeout: None,
+                pane_frame_handle: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),

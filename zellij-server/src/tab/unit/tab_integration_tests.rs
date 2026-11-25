@@ -21198,3 +21198,59 @@ fn a_plugin_pane_whose_plugin_failed_is_marked() {
         "starting another load attempt clears the mark the previous one left"
     );
 }
+
+/// fork addition: `pane_frame_handle false` takes the handle off the frame and leaves it on the
+/// pane, where `list-panes` and every other surface read it.
+#[test]
+fn pane_frame_handle_false_hides_the_handle_on_the_frame_only() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab(size, ModeInfo::default());
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+    let handle = tab
+        .get_pane_with_id(PaneId::Terminal(2))
+        .unwrap()
+        .pane_handle();
+    assert!(!handle.is_empty());
+    let frame = |tab: &mut Tab| {
+        let mut output = Output::default();
+        tab.render(&mut output, None).unwrap();
+        take_snapshot(
+            output.serialize().unwrap().get(&client_id).unwrap().ansi(),
+            size.rows,
+            size.cols,
+            Palette::default(),
+        )
+    };
+    assert!(
+        frame(&mut tab).contains(&handle),
+        "the handle is drawn by default"
+    );
+    crate::ui::pane_contents_and_ui::set_frame_handle_shown(false);
+    let hidden = frame(&mut tab);
+    crate::ui::pane_contents_and_ui::set_frame_handle_shown(true);
+    assert!(!hidden.contains(&handle), "{}", hidden);
+    assert_eq!(
+        tab.get_pane_with_id(PaneId::Terminal(2))
+            .unwrap()
+            .pane_handle(),
+        handle
+    );
+    assert!(
+        frame(&mut tab).contains(&handle),
+        "and drawn again once shown"
+    );
+}

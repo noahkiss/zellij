@@ -10,6 +10,23 @@ use zellij_utils::data::{client_slot_to_colors, BorderStyle, InputMode, PaletteC
 use zellij_utils::errors::prelude::*;
 use zellij_utils::pane_size::PaneGeom;
 
+thread_local! {
+    /// fork addition: the config's `pane_frame_handle`. Frames are drawn on the screen thread,
+    /// and the screen sets this there at its start and at every reload, so no tab, pane list or
+    /// frame needs a field of its own for it.
+    static FRAME_HANDLE_SHOWN: std::cell::Cell<bool> = std::cell::Cell::new(true);
+}
+
+/// fork addition: whether frames drawn on this thread show the pane's handle
+/// (`pane_frame_handle`, default true).
+pub fn set_frame_handle_shown(shown: bool) {
+    FRAME_HANDLE_SHOWN.with(|cell| cell.set(shown));
+}
+
+pub fn frame_handle_shown() -> bool {
+    FRAME_HANDLE_SHOWN.with(|cell| cell.get())
+}
+
 pub fn dim_character_chunks(character_chunks: &mut Vec<CharacterChunk>) {
     for chunk in character_chunks.iter_mut() {
         for terminal_character in chunk.terminal_characters.iter_mut() {
@@ -427,8 +444,13 @@ impl<'a> PaneContentsAndUi<'a> {
         let frame_is_dimmed = self.frame_is_dimmed_for_client(client_id);
         let guest_choice_indicator = self.pane.guest_choice_indicator(client_id);
         let border_style = self.border_style(pane_is_floating);
-        // fork addition: the frame draws the handle the pane is addressed by
-        let pane_handle = self.pane.pane_handle();
+        // fork addition: the frame draws the handle the pane is addressed by, unless the config's
+        // `pane_frame_handle` is false; an empty handle draws nothing
+        let pane_handle = if frame_handle_shown() {
+            self.pane.pane_handle()
+        } else {
+            String::new()
+        };
         // fork addition: and the note somebody left on it, if there is one
         let pane_note = self.pane.pane_note();
         let frame_params = if session_is_mirrored {

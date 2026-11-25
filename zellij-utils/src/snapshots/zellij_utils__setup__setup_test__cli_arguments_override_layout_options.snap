@@ -106,4 +106,5 @@ Options {
     agent_startup_grace: None,
     agent_message_quiet: None,
     mcp_wait_timeout: None,
+    pane_frame_handle: None,
 }

@@ -1121,6 +1121,8 @@ pub enum ScreenInstruction {
     ShowBars(ClientId, Option<NotificationEnd>),
     HideBarByPaneId(PaneId, ClientId, Option<NotificationEnd>),
     SetHiddenBarsNotification(bool),
+    /// fork addition: the config's `pane_frame_handle`, at a reload.
+    SetPaneFrameHandle(bool),
     /// fork addition: the agent-message guard's windows from the config, at a reload:
     /// `agent_message_quiet` and `agent_startup_grace`, in milliseconds.
     SetAgentMailTimings {
@@ -1767,6 +1769,7 @@ impl From<&ScreenInstruction> for ScreenContext {
                 ScreenContext::SetHiddenBarsNotification
             },
             ScreenInstruction::SetAgentMailTimings { .. } => ScreenContext::SetAgentMailTimings,
+            ScreenInstruction::SetPaneFrameHandle(..) => ScreenContext::SetPaneFrameHandle,
             ScreenInstruction::SetModeHintsWhenBarsHidden(..) => {
                 ScreenContext::SetModeHintsWhenBarsHidden
             },
@@ -13143,6 +13146,9 @@ pub(crate) fn screen_thread_main(
         .clone()
         .unwrap_or_default();
     screen.hidden_bars_notification = config_options.hidden_bars_notification.unwrap_or(true);
+    crate::ui::pane_contents_and_ui::set_frame_handle_shown(
+        config_options.pane_frame_handle.unwrap_or(true),
+    );
     screen.agent_mail_quiet_ms = zellij_utils::agent_mail::configured_quiet_ms(
         config_options.agent_message_quiet.as_deref(),
     );
@@ -18247,6 +18253,12 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::SetHiddenBarsNotification(enabled) => {
                 screen.hidden_bars_notification = enabled;
+            },
+            ScreenInstruction::SetPaneFrameHandle(shown) => {
+                if shown != crate::ui::pane_contents_and_ui::frame_handle_shown() {
+                    crate::ui::pane_contents_and_ui::set_frame_handle_shown(shown);
+                    screen.render(None)?;
+                }
             },
             ScreenInstruction::SetAgentMailTimings {
                 quiet_ms,
