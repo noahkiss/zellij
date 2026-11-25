@@ -5316,6 +5316,14 @@ adjacent calls in agent transcripts, and one agent already sent a list. Each ent
 `send-keys` argument, so each is one key with its modifiers. A string still works. An empty list,
 or an entry that is not a non-empty string, is refused. The schema says `oneOf` string or array.
 
+**A remote host can be written short (nkmk.47).** `session: host/session` named a host by its
+listed name or alias alone, and agents wrote the short name a person uses: three refusals. A host
+that is the start or the end of exactly one listed name, alias or first label now reaches that host
+(`alpha/work` reaches a listed `labalpha`), and the answer's `host` names the host in full. Two
+matches, or none, keep the refusal that lists the hosts. Only a word written as a host is matched
+this way: `zellij_send` tries the first word of `to` as a host before it reads it as a session, and
+that lookup stays exact, so a session is never sent to another machine for sharing a host's prefix.
+
 ### `session up` comes back with the shape the session had
 
 ```

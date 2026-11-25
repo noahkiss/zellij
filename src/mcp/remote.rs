@@ -420,6 +420,39 @@ impl RemoteHosts {
         })
     }
 
+    /// The listed host a `host/session` names: by name or alias, or else the one listed host
+    /// whose name, alias or first label starts or ends with it, ignoring case.
+    ///
+    /// Only for a word the caller wrote as a host. `find` stays exact, because `zellij_send` tries
+    /// the first word of `to` as a host before it reads it as a session, and a session named like
+    /// the start of a host must not be sent to another machine. Two matches, or none, are `None`,
+    /// and the caller's refusal lists the hosts.
+    pub fn find_loose(&self, name: &str) -> Option<&RemoteHost> {
+        if let Some(host) = self.find(name) {
+            return Some(host);
+        }
+        let wanted = name.to_ascii_lowercase();
+        if wanted.is_empty() {
+            return None;
+        }
+        let mut matches = self.hosts.iter().filter(|host| {
+            let label = host
+                .name
+                .rsplit_once('@')
+                .map_or(host.name.as_str(), |(_, rest)| rest)
+                .split('.')
+                .next()
+                .unwrap_or_default();
+            [Some(host.name.as_str()), host.alias.as_deref(), Some(label)]
+                .into_iter()
+                .flatten()
+                .map(str::to_ascii_lowercase)
+                .any(|word| word.starts_with(&wanted) || word.ends_with(&wanted))
+        });
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
+    }
+
     /// The listed host by its name alone, ignoring case.
     fn named(&self, name: &str) -> Option<&RemoteHost> {
         self.hosts
@@ -537,8 +570,10 @@ pub fn route(
             session
         ));
     }
-    // an alias names its host, and a host that is this machine stays local by either name
-    let listed = hosts.find(host);
+    // an alias names its host, and a host that is this machine stays local by either name. A
+    // host written short - the end or the start of one listed name - reaches that host when no
+    // other listed host matches it too
+    let listed = hosts.find_loose(host);
     let target = if is_local(host, local) || listed.is_some_and(|l| is_local(&l.name, local)) {
         Target::Local
     } else {
@@ -948,6 +983,47 @@ mod tests {
             route(&mut none, &RemoteHosts::default(), "x").unwrap(),
             Target::Local
         );
+    }
+
+    #[test]
+    fn a_host_written_short_reaches_the_one_listed_host_it_matches() {
+        let hosts = RemoteHosts::parse(
+            r#"
+            remote_hosts {
+                host "labalpha"
+                host "labbeta"
+                host "user@gamma.example.net"
+            }
+        "#,
+        );
+        let route_to = |session: &str| {
+            let mut arguments = json!({"session": session}).as_object().unwrap().clone();
+            route(&mut arguments, &hosts, "local-box").map(|target| {
+                (
+                    target.host().map(str::to_owned),
+                    arguments.get("session").cloned(),
+                )
+            })
+        };
+        // the end of one name, the start of one name, and a first label
+        assert_eq!(
+            route_to("alpha/work").unwrap(),
+            (Some("labalpha".to_owned()), Some(json!("work")))
+        );
+        assert_eq!(route_to("BETA/").unwrap().0, Some("labbeta".to_owned()));
+        assert_eq!(route_to("labb/w").unwrap().0, Some("labbeta".to_owned()));
+        assert_eq!(
+            route_to("gam/w").unwrap().0,
+            Some("user@gamma.example.net".to_owned())
+        );
+        // two matches, or none, keep the refusal that lists the hosts
+        for session in ["lab/work", "delta/work"] {
+            let refusal = route_to(session).unwrap_err();
+            assert!(refusal.contains("is not in remote_hosts"), "{}", refusal);
+            assert!(refusal.contains("labalpha, labbeta"), "{}", refusal);
+        }
+        // `find` stays exact: zellij_send reads a first word that is no host as a session
+        assert!(hosts.find("alpha").is_none());
     }
 
     #[test]

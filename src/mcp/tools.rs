@@ -91,7 +91,9 @@ const SESSION: ParamSpec = ParamSpec {
     describe: "The session to act on. Defaults to ZELLIJ_SESSION_NAME in this server's own \
                environment, which is the session it was started from. host/session acts on a \
                session on another machine over ssh - boxa/work - and host/ on whichever session \
-               that machine's CLI picks. The host must be listed in remote_hosts in config.kdl.",
+               that machine's CLI picks. The host must be listed in remote_hosts in config.kdl; \
+               the start or the end of one listed name reaches that host when no other \
+               matches.",
     default: None,
 };
 
