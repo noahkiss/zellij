@@ -118,8 +118,16 @@ impl ZellijMcp {
         remote::RemoteHosts::load(self.config_path.as_deref())
     }
 
+    /// One tool call, and the parameters it was given that its tool does not take.
+    async fn call(&self, name: &str, arguments: Map<String, Value>) -> CallToolResult {
+        let ignored = tools::ignored_parameters(name, &arguments);
+        let mut result = self.run_call(name, arguments).await;
+        note_ignored(&mut result, name, &ignored);
+        result
+    }
+
     /// One tool call: build the command line, run it, and report what the CLI said.
-    async fn call(&self, name: &str, mut arguments: Map<String, Value>) -> CallToolResult {
+    async fn run_call(&self, name: &str, mut arguments: Map<String, Value>) -> CallToolResult {
         let local = zellij_utils::shared::short_hostname();
         if name == "zellij_overview"
             && arguments.get("scope").and_then(Value::as_str) == Some("fleet")
@@ -881,6 +889,75 @@ fn report_value(stdout: &str, key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Name the parameters a call was given and did not use: `ignored` in the answer, and one line
+/// in front of its text, so a caller that believed a key took effect learns that it did not.
+///
+/// A pane's handle is generated, never chosen, and agents keep passing one. The line for it names
+/// the handle the pane did get, because that is the one every later call has to use.
+fn note_ignored(result: &mut CallToolResult, tool: &str, ignored: &[String]) {
+    if ignored.is_empty() {
+        return;
+    }
+    let structured = match result.structured_content.as_mut() {
+        Some(Value::Object(structured)) => structured,
+        _ => {
+            result.structured_content = Some(Value::Object(Map::new()));
+            match result.structured_content.as_mut() {
+                Some(Value::Object(structured)) => structured,
+                _ => return,
+            }
+        },
+    };
+    structured.insert("ignored".to_owned(), json!(ignored));
+    let mut parts = Vec::new();
+    let (handles, others): (Vec<&String>, Vec<&String>) = ignored
+        .iter()
+        .partition(|name| tool == "zellij_create" && name.as_str() == "handle");
+    if !handles.is_empty() {
+        let made = structured
+            .get("handle")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                structured
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .and_then(|output| report_value(output, "handle"))
+            })
+            .or_else(|| {
+                structured
+                    .get("result")
+                    .and_then(|result| result.get("handle"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        parts.push(match made {
+            Some(handle) => format!(
+                "`handle` (handles are generated; this pane's is {})",
+                handle
+            ),
+            None => "`handle` (handles are generated; this call made no pane)".to_owned(),
+        });
+    }
+    if !others.is_empty() {
+        let names = others
+            .iter()
+            .map(|name| format!("`{}`", name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let what = if others.len() == 1 {
+            "not a parameter"
+        } else {
+            "not parameters"
+        };
+        parts.push(format!("{} ({} of {})", names, what, tool));
+    }
+    result.content.insert(
+        0,
+        ContentBlock::text(format!("ignored: {}", parts.join("; "))),
+    );
+}
+
 /// How long a client may treat the tool list as fresh, in milliseconds.
 ///
 /// The list is compiled in - see [`tools::TOOLS`] - so it cannot change while this process is
@@ -1456,6 +1533,42 @@ mod tests {
             None,
         );
         assert_eq!(result.structured_content.unwrap()["reason"], json!("miss"));
+    }
+
+    #[test]
+    fn a_parameter_the_tool_does_not_take_is_named_and_the_call_still_answers() {
+        let server = ZellijMcp::default();
+        let mut result = server.report(
+            &create_argv(),
+            outcome(
+                0,
+                "pane_id: terminal_7\nhandle: sunny-otter\nready_by: prompt\n",
+                "",
+            ),
+            Some(true),
+        );
+        note_ignored(
+            &mut result,
+            "zellij_create",
+            &["handle".to_owned(), "brief".to_owned()],
+        );
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(structured["ignored"], json!(["handle", "brief"]));
+        let first = serde_json::to_value(&result.content[0]).unwrap();
+        assert_eq!(
+            first["text"],
+            json!(
+                "ignored: `handle` (handles are generated; this pane's is sunny-otter); \
+                 `brief` (not a parameter of zellij_create)"
+            )
+        );
+        // nothing ignored, nothing added
+        let mut plain = server.report(&create_argv(), outcome(0, "handle: a-b\n", ""), None);
+        let before = plain.content.len();
+        note_ignored(&mut plain, "zellij_create", &[]);
+        assert_eq!(plain.content.len(), before);
+        assert!(plain.structured_content.unwrap().get("ignored").is_none());
     }
 
     #[test]

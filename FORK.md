@@ -5277,6 +5277,15 @@ already settled it. `operation` is now optional. `pane` alone closes that pane, 
 tab, and `operation: close` reads the same way. The tool cannot be undone, so it guesses no further:
 both targets, or neither, without a named operation is refused with a line that says so.
 
+**A parameter a tool does not take is named in the answer (nkmk.47).** The schemas say
+`additionalProperties: false`, but a client need not check it, and the server dropped an unknown
+key without a word. Agents passed `handle`, `lines`, `brief`, `input` and `message`, believed they
+took effect, and then addressed a handle no pane answers to. The call still runs. Its answer gains
+`ignored: [names]` and one text line in front, such as ``ignored: `brief` (not a parameter of
+zellij_read_pane)``. For `handle` on `zellij_create` the line names the handle the pane did get:
+``ignored: `handle` (handles are generated; this pane's is sunny-otter)``. A parameter a tool
+refuses by name, such as `floating`, says so in its own refusal and is not also listed.
+
 ### `session up` comes back with the shape the session had
 
 ```

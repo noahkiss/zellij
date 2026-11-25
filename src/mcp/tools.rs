@@ -671,6 +671,36 @@ pub const TOOLS: &[ToolSpec] = &[
     },
 ];
 
+/// Parameters a tool reads although its schema does not list them, so they are never reported as
+/// ignored: one the tool refuses with its own line, or one an older client still sends from a
+/// cached schema.
+pub const UNLISTED: &[(&str, &str)] = &[
+    // refused by name: `floating` was removed, and the refusal says what to use instead
+    ("zellij_create", "floating"),
+];
+
+/// The parameters of a call that its tool does not take, in the order they were given.
+///
+/// The schema says `additionalProperties: false`, but a client need not check it, and a key the
+/// command line never reads used to vanish without a word: agents passed `handle`, `lines` and
+/// `brief`, believed they took effect, and then addressed a handle no pane answers to. The call
+/// still runs; the answer names what it did not use.
+pub fn ignored_parameters(tool: &str, arguments: &Map<String, Value>) -> Vec<String> {
+    let Some(spec) = tool_spec(tool) else {
+        return Vec::new();
+    };
+    arguments
+        .keys()
+        .filter(|key| !spec.params.iter().any(|param| param.name == key.as_str()))
+        .filter(|key| {
+            !UNLISTED
+                .iter()
+                .any(|(unlisted_tool, param)| *unlisted_tool == tool && param == key)
+        })
+        .cloned()
+        .collect()
+}
+
 /// The tool by that name, or `None`.
 pub fn tool_spec(name: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|tool| tool.name == name)
@@ -767,6 +797,15 @@ fn output_schema() -> JsonObject {
         json!({
             "type": "string",
             "description": "Anything the command wrote to stderr.",
+        }),
+    );
+    properties.insert(
+        "ignored".to_owned(),
+        json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Parameters this call was given that the tool does not take. The \
+                            call ran without them.",
         }),
     );
     properties.insert(
@@ -1095,6 +1134,30 @@ mod tests {
         let schema = super::output_schema();
         let allowed = schema["properties"]["reason"]["enum"].as_array().unwrap();
         assert!(allowed.iter().any(|v| v == "not_ready"));
+    }
+
+    #[test]
+    fn a_parameter_the_tool_does_not_take_is_named() {
+        let given = |value: Value| value.as_object().cloned().unwrap();
+        assert_eq!(
+            ignored_parameters(
+                "zellij_create",
+                &given(json!({"command": "ls", "handle": "my-pane", "kind": "tab"}))
+            ),
+            vec!["handle".to_owned()]
+        );
+        assert_eq!(
+            ignored_parameters(
+                "zellij_read_pane",
+                &given(json!({"pane": "sunny-otter", "lines": 40, "brief": true}))
+            ),
+            vec!["brief".to_owned(), "lines".to_owned()]
+        );
+        // a parameter the tool refuses by name says so itself, and is not also "ignored"
+        assert!(ignored_parameters("zellij_create", &given(json!({"floating": true}))).is_empty());
+        assert!(ignored_parameters("zellij_overview", &given(json!({"session": "w"}))).is_empty());
+        let schema = output_schema();
+        assert_eq!(schema["properties"]["ignored"]["type"], json!("array"));
     }
 
     #[test]
