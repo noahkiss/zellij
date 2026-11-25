@@ -5302,6 +5302,14 @@ pane closed, the agent ended its turn without asking - and a wait that could not
 The server tells a timeout by the CLI's own words: every way `action wait` gives up on its deadline
 says "timed out", so a change to that wording in the client changes this.
 
+**The MCP instructions open with what the server does (nkmk.47).** They opened with "Start the
+child, then wait for agent-change in the background; never poll the screen", a line written for
+the CLI's `action wait --for agent-change`, which a supervising agent can run as a background shell
+command. An MCP call cannot run in the background, and `agent-change` is not the tool's value. The
+instructions now say to wait rather than poll, under the session paragraph, with `until=agent_change`
+and the note that a wait holds the call open, so `timeout_s` stays under the client's deadline. The
+`zellij_wait_for` tips lost the same line.
+
 ### `session up` comes back with the shape the session had
 
 ```

@@ -242,8 +242,8 @@ pub const TOOLS: &[ToolSpec] = &[
                up after {wait_timeout_s} seconds rather than blocking for the life of the pane. If your MCP \
                client cuts a request off sooner (many do at 60 seconds), pass a timeout_s under \
                that deadline and wait again. \
-               Start the child, then wait for agent-change in the background; never poll the screen. \
-               until=agent_change wakes on agent state, identity or name changes. Omit pane to watch \
+               until=agent_change watches other agents instead of polling their screens: it \
+               returns when an agent changes state, identity or name. Omit pane to watch \
                every agent except the caller. until=agent_idle is for a pane running a coding agent: it returns when the agent \
                stops working - its turn ended (`state` idle, done or error) or it is blocked on a \
                person (`state` blocked, with `state_kind` permission, question or auth and the \

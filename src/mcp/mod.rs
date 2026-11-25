@@ -41,9 +41,6 @@ use zellij_utils::consts::VERSION;
 
 /// What a client is told this server is, before it asks for anything.
 const INSTRUCTIONS: &str = "\
-Start the child, then wait for agent-change in the background; never poll the screen.
-Use zellij_wait_for until=agent_change.
-
 Drive a running zellij session: read what is on a pane, wait for something to happen in one, type
 into one, and make or close panes and tabs.
 
@@ -53,6 +50,12 @@ works too.
 
 Which session a call is about: the tool's own `session` argument, or the session this server was
 started inside. Nothing here starts or stops a session; that is the command line's job.
+
+Wait rather than poll. After you start something, call zellij_wait_for instead of reading the pane
+again and again. To watch other agents, use zellij_wait_for with until=agent_change: it returns
+when an agent changes state, identity or name. A wait holds the call open until it returns or
+times out; nothing runs in the background, so keep timeout_s under your client's request deadline
+and wait again.
 
 Work in ONE pane. Before you create anything, call zellij_overview and look for a pane you already
 own - its handle is in that answer. Have one? Use zellij_write_input, not zellij_create. Did a
@@ -1669,6 +1672,19 @@ mod tests {
             .collect();
         let held = ZellijMcp::default().report(&send, outcome(2, "", "the wait timed out\n"), None);
         assert_eq!(held.is_error, Some(true));
+    }
+
+    #[test]
+    fn the_instructions_promise_only_what_a_tool_call_can_do() {
+        // a line written for the CLI opened the instructions: an MCP call cannot run in the
+        // background, and `agent-change` is the CLI's spelling, not the tool's
+        assert!(INSTRUCTIONS.starts_with("Drive a running zellij session"));
+        let wait_tips = tools::tool_spec("zellij_wait_for").unwrap().tips;
+        for said in [INSTRUCTIONS, wait_tips] {
+            assert!(!said.contains("in the background;"), "{}", said);
+            assert!(!said.contains("agent-change"), "{}", said);
+        }
+        assert!(INSTRUCTIONS.contains("until=agent_change"));
     }
 
     #[test]
