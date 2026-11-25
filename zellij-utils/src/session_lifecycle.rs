@@ -1512,7 +1512,7 @@ pub struct ServerUnchanged {
 /// changes nothing a server runs lists the earlier versions it serves the same as (carrying the
 /// previous list forward); a release that changes the server empties the list.
 pub const SERVER_UNCHANGED: ServerUnchanged = ServerUnchanged {
-    declared_for: "0.46.0-nkmk.45",
+    declared_for: "0.46.0-nkmk.46",
     same_server_as: &[],
 };
 
