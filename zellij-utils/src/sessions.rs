@@ -174,6 +174,51 @@ pub fn get_sessions_in_other_socket_dirs() -> Vec<(std::path::PathBuf, Vec<Strin
         .collect()
 }
 
+/// fork addition: why a listing that found no session in this build's socket dir should not be
+/// read as "no session on this machine", or `None` when it can be.
+///
+/// A missing socket dir is NOT the signal: a machine that has just booted has none until its first
+/// server starts, and `list-agents --all-sessions` must answer `[]` there. What is a signal:
+///
+/// - the directory the root lives in does not exist (an `XDG_RUNTIME_DIR` or `TMPDIR` naming a
+///   place that is not there), or
+/// - live sessions answer under another candidate root - the shell lacks the variable its login
+///   had (`XDG_RUNTIME_DIR` under cron or ssh, the per-user `TMPDIR` on macOS).
+///
+/// An explicit `ZELLIJ_SOCKET_DIR` is trusted: it is how a scratch environment is made, and its
+/// directory is created by the first server started there.
+pub fn socket_dir_misresolved() -> Option<String> {
+    if envs::get_socket_dir().is_ok() {
+        return None;
+    }
+    misresolved_note(&ZELLIJ_SOCK_DIR, &get_sessions_in_other_socket_dirs())
+}
+
+/// The one-line note [`socket_dir_misresolved`] gives, from what it found. `looked_in` is the
+/// contract dir; its parent is the root, and the root's parent is the directory the environment
+/// named.
+pub fn misresolved_note(
+    looked_in: &Path,
+    elsewhere: &[(std::path::PathBuf, Vec<String>)],
+) -> Option<String> {
+    if let Some(base) = looked_in.parent().and_then(Path::parent) {
+        if !base.as_os_str().is_empty() && !base.exists() {
+            return Some(format!(
+                "looked for sessions in {}, but {} does not exist: this shell's XDG_RUNTIME_DIR or TMPDIR is wrong",
+                looked_in.display(),
+                base.display()
+            ));
+        }
+    }
+    let (dir, sessions) = elsewhere.first()?;
+    Some(format!(
+        "looked for sessions in {}, but {} live session(s) answer in {}: this shell resolves a different socket dir than the one they were started from",
+        looked_in.display(),
+        sessions.len(),
+        dir.display()
+    ))
+}
+
 /// The client/server contract versions a session by this name has a socket under, other than the
 /// one this binary speaks.
 ///
@@ -2008,6 +2053,43 @@ mod session_folder_name_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn misresolved_note_is_none_for_a_machine_with_no_session_yet() {
+        // a fresh boot: the runtime dir is there, the zellij root under it is not
+        let base = tempfile::tempdir().unwrap();
+        let looked_in = base.path().join("zellij").join("contract_version_1");
+        assert_eq!(super::misresolved_note(&looked_in, &[]), None);
+    }
+
+    #[test]
+    fn misresolved_note_names_a_base_dir_that_does_not_exist() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("no-such-runtime-dir");
+        let looked_in = missing.join("zellij").join("contract_version_1");
+        let note = super::misresolved_note(&looked_in, &[]).expect("a note");
+        assert!(note.contains(&looked_in.display().to_string()), "{}", note);
+        assert!(note.contains("does not exist"), "{}", note);
+        assert!(!note.contains('\n'), "one line: {}", note);
+    }
+
+    #[test]
+    fn misresolved_note_names_where_live_sessions_answer() {
+        let base = tempfile::tempdir().unwrap();
+        let looked_in = base.path().join("zellij").join("contract_version_1");
+        let other = std::path::PathBuf::from("/elsewhere/zellij/contract_version_1");
+        let note = super::misresolved_note(
+            &looked_in,
+            &[(other.clone(), vec!["work".to_owned(), "play".to_owned()])],
+        )
+        .expect("a note");
+        assert!(note.contains(&looked_in.display().to_string()), "{}", note);
+        assert!(note.contains(&other.display().to_string()), "{}", note);
+        assert!(note.contains("2 live session(s)"), "{}", note);
+        // the fleet overview reads an exit 2 whose stderr names this flag as an older build
+        assert!(!note.contains("--all-sessions"), "{}", note);
+        assert!(!note.contains('\n'), "one line: {}", note);
+    }
+
     #[test]
     #[cfg(unix)]
     fn socket_path_is_occupied_sees_a_bound_listener() {

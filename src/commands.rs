@@ -804,6 +804,24 @@ pub(crate) fn send_action_to_session(
             names.sort();
             names
         };
+        // fork addition: an empty answer has to mean "no session on this machine". A socket dir
+        // that cannot be read, or one this shell resolved wrongly while sessions answer in
+        // another, is exit 2 with one line on stderr and nothing on stdout. A machine with no
+        // session yet - no socket dir at all - is still `[]` and 0
+        if let Err(kind) = get_sessions() {
+            eprintln!(
+                "could not read the socket dir {}: {:?}",
+                zellij_utils::consts::ZELLIJ_SOCK_DIR.display(),
+                kind
+            );
+            process::exit(2);
+        }
+        if live_sessions().is_empty() {
+            if let Some(note) = zellij_utils::sessions::socket_dir_misresolved() {
+                eprintln!("{}", note);
+                process::exit(2);
+            }
+        }
         let make_os_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
             Box::new(get_os_input(
                 zellij_client::os_input_output::get_cli_client_os_input,

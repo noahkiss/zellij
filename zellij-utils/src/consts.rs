@@ -446,7 +446,40 @@ mod unix_only {
         }
         push(ZELLIJ_TMP_DIR.clone());
         push(PathBuf::from("/tmp").join(format!("zellij-{}", *UID)));
+        // fork addition: the roots a login environment would have resolved to, for a shell that
+        // lacks the variable that names it - a cron job or an ssh command with no
+        // XDG_RUNTIME_DIR on Linux, or no per-user TMPDIR on macOS. Without these a session
+        // started from the person's login is invisible to the scan that looks for a split.
+        #[cfg(target_os = "linux")]
+        push(
+            PathBuf::from("/run/user")
+                .join(UID.to_string())
+                .join("zellij"),
+        );
+        #[cfg(target_os = "macos")]
+        if let Some(user_temp) = darwin_user_temp_dir() {
+            push(user_temp.join(format!("{}-{}", crate::distribution::name(), *UID)));
+        }
         candidates
+    }
+
+    /// fork addition: the per-user temporary directory macOS gives a login (`$TMPDIR` there),
+    /// read from the system rather than from the environment, so a shell without `TMPDIR` can
+    /// still name it.
+    #[cfg(target_os = "macos")]
+    fn darwin_user_temp_dir() -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0 as libc::c_char; 1024];
+        // SAFETY: the buffer is writable for its whole length, and confstr writes at most that
+        // many bytes, NUL included
+        let needed =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+        if needed == 0 || needed > buf.len() {
+            return None;
+        }
+        let bytes: Vec<u8> = buf[..needed - 1].iter().map(|c| *c as u8).collect();
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        path.is_absolute().then_some(path)
     }
 }
 

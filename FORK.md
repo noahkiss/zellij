@@ -5027,6 +5027,45 @@ plugin API.
 
 Capability: `list-agents-all-sessions`.
 
+#### An empty answer means no session, not the wrong socket dir
+
+```
+$ env -u XDG_RUNTIME_DIR zellij action list-agents --all-sessions --json
+looked for sessions in /tmp/zellij-1000/contract_version_1, but 2 live session(s) answer in /run/user/1000/zellij/contract_version_1: this shell resolves a different socket dir than the one they were started from
+$ echo $?
+2
+```
+
+`--all-sessions` printed `[]` and exited 0 wherever the socket dir resolved wrongly: on Linux with
+no `XDG_RUNTIME_DIR` (cron, a bare ssh command), on macOS with no per-user `TMPDIR`. A hook, the
+fleet overview or a status bar could not tell that from "no agents".
+
+A missing socket dir is not the signal. A machine that has just booted has none until its first
+server starts: on Linux `$XDG_RUNTIME_DIR` is a fresh tmpfs, so `<runtime>/zellij` is absent, and
+the pollers must keep reading `[]` with exit 0 there. So the listing, when it found no session,
+asks two questions:
+
+| Found | Answer |
+|---|---|
+| no session, and nothing below | `[]` (or the header), exit 0, as before |
+| the directory the root lives in does not exist (an `XDG_RUNTIME_DIR` or `TMPDIR` naming nothing) | one line on stderr, nothing on stdout, exit 2 |
+| live sessions answer under another candidate root | one line on stderr naming both dirs, nothing on stdout, exit 2 |
+| the socket dir exists but cannot be read | one line on stderr, exit 2 |
+
+An explicit `ZELLIJ_SOCKET_DIR` is trusted and never earns exit 2: it is how a scratch environment
+is made, and the first server there creates its directory.
+
+The candidate roots gain the ones a login would have resolved to: `/run/user/<uid>/zellij` on Linux,
+and on macOS the per-user temporary dir read from the system (`confstr(_CS_DARWIN_USER_TEMP_DIR)`),
+not from `TMPDIR`. They also feed the existing split warnings of `ls` and `attach`. The note never
+names `--all-sessions`: the fleet overview reads an exit 2 that names it as an older build.
+
+Plain `list-agents` without `--all-sessions` already exited 2 with no session to ask.
+
+`socket_dir_misresolved` and `misresolved_note` in `zellij-utils/src/sessions.rs`, the candidates in
+`zellij-utils/src/consts.rs` (`socket_dir_candidates`), the check in `src/commands.rs`. Tests in
+`sessions.rs`. No contract change.
+
 ### `zellij action watch`: the session pushes its changes
 
 ```
