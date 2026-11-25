@@ -5199,8 +5199,8 @@ stream and the process is the session, so one missed pane would corrupt the firs
 second. A child process also maps the fork's exit convention straight through - **0 a result, 1 an
 error, 2 a miss** - which is what lets `zellij_create` be honest: a pane that was not made reports
 the CLI's own refusal, and there is no id anywhere for it to invent. What cannot be undone lives in
-`zellij_close`, where `close_pane` passes the `--yes` the CLI would otherwise refuse to run without
-and `close_tab` has no confirmation to pass.
+`zellij_close`, where closing a pane passes the `--yes` the CLI would otherwise refuse to run
+without and closing a tab has no confirmation to pass.
 
 Which session a call is about: the tool's own `session`, else `ZELLIJ_SESSION_NAME` in the server's
 environment.
@@ -5276,6 +5276,8 @@ agents left it out or wrote `close`: five refusals in sixty-two calls, each for 
 already settled it. `operation` is now optional. `pane` alone closes that pane, `tab` alone that
 tab, and `operation: close` reads the same way. The tool cannot be undone, so it guesses no further:
 both targets, or neither, without a named operation is refused with a line that says so.
+The schema no longer lists `operation` at all: `pane` or `tab` decides. A client with a cached
+schema that still sends a valid one keeps working, and the call does not list it as ignored.
 
 **A parameter a tool does not take is named in the answer (nkmk.47).** The schemas say
 `additionalProperties: false`, but a client need not check it, and the server dropped an unknown

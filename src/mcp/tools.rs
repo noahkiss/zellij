@@ -631,28 +631,20 @@ pub const TOOLS: &[ToolSpec] = &[
         not_for: "a pane somebody else made. Closing a tab closes every pane in it.",
         follow_up: Some("zellij_overview to see what the session has left"),
         reports: &["action close-pane", "action close-tab-by-id"],
-        tips: "close_pane passes the `--yes` a person at a terminal would have to type. close_tab \
+        tips: "Pass pane or tab, not both: pane closes that pane, tab closes that tab. Closing a \
+               pane passes the `--yes` a person at a terminal would have to type. Closing a tab \
                has no confirmation to pass and takes every pane in the tab with it. Both are \
                final. Closing a pane whose command failed is the right move - do not leave it \
                behind and create a second one.",
         params: &[
             SESSION,
             ParamSpec {
-                name: "operation",
-                kind: ParamKind::Enum(&["close_pane", "close_tab"]),
-                required: false,
-                from: None,
-                describe: "What to close. Leave it out: pane alone closes that pane, and tab \
-                           alone that tab. close_pane takes pane; close_tab takes tab.",
-                default: None,
-            },
-            ParamSpec {
                 name: "pane",
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action close-pane", "--pane-id")),
                 describe: "The pane to close: its handle, like sunny-otter, or terminal_1, \
-                           plugin_2, a bare integer or a pane uuid.",
+                           plugin_2, a bare integer or a pane uuid. Not with tab.",
                 default: None,
             },
             ParamSpec {
@@ -661,7 +653,7 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action close-tab-by-id", "id")),
                 describe: "The tab to close, by the stable id zellij_overview prints - not its \
-                           1-based display position.",
+                           1-based display position. Closes every pane in it. Not with pane.",
                 default: None,
             },
         ],
@@ -677,6 +669,8 @@ pub const TOOLS: &[ToolSpec] = &[
 pub const UNLISTED: &[(&str, &str)] = &[
     // refused by name: `floating` was removed, and the refusal says what to use instead
     ("zellij_create", "floating"),
+    // the target says what to close; a client with a cached schema still sends `operation`
+    ("zellij_close", "operation"),
 ];
 
 /// The parameters of a call that its tool does not take, in the order they were given.
@@ -1158,6 +1152,16 @@ mod tests {
         assert!(ignored_parameters("zellij_overview", &given(json!({"session": "w"}))).is_empty());
         let schema = output_schema();
         assert_eq!(schema["properties"]["ignored"]["type"], json!("array"));
+    }
+
+    #[test]
+    fn close_offers_no_operation_and_still_reads_one_quietly() {
+        let close = tool_spec("zellij_close").expect("a tool");
+        let schema = input_schema(close);
+        assert!(schema["properties"].get("operation").is_none());
+        // an old client's cached schema still sends it, and it is not reported as ignored
+        let given = json!({"operation": "close_pane", "pane": "sunny-otter"});
+        assert!(ignored_parameters("zellij_close", given.as_object().unwrap()).is_empty());
     }
 
     #[test]
