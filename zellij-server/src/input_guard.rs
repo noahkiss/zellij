@@ -117,6 +117,37 @@ pub struct InputGuards {
     guards: HashMap<ClientId, Guard>,
     /// Buttons whose press was dropped and whose release has not come yet, per client.
     dropped_presses: HashMap<ClientId, HashSet<Button>>,
+    /// Friendly focus: `focus_wait_idle` and `focus_wait_max`, in milliseconds.
+    wait_idle_ms: u64,
+    wait_max_ms: u64,
+    /// When each client's person last pressed a key, clicked or scrolled.
+    last_input: HashMap<ClientId, Instant>,
+    /// The focus change waiting for each client's person to pause.
+    pending: HashMap<ClientId, Pending>,
+    next_generation: u64,
+}
+
+/// An agent's focus change waiting for a client's person to pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pending {
+    /// Which deferral this is; a later one for the same client replaces it.
+    pub generation: u64,
+    /// The pane the agent's CLI ran in, which keys its virtual focus.
+    pub caller_pane: Option<u32>,
+    /// The pane the change will focus, when that is known before it applies.
+    pub target: Option<PaneId>,
+    since: Instant,
+}
+
+/// What a waiting focus change should do now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingState {
+    /// Replaced by a later change, or dropped with its client: do nothing.
+    Gone,
+    /// The person is still typing: keep waiting.
+    Wait,
+    /// The person paused, or the wait ran out: apply it.
+    Apply,
 }
 
 impl Default for InputGuards {
@@ -126,6 +157,11 @@ impl Default for InputGuards {
             typing: Typing::default(),
             guards: HashMap::new(),
             dropped_presses: HashMap::new(),
+            wait_idle_ms: zellij_utils::focus_wait::DEFAULT_IDLE_MS,
+            wait_max_ms: zellij_utils::focus_wait::DEFAULT_MAX_MS,
+            last_input: HashMap::new(),
+            pending: HashMap::new(),
+            next_generation: 0,
         }
     }
 }
@@ -140,6 +176,109 @@ impl InputGuards {
             self.guards.clear();
             self.dropped_presses.clear();
         }
+    }
+
+    /// The config's `focus_wait_idle` and `focus_wait_max`, in milliseconds. Either at zero
+    /// turns the wait off; a change already waiting then applies at its next look.
+    pub fn configure_focus_wait(&mut self, idle_ms: u64, max_ms: u64) {
+        self.wait_idle_ms = idle_ms;
+        self.wait_max_ms = max_ms;
+    }
+
+    /// Whether an agent's focus change waits at all. Off, it applies at once: the old path.
+    pub fn focus_waits(&self) -> bool {
+        self.wait_idle_ms > 0 && self.wait_max_ms > 0
+    }
+
+    /// The person at `client_id` pressed a key, clicked or scrolled.
+    pub fn note_person_input(&mut self, client_id: ClientId, now: Instant) {
+        self.last_input.insert(client_id, now);
+    }
+
+    /// Whether an agent's focus change for `client_id` waits now: the wait is on and the person
+    /// typed within `focus_wait_idle`.
+    pub fn should_wait(&self, client_id: ClientId, now: Instant) -> bool {
+        self.focus_waits()
+            && self.last_input.get(&client_id).map_or(false, |last| {
+                now.saturating_duration_since(*last) < Duration::from_millis(self.wait_idle_ms)
+            })
+    }
+
+    /// Hold an agent's focus change for `client_id` until its person pauses. A change already
+    /// waiting for that client is replaced. Returns the generation to ask [`Self::pending_state`]
+    /// about.
+    pub fn defer(
+        &mut self,
+        client_id: ClientId,
+        caller_pane: Option<u32>,
+        target: Option<PaneId>,
+        now: Instant,
+    ) -> u64 {
+        self.next_generation += 1;
+        self.pending.insert(
+            client_id,
+            Pending {
+                generation: self.next_generation,
+                caller_pane,
+                target,
+                since: now,
+            },
+        );
+        self.next_generation
+    }
+
+    /// What the waiting change `generation` for `client_id` should do at `now`. `Apply` takes it
+    /// off the list. Fail open: the wait always ends by `focus_wait_max`, and a wait turned off
+    /// meanwhile applies at once.
+    pub fn pending_state(
+        &mut self,
+        client_id: ClientId,
+        generation: u64,
+        now: Instant,
+    ) -> PendingState {
+        let Some(pending) = self.pending.get(&client_id) else {
+            return PendingState::Gone;
+        };
+        if pending.generation != generation {
+            return PendingState::Gone;
+        }
+        let waited = now.saturating_duration_since(pending.since);
+        if !self.should_wait(client_id, now) || waited >= Duration::from_millis(self.wait_max_ms) {
+            self.pending.remove(&client_id);
+            return PendingState::Apply;
+        }
+        PendingState::Wait
+    }
+
+    /// The pane a held change will focus, learnt once its create said what it made.
+    pub fn set_pending_target(&mut self, client_id: ClientId, generation: u64, target: PaneId) {
+        if let Some(pending) = self.pending.get_mut(&client_id) {
+            if pending.generation == generation {
+                pending.target = Some(target);
+            }
+        }
+    }
+
+    /// Drop a held change that turned out to have nothing to focus.
+    pub fn drop_pending(&mut self, client_id: ClientId, generation: u64) {
+        if self
+            .pending
+            .get(&client_id)
+            .map_or(false, |pending| pending.generation == generation)
+        {
+            self.pending.remove(&client_id);
+        }
+    }
+
+    /// The virtual focus of the agent whose CLI runs in `caller_pane`: while a change it asked
+    /// for waits, `Some(target)` - the pane its implicit "focused pane" writes go to, or `None`
+    /// when that pane is not known until the change applies. `None` when nothing of it waits.
+    pub fn virtual_focus(&self, caller_pane: u32) -> Option<Option<PaneId>> {
+        self.pending
+            .values()
+            .filter(|pending| pending.caller_pane == Some(caller_pane))
+            .max_by_key(|pending| pending.generation)
+            .map(|pending| pending.target)
     }
 
     /// Whether the guard is on at all. Off, every caller takes the old path.
@@ -236,6 +375,8 @@ impl InputGuards {
     pub fn forget_client(&mut self, client_id: ClientId) {
         self.guards.remove(&client_id);
         self.dropped_presses.remove(&client_id);
+        self.last_input.remove(&client_id);
+        self.pending.remove(&client_id);
     }
 
     /// The client's focus is now on `focused_now`. A guard whose pane that is not was overtaken
@@ -576,6 +717,94 @@ mod tests {
         assert!(guards.any_active(t0 + ms(10)));
         assert!(guards.markers(t0 + ms(600)).is_empty());
         assert!(!guards.any_active(t0 + ms(600)));
+    }
+
+    #[test]
+    fn a_focus_change_waits_only_while_the_person_types() {
+        let t0 = Instant::now();
+        let mut guards = InputGuards::default();
+        // nobody typed: no wait
+        assert!(!guards.should_wait(ME, t0));
+        guards.note_person_input(ME, t0);
+        assert!(guards.should_wait(ME, t0 + ms(1_999)));
+        assert!(!guards.should_wait(ME, t0 + ms(2_000)));
+    }
+
+    #[test]
+    fn a_waiting_change_applies_at_the_pause() {
+        let t0 = Instant::now();
+        let mut guards = InputGuards::default();
+        guards.note_person_input(ME, t0);
+        let generation = guards.defer(ME, Some(5), Some(NEW), t0);
+        assert_eq!(guards.virtual_focus(5), Some(Some(NEW)));
+        assert_eq!(guards.virtual_focus(6), None);
+        // typing goes on: it waits
+        guards.note_person_input(ME, t0 + ms(1_500));
+        assert_eq!(
+            guards.pending_state(ME, generation, t0 + ms(3_000)),
+            PendingState::Wait
+        );
+        assert_eq!(
+            guards.pending_state(ME, generation, t0 + ms(3_500)),
+            PendingState::Apply
+        );
+        assert_eq!(guards.virtual_focus(5), None, "applied: no virtual focus");
+        assert_eq!(
+            guards.pending_state(ME, generation, t0 + ms(3_600)),
+            PendingState::Gone
+        );
+    }
+
+    #[test]
+    fn a_waiting_change_applies_after_focus_wait_max_however_much_the_person_types() {
+        let t0 = Instant::now();
+        let mut guards = InputGuards::default();
+        guards.configure_focus_wait(2_000, 10_000);
+        let generation = guards.defer(ME, None, None, t0);
+        let mut at = t0;
+        let mut state = PendingState::Wait;
+        while state == PendingState::Wait {
+            at += ms(500);
+            guards.note_person_input(ME, at);
+            state = guards.pending_state(ME, generation, at);
+            assert!(at <= t0 + ms(10_000), "never stuck");
+        }
+        assert_eq!(state, PendingState::Apply);
+        assert_eq!(at, t0 + ms(10_000));
+    }
+
+    #[test]
+    fn a_later_change_replaces_a_waiting_one_and_leaving_drops_it() {
+        let t0 = Instant::now();
+        let mut guards = InputGuards::default();
+        guards.note_person_input(ME, t0);
+        let first = guards.defer(ME, Some(5), Some(OLD), t0);
+        let second = guards.defer(ME, Some(5), Some(NEW), t0);
+        assert_eq!(guards.pending_state(ME, first, t0), PendingState::Gone);
+        assert_eq!(guards.virtual_focus(5), Some(Some(NEW)));
+        guards.forget_client(ME);
+        assert_eq!(guards.pending_state(ME, second, t0), PendingState::Gone);
+        assert_eq!(guards.virtual_focus(5), None);
+    }
+
+    #[test]
+    fn a_zero_wait_takes_the_old_path() {
+        let t0 = Instant::now();
+        let mut guards = InputGuards::default();
+        guards.note_person_input(ME, t0);
+        for (idle, max) in [(0, 300_000), (2_000, 0)] {
+            guards.configure_focus_wait(idle, max);
+            assert!(!guards.focus_waits());
+            assert!(!guards.should_wait(ME, t0));
+        }
+        // and a change already waiting applies at its next look
+        guards.configure_focus_wait(2_000, 300_000);
+        let generation = guards.defer(ME, None, None, t0);
+        guards.configure_focus_wait(0, 300_000);
+        assert_eq!(
+            guards.pending_state(ME, generation, t0),
+            PendingState::Apply
+        );
     }
 
     #[test]

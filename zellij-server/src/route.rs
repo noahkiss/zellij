@@ -408,6 +408,7 @@ pub(crate) fn route_action(
         is_cli_client,
         None,
         None,
+        Vec::new(),
     )
 }
 
@@ -454,7 +455,380 @@ pub(crate) fn route_bound_mouse_action(
         false,
         origin_pane_id,
         None,
+        Vec::new(),
     )
+}
+
+/// fork addition: the report line of a focus change an agent asked for that waits for the person.
+const FOCUS_PENDING: &str = "focus: pending";
+/// fork addition: the report line of a focus change an agent asked for that moved the focus now.
+const FOCUS_APPLIED: &str = "focus: applied";
+
+/// fork addition: what an agent's call does to the person's focus - see friendly focus in
+/// `crate::input_guard`.
+#[derive(Debug, Clone, PartialEq)]
+enum FocusPlan {
+    /// It does not move the focus.
+    Unaffected,
+    /// It only moves the focus: the whole call waits. `target` is the pane it focuses, when
+    /// that is known before it runs.
+    Move { target: Option<PaneId> },
+    /// It makes a pane or tab and focuses it: `now`, the same call without focus, runs at once,
+    /// and the focus move waits.
+    Create { now: Action, then: FocusAfter },
+}
+
+/// What a create's focus move is, once the create has said what it made.
+#[derive(Debug, Clone, PartialEq)]
+enum FocusAfter {
+    Pane,
+    Tab,
+    TabName(String),
+}
+
+impl FocusAfter {
+    /// The call that brings what was made to the front, and the pane it focuses, when known.
+    fn focus_action(&self, result: &ActionCompletionResult) -> Option<(Action, Option<PaneId>)> {
+        match self {
+            FocusAfter::Pane => result.affected_pane_id.map(|pane_id| {
+                (
+                    Action::FocusPaneByPaneId {
+                        pane_id: pane_id.into(),
+                        no_focus: false,
+                    },
+                    Some(pane_id),
+                )
+            }),
+            FocusAfter::Tab => result
+                .affected_tab_id
+                .map(|id| (Action::GoToTabById { id: id as u64 }, None)),
+            FocusAfter::TabName(name) => Some((
+                Action::GoToTabName {
+                    name: name.clone(),
+                    create: false,
+                    no_focus: false,
+                },
+                None,
+            )),
+        }
+    }
+}
+
+/// The verbs friendly focus holds: focus-pane-id, go-to-tab, go-to-tab-by-id, go-to-tab-name
+/// (with --create, the create runs now), move-focus, and a new pane, tab, run or plugin made
+/// with focus. Anything else - and a probe or create with --no-focus - is unaffected.
+fn focus_plan(action: &Action) -> FocusPlan {
+    let create = |now: Action| FocusPlan::Create {
+        now,
+        then: FocusAfter::Pane,
+    };
+    match action.clone() {
+        Action::FocusPaneByPaneId {
+            pane_id,
+            no_focus: false,
+        } => FocusPlan::Move {
+            target: Some(pane_id.into()),
+        },
+        Action::FocusTerminalPaneWithId { pane_id, .. } => FocusPlan::Move {
+            target: Some(PaneId::Terminal(pane_id)),
+        },
+        Action::FocusPluginPaneWithId { pane_id, .. } => FocusPlan::Move {
+            target: Some(PaneId::Plugin(pane_id)),
+        },
+        Action::GoToTab { .. } | Action::GoToTabById { .. } | Action::MoveFocus { .. } => {
+            FocusPlan::Move { target: None }
+        },
+        Action::GoToTabName {
+            create: false,
+            no_focus: false,
+            ..
+        } => FocusPlan::Move { target: None },
+        Action::GoToTabName {
+            name,
+            create: true,
+            no_focus: false,
+        } => FocusPlan::Create {
+            now: Action::GoToTabName {
+                name: name.clone(),
+                create: true,
+                no_focus: true,
+            },
+            then: FocusAfter::TabName(name),
+        },
+        Action::NewTiledPane {
+            no_focus: false,
+            direction,
+            command,
+            pane_name,
+            near_current_pane,
+            borderless,
+            border_style,
+            tab_id,
+        } => create(Action::NewTiledPane {
+            no_focus: true,
+            direction,
+            command,
+            pane_name,
+            near_current_pane,
+            borderless,
+            border_style,
+            tab_id,
+        }),
+        Action::NewFloatingPane {
+            no_focus: false,
+            command,
+            pane_name,
+            coordinates,
+            near_current_pane,
+            tab_id,
+        } => create(Action::NewFloatingPane {
+            no_focus: true,
+            command,
+            pane_name,
+            coordinates,
+            near_current_pane,
+            tab_id,
+        }),
+        Action::NewStackedPane {
+            no_focus: false,
+            command,
+            pane_name,
+            near_current_pane,
+            tab_id,
+        } => create(Action::NewStackedPane {
+            no_focus: true,
+            command,
+            pane_name,
+            near_current_pane,
+            tab_id,
+        }),
+        Action::NewShellPane {
+            no_focus: false,
+            placement,
+            pane_name,
+            cwd,
+            near_current_pane,
+            tab_id,
+        } => create(Action::NewShellPane {
+            no_focus: true,
+            placement,
+            pane_name,
+            cwd,
+            near_current_pane,
+            tab_id,
+        }),
+        Action::Run {
+            no_focus: false,
+            command,
+            near_current_pane,
+        } => create(Action::Run {
+            no_focus: true,
+            command,
+            near_current_pane,
+        }),
+        Action::LaunchPlugin {
+            no_focus: false,
+            plugin,
+            should_float,
+            should_open_in_place: false,
+            close_replaced_pane,
+            skip_cache,
+            cwd,
+            tab_id,
+        } => create(Action::LaunchPlugin {
+            no_focus: true,
+            plugin,
+            should_float,
+            should_open_in_place: false,
+            close_replaced_pane,
+            skip_cache,
+            cwd,
+            tab_id,
+        }),
+        Action::NewTab {
+            should_change_focus_to_new_tab: true,
+            tiled_layout,
+            floating_layouts,
+            swap_tiled_layouts,
+            swap_floating_layouts,
+            tab_name,
+            cwd,
+            initial_panes,
+            first_pane_unblock_condition,
+        } => FocusPlan::Create {
+            now: Action::NewTab {
+                should_change_focus_to_new_tab: false,
+                tiled_layout,
+                floating_layouts,
+                swap_tiled_layouts,
+                swap_floating_layouts,
+                tab_name,
+                cwd,
+                initial_panes,
+                first_pane_unblock_condition,
+            },
+            then: FocusAfter::Tab,
+        },
+        _ => FocusPlan::Unaffected,
+    }
+}
+
+/// fork addition: whether an attached client's action is the person at work - a key, a paste,
+/// a click or the wheel. A hover is not: friendly focus waits for typing, not for a resting mouse.
+fn is_person_activity(action: &Action) -> bool {
+    match action {
+        Action::MouseEvent { event } => {
+            event.event_type != zellij_utils::input::mouse::MouseEventType::Motion
+                || event.left
+                || event.right
+                || event.middle
+        },
+        Action::Write { .. } | Action::WriteChars { .. } | Action::Paste { .. } => true,
+        _ => false,
+    }
+}
+
+/// fork addition: a CLI caller's write with no target, while a focus change its pane asked for
+/// waits: to the pane it asked for, at once. When that pane is not known until the change applies
+/// (a tab), the write is refused rather than sent to the person's pane. A caller with no pane
+/// (`ZELLIJ_PANE_ID` unset) has no virtual focus: its writes go where they always went.
+fn with_virtual_focus(
+    action: Action,
+    caller: zellij_utils::ipc::ActionCaller,
+    input_guards: &crate::input_guard::SharedInputGuards,
+) -> std::result::Result<Action, String> {
+    let Some(caller_pane) = caller.pane else {
+        return Ok(action);
+    };
+    let targets_focus = matches!(
+        action,
+        Action::Write { .. } | Action::WriteChars { .. } | Action::Paste { pane_id: None, .. }
+    );
+    if !targets_focus {
+        return Ok(action);
+    }
+    let Some(virtual_focus) = input_guards
+        .lock()
+        .ok()
+        .and_then(|guards| guards.virtual_focus(caller_pane))
+    else {
+        return Ok(action);
+    };
+    let Some(target) = virtual_focus else {
+        return Err(
+            "The focus change this pane asked for is waiting for the person to pause, and the \
+             pane it will focus is not known yet. Name the pane: --pane-id <id or handle>."
+                .to_owned(),
+        );
+    };
+    let pane_id: zellij_utils::data::PaneId = target.into();
+    Ok(match action {
+        Action::Write { bytes, .. } => Action::WriteToPaneId { bytes, pane_id },
+        Action::WriteChars { chars } => Action::WriteCharsToPaneId { chars, pane_id },
+        Action::Paste { chars, .. } => Action::Paste {
+            chars,
+            pane_id: Some(pane_id),
+        },
+        action => action,
+    })
+}
+
+/// fork addition: what it takes to apply a held focus change later, off the caller's connection.
+struct FocusWaiter {
+    guards: crate::input_guard::SharedInputGuards,
+    client_id: ClientId,
+    caller_pane: Option<u32>,
+    senders: ThreadSenders,
+    default_shell: Option<TerminalAction>,
+    default_mode: InputMode,
+}
+
+impl FocusWaiter {
+    /// Hold a focus change for the client; its target, if known, is the caller's virtual focus.
+    fn hold(&self, target: Option<PaneId>) -> u64 {
+        self.guards.lock().map_or(0, |mut guards| {
+            guards.defer(
+                self.client_id,
+                self.caller_pane,
+                target,
+                std::time::Instant::now(),
+            )
+        })
+    }
+
+    /// A hold whose create made nothing: drop it.
+    fn release(&self, generation: u64) {
+        if let Ok(mut guards) = self.guards.lock() {
+            guards.drop_pending(self.client_id, generation);
+        }
+    }
+
+    fn wait_then_route(self, action: Action, target: Option<PaneId>) {
+        let generation = self.hold(target);
+        self.wait_then_route_held(generation, action, target);
+    }
+
+    /// Apply `action` once the person pauses, or when `focus_wait_max` runs out - on a thread of
+    /// its own, so the caller is answered at once. The change goes through the input guard like
+    /// any agent move.
+    fn wait_then_route_held(self, generation: u64, action: Action, target: Option<PaneId>) {
+        if let (Some(target), Ok(mut guards)) = (target, self.guards.lock()) {
+            guards.set_pending_target(self.client_id, generation, target);
+        }
+        let spawned = thread::Builder::new()
+            .name("focus_wait".to_owned())
+            .spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_millis(100));
+                    let state = self.guards.lock().map_or(
+                        crate::input_guard::PendingState::Apply,
+                        |mut guards| {
+                            guards.pending_state(
+                                self.client_id,
+                                generation,
+                                std::time::Instant::now(),
+                            )
+                        },
+                    );
+                    match state {
+                        crate::input_guard::PendingState::Gone => return,
+                        crate::input_guard::PendingState::Wait => continue,
+                        crate::input_guard::PendingState::Apply => break,
+                    }
+                }
+                // a token no CLI connection is likely to have, for the guard's bracket
+                let token = ClientId::MAX - (generation % 1024) as ClientId;
+                let bracket = person_input_guard(&self.guards).is_some();
+                if bracket {
+                    let _ = self
+                        .senders
+                        .send_to_screen(ScreenInstruction::InputGuardSnapshot(token));
+                }
+                let _ = route_action_with_origin(
+                    action,
+                    self.client_id,
+                    None,
+                    None,
+                    self.senders.clone(),
+                    self.default_shell,
+                    None,
+                    self.default_mode,
+                    None,
+                    true,
+                    None,
+                    None,
+                    Vec::new(),
+                );
+                if bracket {
+                    let _ = self
+                        .senders
+                        .send_to_screen(ScreenInstruction::InputGuardArm(token));
+                }
+            });
+        if spawned.is_err() {
+            log::error!("friendly focus: could not start the wait; the focus change is dropped");
+        }
+    }
 }
 
 fn route_action_with_origin(
@@ -470,6 +844,7 @@ fn route_action_with_origin(
     is_cli_client: bool,
     origin_pane_id: Option<PaneId>,
     person_guard: Option<crate::input_guard::SharedInputGuards>,
+    report_tail: Vec<String>,
 ) -> Result<(bool, Option<ActionCompletionResult>)> {
     let mut should_break = false;
     let err_context = || format!("failed to route action for client {client_id}");
@@ -3256,7 +3631,10 @@ fn route_action_with_origin(
     } else if let Some(cli_client_id) = cli_client_id {
         // the report is only built for a CLI client: a plugin reads the ids off the result itself,
         // and the handle lookup below is a question worth asking only when someone will read it
-        let report = cli_report(&result, &id_keys, &senders);
+        let mut report = cli_report(&result, &id_keys, &senders);
+        // fork addition: friendly focus says whether the focus moved (`focus: applied`) or
+        // waits for the person (`focus: pending`), in the same report
+        report.extend(report_tail);
         if let Some(ref os_input) = os_input {
             if !report.is_empty() {
                 let _ = os_input
@@ -3629,6 +4007,12 @@ pub(crate) fn route_thread_main(
                                     .unwrap()
                                     .as_ref()
                                     .map(|s| s.input_guards.clone());
+                                // friendly focus measures the person's pause from here
+                                if let Some(Ok(mut guards)) =
+                                    input_guards.as_ref().map(|guards| guards.lock())
+                                {
+                                    guards.note_person_input(client_id, std::time::Instant::now());
+                                }
                                 let person_guard =
                                     input_guards.as_ref().and_then(person_input_guard);
                                 let routes_only = key_actions
@@ -3739,6 +4123,7 @@ pub(crate) fn route_thread_main(
                                         false,
                                         origin_pane_id,
                                         person_guard.clone(),
+                                        Vec::new(),
                                     ) {
                                         Ok(route_action_should_break) => {
                                             if route_action_should_break.0 {
@@ -3854,33 +4239,147 @@ pub(crate) fn route_thread_main(
                                         return Ok(should_break);
                                     }
                                 }
-                                let agent_call = is_cli_client
-                                    && caller.agent
-                                    && person_input_guard(&input_guards).is_some();
-                                if agent_call {
-                                    let _ = senders.send_to_screen(
-                                        ScreenInstruction::InputGuardSnapshot(cli_client_id),
-                                    );
+                                if !is_cli_client && is_person_activity(&action) {
+                                    if let Ok(mut guards) = input_guards.lock() {
+                                        guards.note_person_input(
+                                            client_id,
+                                            std::time::Instant::now(),
+                                        );
+                                    }
                                 }
-                                let routed = route_action_with_origin(
-                                    action,
+                                // fork addition: friendly focus. While a focus change this
+                                // caller's pane asked for waits, its writes with no target go
+                                // to the pane it asked for - never to the person's pane
+                                let action = if is_cli_client {
+                                    match with_virtual_focus(action, caller, &input_guards) {
+                                        Ok(action) => action,
+                                        Err(refusal) => {
+                                            let _ = os_input.send_to_client(
+                                                cli_client_id,
+                                                ServerToClientMsg::LogError {
+                                                    lines: vec![refusal],
+                                                },
+                                            );
+                                            return Ok(should_break);
+                                        },
+                                    }
+                                } else {
+                                    action
+                                };
+                                let agent_call = is_cli_client && caller.agent;
+                                let plan = if agent_call {
+                                    focus_plan(&action)
+                                } else {
+                                    FocusPlan::Unaffected
+                                };
+                                let waits = !caller.now
+                                    && !matches!(plan, FocusPlan::Unaffected)
+                                    && input_guards.lock().map_or(false, |guards| {
+                                        guards.should_wait(client_id, std::time::Instant::now())
+                                    });
+                                let bracket =
+                                    agent_call && person_input_guard(&input_guards).is_some();
+                                let waiter = FocusWaiter {
+                                    guards: input_guards.clone(),
                                     client_id,
-                                    Some(cli_client_id),
-                                    maybe_pane_id.map(|p| PaneId::Terminal(p)),
-                                    senders.clone(),
-                                    default_shell,
-                                    Some(&mut seen_cli_pipes),
-                                    client_input_mode,
-                                    Some(os_input.clone()),
-                                    is_cli_client,
-                                    None,
-                                    person_guard,
-                                );
-                                if agent_call {
-                                    let _ = senders.send_to_screen(
-                                        ScreenInstruction::InputGuardArm(cli_client_id),
-                                    );
-                                }
+                                    caller_pane: caller.pane,
+                                    senders: senders.clone(),
+                                    default_shell: default_shell.clone(),
+                                    default_mode: client_input_mode,
+                                };
+                                let routed = match plan {
+                                    FocusPlan::Move { target } if waits => {
+                                        waiter.wait_then_route(action, target);
+                                        let _ = os_input.send_to_client(
+                                            cli_client_id,
+                                            ServerToClientMsg::Log {
+                                                lines: vec![FOCUS_PENDING.to_owned()],
+                                            },
+                                        );
+                                        Ok((false, None))
+                                    },
+                                    FocusPlan::Create { now, then } if waits => {
+                                        // the pane or tab is made at once, in the background;
+                                        // only bringing it to the front waits
+                                        let generation = waiter.hold(None);
+                                        if bracket {
+                                            let _ = senders.send_to_screen(
+                                                ScreenInstruction::InputGuardSnapshot(
+                                                    cli_client_id,
+                                                ),
+                                            );
+                                        }
+                                        let routed = route_action_with_origin(
+                                            now,
+                                            client_id,
+                                            Some(cli_client_id),
+                                            maybe_pane_id.map(|p| PaneId::Terminal(p)),
+                                            senders.clone(),
+                                            default_shell,
+                                            Some(&mut seen_cli_pipes),
+                                            client_input_mode,
+                                            Some(os_input.clone()),
+                                            is_cli_client,
+                                            None,
+                                            None,
+                                            vec![FOCUS_PENDING.to_owned()],
+                                        );
+                                        if bracket {
+                                            let _ = senders.send_to_screen(
+                                                ScreenInstruction::InputGuardArm(cli_client_id),
+                                            );
+                                        }
+                                        let focus = routed
+                                            .as_ref()
+                                            .ok()
+                                            .and_then(|(_, result)| result.as_ref())
+                                            .filter(|result| result.error_message.is_none())
+                                            .and_then(|result| then.focus_action(result));
+                                        match focus {
+                                            Some((focus, target)) => {
+                                                waiter.wait_then_route_held(
+                                                    generation, focus, target,
+                                                )
+                                            },
+                                            None => waiter.release(generation),
+                                        }
+                                        routed
+                                    },
+                                    plan => {
+                                        if bracket {
+                                            let _ = senders.send_to_screen(
+                                                ScreenInstruction::InputGuardSnapshot(
+                                                    cli_client_id,
+                                                ),
+                                            );
+                                        }
+                                        let report_tail = match plan {
+                                            FocusPlan::Unaffected => Vec::new(),
+                                            _ => vec![FOCUS_APPLIED.to_owned()],
+                                        };
+                                        let routed = route_action_with_origin(
+                                            action,
+                                            client_id,
+                                            Some(cli_client_id),
+                                            maybe_pane_id.map(|p| PaneId::Terminal(p)),
+                                            senders.clone(),
+                                            default_shell,
+                                            Some(&mut seen_cli_pipes),
+                                            client_input_mode,
+                                            Some(os_input.clone()),
+                                            is_cli_client,
+                                            None,
+                                            person_guard,
+                                            report_tail,
+                                        );
+                                        if bracket {
+                                            let _ = senders.send_to_screen(
+                                                ScreenInstruction::InputGuardArm(cli_client_id),
+                                            );
+                                        }
+                                        routed
+                                    },
+                                };
                                 match routed {
                                     Ok(route_action_should_break) => {
                                         if route_action_should_break.0 {
@@ -5662,6 +6161,7 @@ mod tests {
                     false,
                     None,
                     person_guard,
+                    Vec::new(),
                 );
             });
             let instruction = loop {
@@ -5691,5 +6191,169 @@ mod tests {
             .configure(0, crate::input_guard::Typing::Previous);
         assert!(person_input_guard(&guards).is_none());
         assert_eq!(sent(&guards), "WriteCharacter");
+    }
+
+    /// fork addition: friendly focus holds the verbs that move the person's focus, and runs a
+    /// create at once without focus.
+    #[test]
+    fn focus_plan_holds_focus_moves_and_runs_creates_now_without_focus() {
+        use zellij_utils::data::PaneId as UtilsPaneId;
+        assert_eq!(
+            focus_plan(&Action::FocusPaneByPaneId {
+                pane_id: UtilsPaneId::Terminal(3),
+                no_focus: false,
+            }),
+            FocusPlan::Move {
+                target: Some(PaneId::Terminal(3))
+            }
+        );
+        // the probe moves nothing
+        assert_eq!(
+            focus_plan(&Action::FocusPaneByPaneId {
+                pane_id: UtilsPaneId::Terminal(3),
+                no_focus: true,
+            }),
+            FocusPlan::Unaffected
+        );
+        for action in [
+            Action::GoToTab { index: 2 },
+            Action::GoToTabById { id: 4 },
+            Action::MoveFocus {
+                direction: zellij_utils::data::Direction::Left,
+            },
+            Action::GoToTabName {
+                name: "x".to_owned(),
+                create: false,
+                no_focus: false,
+            },
+        ] {
+            assert_eq!(
+                focus_plan(&action),
+                FocusPlan::Move { target: None },
+                "{:?}",
+                action
+            );
+        }
+        assert_eq!(
+            focus_plan(&Action::GoToTabName {
+                name: "x".to_owned(),
+                create: true,
+                no_focus: false,
+            }),
+            FocusPlan::Create {
+                now: Action::GoToTabName {
+                    name: "x".to_owned(),
+                    create: true,
+                    no_focus: true,
+                },
+                then: FocusAfter::TabName("x".to_owned()),
+            }
+        );
+        let pane = |no_focus| Action::NewTiledPane {
+            direction: None,
+            command: None,
+            pane_name: None,
+            near_current_pane: false,
+            no_focus,
+            borderless: None,
+            border_style: None,
+            tab_id: None,
+        };
+        assert_eq!(
+            focus_plan(&pane(false)),
+            FocusPlan::Create {
+                now: pane(true),
+                then: FocusAfter::Pane,
+            }
+        );
+        assert_eq!(focus_plan(&pane(true)), FocusPlan::Unaffected);
+        for action in [
+            Action::WriteChars {
+                chars: "x".to_owned(),
+            },
+            Action::CloseFocus,
+            Action::ListClients { output_json: false },
+        ] {
+            assert_eq!(focus_plan(&action), FocusPlan::Unaffected, "{:?}", action);
+        }
+        // a create's focus move is known once it says what it made
+        let made = ActionCompletionResult {
+            exit_status: None,
+            affected_pane_id: Some(PaneId::Terminal(9)),
+            affected_tab_id: Some(2),
+            error_message: None,
+            stdout_lines: Vec::new(),
+        };
+        assert_eq!(
+            FocusAfter::Pane.focus_action(&made),
+            Some((
+                Action::FocusPaneByPaneId {
+                    pane_id: UtilsPaneId::Terminal(9),
+                    no_focus: false,
+                },
+                Some(PaneId::Terminal(9))
+            ))
+        );
+        assert_eq!(
+            FocusAfter::Tab.focus_action(&made),
+            Some((Action::GoToTabById { id: 2 }, None))
+        );
+    }
+
+    /// fork addition: while a focus change its pane asked for waits, an agent's write with no
+    /// target goes to the pane it asked for - never to the person's.
+    #[test]
+    fn a_waiting_focus_change_sends_the_callers_untargeted_writes_to_its_pane() {
+        use zellij_utils::data::PaneId as UtilsPaneId;
+        let guards = crate::input_guard::SharedInputGuards::default();
+        let caller = |pane| zellij_utils::ipc::ActionCaller {
+            agent: true,
+            now: false,
+            pane,
+        };
+        let write = || Action::WriteChars {
+            chars: "ls\n".to_owned(),
+        };
+        // nothing waits: unchanged
+        assert_eq!(
+            with_virtual_focus(write(), caller(Some(5)), &guards),
+            Ok(write())
+        );
+        guards.lock().unwrap().defer(
+            1,
+            Some(5),
+            Some(PaneId::Terminal(8)),
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            with_virtual_focus(write(), caller(Some(5)), &guards),
+            Ok(Action::WriteCharsToPaneId {
+                chars: "ls\n".to_owned(),
+                pane_id: UtilsPaneId::Terminal(8),
+            })
+        );
+        // another pane's call, a call from no pane, and a targeted write are left alone
+        assert_eq!(
+            with_virtual_focus(write(), caller(Some(6)), &guards),
+            Ok(write())
+        );
+        assert_eq!(
+            with_virtual_focus(write(), caller(None), &guards),
+            Ok(write())
+        );
+        let targeted = Action::WriteCharsToPaneId {
+            chars: "x".to_owned(),
+            pane_id: UtilsPaneId::Terminal(2),
+        };
+        assert_eq!(
+            with_virtual_focus(targeted.clone(), caller(Some(5)), &guards),
+            Ok(targeted)
+        );
+        // a held change whose pane is not known yet refuses the write
+        guards
+            .lock()
+            .unwrap()
+            .defer(1, Some(5), None, std::time::Instant::now());
+        assert!(with_virtual_focus(write(), caller(Some(5)), &guards).is_err());
     }
 }

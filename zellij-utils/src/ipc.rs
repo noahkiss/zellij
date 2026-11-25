@@ -175,13 +175,28 @@ pub struct MobileStatePayload {
 pub struct ActionCaller {
     /// The CLI process passed the agent test ([`crate::agent_detect::caller_is_agent`]).
     pub agent: bool,
+    /// `zellij action --now`: a focus change applies at once instead of waiting for the person
+    /// to pause.
+    pub now: bool,
+    /// The pane the CLI ran in (`ZELLIJ_PANE_ID`). It keys the caller's pending focus change,
+    /// since each CLI call is a connection of its own.
+    pub pane: Option<u32>,
+}
+
+static FOCUS_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// fork addition: this process was run as `zellij action --now`.
+pub fn set_focus_now(now: bool) {
+    FOCUS_NOW.store(now, std::sync::atomic::Ordering::SeqCst);
 }
 
 impl ActionCaller {
     /// The caller as this process's environment describes it.
     pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
         ActionCaller {
-            agent: crate::agent_detect::caller_is_agent(var),
+            agent: crate::agent_detect::caller_is_agent(&var),
+            now: FOCUS_NOW.load(std::sync::atomic::Ordering::SeqCst),
+            pane: var("ZELLIJ_PANE_ID").and_then(|id| id.trim().parse().ok()),
         }
     }
 }

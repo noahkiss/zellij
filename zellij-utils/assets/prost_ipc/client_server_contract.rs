@@ -4548,6 +4548,12 @@ pub struct ActionCaller {
     /// the CLI process passed the agent test (`caller_is_agent`)
     #[prost(bool, tag="1")]
     pub agent: bool,
+    /// `zellij action --now`: a focus change applies at once instead of waiting for a pause
+    #[prost(bool, tag="2")]
+    pub now: bool,
+    /// the pane the CLI ran in (ZELLIJ_PANE_ID), which keys the caller's pending focus change
+    #[prost(uint32, optional, tag="3")]
+    pub pane: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

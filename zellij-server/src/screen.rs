@@ -1135,6 +1135,8 @@ pub enum ScreenInstruction {
     SetInputGuard {
         guard_ms: u64,
         typing: crate::input_guard::Typing,
+        wait_idle_ms: u64,
+        wait_max_ms: u64,
     },
     /// fork addition: an agent's CLI call (the CLI client id) is about to run; note where every
     /// client is looking, to compare with after it.
@@ -13385,6 +13387,10 @@ pub(crate) fn screen_thread_main(
                 .unwrap_or(crate::input_guard::DEFAULT_GUARD_MS),
             crate::input_guard::Typing::from_config(config_options.input_guard_typing.as_deref()),
         );
+        guards.configure_focus_wait(
+            zellij_utils::focus_wait::configured_idle_ms(config_options.focus_wait_idle.as_deref()),
+            zellij_utils::focus_wait::configured_max_ms(config_options.focus_wait_max.as_deref()),
+        );
     }
     screen.default_context_menu_config = config.context_menu.clone();
     screen.default_mousebinds = config.mousebinds.clone();
@@ -18546,9 +18552,15 @@ pub(crate) fn screen_thread_main(
                     screen.render(None)?;
                 }
             },
-            ScreenInstruction::SetInputGuard { guard_ms, typing } => {
+            ScreenInstruction::SetInputGuard {
+                guard_ms,
+                typing,
+                wait_idle_ms,
+                wait_max_ms,
+            } => {
                 if let Ok(mut guards) = screen.input_guards.lock() {
                     guards.configure(guard_ms, typing);
+                    guards.configure_focus_wait(wait_idle_ms, wait_max_ms);
                 }
                 if screen.sync_input_guard_markers() {
                     screen.render(None)?;

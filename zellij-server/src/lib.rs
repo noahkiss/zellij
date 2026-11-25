@@ -1449,6 +1449,12 @@ impl SessionMetaData {
                     typing: crate::input_guard::Typing::from_config(
                         new_config.options.input_guard_typing.as_deref(),
                     ),
+                    wait_idle_ms: zellij_utils::focus_wait::configured_idle_ms(
+                        new_config.options.focus_wait_idle.as_deref(),
+                    ),
+                    wait_max_ms: zellij_utils::focus_wait::configured_max_ms(
+                        new_config.options.focus_wait_max.as_deref(),
+                    ),
                 });
             let _ = self
                 .senders

@@ -178,6 +178,13 @@ pub enum Command {
         #[clap(long)]
         json: bool,
 
+        /// Move the focus at once. From a coding agent, a verb that moves the person's focus
+        /// (focus-pane-id, go-to-tab*, move-focus, and new-pane, new-tab, run or launch-plugin with
+        /// focus) waits until their typing pauses (`focus_wait_idle`). This skips the wait. It goes
+        /// before the verb, like --json; on any other verb it does nothing
+        #[clap(long)]
+        now: bool,
+
         #[clap(subcommand)]
         action: Box<CliAction>,
     },
@@ -1955,6 +1962,8 @@ pub enum CliAction {
     /// With --no-focus this is an existence probe instead, the same one `go-to-tab-name` has: the
     /// exit code is 0 either way, and stdout is the answer - `id:` and `handle:` if the pane is
     /// there, nothing at all if it is not
+    ///
+    /// To type into a pane, name it (write-chars --pane-id); no focus is needed first.
     #[clap(visible_alias = "go-to-pane")]
     FocusPaneId {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
@@ -2620,6 +2629,8 @@ pub enum CliAction {
     /// With --no-focus and without --create this is an existence probe instead: the exit code is 0
     /// either way, and stdout is the answer - `id: <tab id>` if the tab is there, nothing at all
     /// if it is not.
+    ///
+    /// To type into a pane, name it (write-chars --pane-id); no focus is needed first.
     GoToTabName {
         /// The tab name, matched exactly - the NAME column of `list-tabs`
         name: String,

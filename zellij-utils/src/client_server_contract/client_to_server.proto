@@ -102,6 +102,10 @@ message ActionMsg {
 message ActionCaller {
   // the CLI process passed the agent test (`caller_is_agent`)
   bool agent = 1;
+  // `zellij action --now`: a focus change applies at once instead of waiting for a pause
+  bool now = 2;
+  // the pane the CLI ran in (ZELLIJ_PANE_ID), which keys the caller's pending focus change
+  optional uint32 pane = 3;
 }
 
 message KeyMsg {

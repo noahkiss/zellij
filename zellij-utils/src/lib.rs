@@ -13,6 +13,7 @@ pub mod desktop_integration;
 pub mod distribution;
 pub mod envs;
 pub mod errors;
+pub mod focus_wait;
 pub mod graphemes;
 pub mod harness_map;
 pub mod home;

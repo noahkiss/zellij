@@ -9255,6 +9255,76 @@ prost output was edited by hand to match what `cargo xtask proto` writes for tho
 Older builds warn about the two unknown top-level keys and run without a guard. Capability:
 `input-guard`.
 
+### An agent's focus change waits for the person to pause (`focus_wait_idle`, `action --now`)
+
+```kdl
+focus_wait_idle "2s"   // 0 applies at once; up to 60s; unset, 2s
+focus_wait_max "5m"    // 0 applies at once; up to 1h; unset, 5m
+```
+
+```
+# the person is typing; an agent runs
+$ zellij action go-to-tab 2
+focus: pending                 # it returns at once; the move waits for a 2 s pause
+$ zellij action --now go-to-tab 2
+from: 0 one
+to: 1 two
+focus: applied                 # it moves now; the input guard still holds the typing
+$ zellij action new-pane --focus -- make
+pane_id: terminal_7
+handle: sunny-otter
+focus: pending                 # the pane runs now, in the background; only the focus waits
+```
+
+An agent's call that moves the person's focus waits until that client's input has been idle for
+`focus_wait_idle`, and applies anyway after `focus_wait_max`. Either way the input guard
+("An agent's focus change holds the person's input briefly") runs when it applies. A person, a
+script with no agent variable, and a plugin are never held.
+
+| Verb | What waits |
+|---|---|
+| `focus-pane-id`, `go-to-tab`, `go-to-tab-by-id`, `go-to-tab-name`, `move-focus` | the whole call |
+| `go-to-tab-name --create` | the tab is made now, without focus; only the move to it waits |
+| `new-pane`, `run`, `new-tab`, `launch-plugin` with focus (`--focus`, `-f`) | the pane or tab is made and runs now; only bringing it to the front waits |
+
+Anything else, `--no-focus`, and the probes are not held. `switch-session` is not held. No MCP tool
+moves the focus, so MCP has no `now`.
+
+**`zellij action --now <verb>`** applies at once. It is one action-level flag, before the verb like
+`--json`, and it is a no-op on a verb that moves no focus.
+
+**Output.** A held verb from an agent returns at once and ends its report with `focus: pending`; one
+that applied with `focus: applied` (`"focus"` in `action --json`). Nothing blocks by default.
+
+**Virtual focus.** While a change a caller asked for waits, that caller's writes with no target
+(`write`, `write-chars` and `paste` with `--focused`) go to the pane it asked for, at once: never
+to the person's pane, and never guarded. The caller is keyed by the pane its CLI runs in
+(`ZELLIJ_PANE_ID`), since each CLI call is a connection of its own. When the pane is not known until
+the change applies (a tab), such a write is refused with a note to name the pane. A caller with no
+pane has no virtual focus and must name its target. To type into a pane, name it
+(`write-chars --pane-id`); no focus is needed first.
+
+**State.** Idle time and the held change are per attached client. A later change for the same
+client replaces the held one. A held change for a pane that is gone does nothing when it applies.
+A client that detaches drops its held change.
+
+**Fail open.** A held change is applied or dropped on the clock: it applies by `focus_wait_max` at
+the latest. `focus_wait_idle 0` or `focus_wait_max 0` takes the old path: the change applies at once.
+
+The CLI sends `now` and the caller's pane on the same `ActionCaller` carrier as the agent test. The
+route thread decides (`focus_plan`, `with_virtual_focus`, `FocusWaiter` in
+`zellij-server/src/route.rs`); the waiting state is in `zellij-server/src/input_guard.rs`
+(`should_wait`, `defer`, `pending_state`, `virtual_focus`); the keys are in
+`zellij-utils/src/focus_wait.rs`. The person's keys, pastes, clicks and wheel set the idle clock; a
+hover does not. Tests: the wait, the pause, the cap, the replacement, the detach and the zero path
+in `input_guard.rs`; the verb table and virtual focus in `route.rs`; the keys in `kdl/mod.rs`; the
+carrier round trip.
+
+Contract: `ActionCaller` gains `bool now = 2` and `optional uint32 pane = 3`. Nothing existing
+changes, so the contract version stays. An older server ignores both: it applies at once. Older
+builds refuse `action --now` as an unknown flag, and warn about the two keys. Capability:
+`focus-wait`.
+
 ### A pane made without focus in a full tab leaves the focus alone
 
 ```

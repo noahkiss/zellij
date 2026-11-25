@@ -272,6 +272,19 @@ context_menu {
 //
 // input_guard_typing "previous"
 
+// How long your input must have been idle before a coding agent's change of your focused pane or tab
+// applies. Until then the agent's new pane or tab is made in the background and the move waits;
+// `zellij action --now` skips the wait. 0 applies at once. A span up to 60s. A reload applies it
+// Default: "2s"
+//
+// focus_wait_idle "2s"
+
+// The longest an agent's focus change waits for that pause; then it applies anyway. 0 applies at
+// once. A span up to 1h. A reload applies it
+// Default: "5m"
+//
+// focus_wait_max "5m"
+
 // Set the pane frame style when pane_frames is enabled
 // Options:
 //   - titles (default - draw a title above each pane)

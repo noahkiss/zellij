@@ -112,6 +112,8 @@ impl From<ClientToServerMsg> for ProtoClientToServerMsg {
                 caller: (caller != crate::ipc::ActionCaller::default()).then(|| {
                     crate::client_server_contract::client_server_contract::ActionCaller {
                         agent: caller.agent,
+                        now: caller.now,
+                        pane: caller.pane,
                     }
                 }),
             }),
@@ -363,6 +365,8 @@ impl TryFrom<ProtoClientToServerMsg> for ClientToServerMsg {
                     .caller
                     .map(|caller| crate::ipc::ActionCaller {
                         agent: caller.agent,
+                        now: caller.now,
+                        pane: caller.pane,
                     })
                     .unwrap_or_default(),
             }),
@@ -1344,6 +1348,8 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             pane_frame_handle: None,
             input_guard_ms: None,
             input_guard_typing: None,
+            focus_wait_idle: None,
+            focus_wait_max: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

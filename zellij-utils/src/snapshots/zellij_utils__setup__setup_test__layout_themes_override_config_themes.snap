@@ -6753,6 +6753,8 @@ Config {
         pane_frame_handle: None,
         input_guard_ms: None,
         input_guard_typing: None,
+        focus_wait_idle: None,
+        focus_wait_max: None,
     },
     themes: {
         "other-theme-from-config": Theme {

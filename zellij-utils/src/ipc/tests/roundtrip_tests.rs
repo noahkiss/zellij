@@ -532,6 +532,8 @@ fn test_client_messages() {
                 pane_frame_handle: None,
                 input_guard_ms: None,
                 input_guard_typing: None,
+                focus_wait_idle: None,
+                focus_wait_max: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),
@@ -919,7 +921,11 @@ fn test_client_messages() {
         terminal_id: Some(1),
         client_id: Some(100),
         is_cli_client: true,
-        caller: crate::ipc::ActionCaller { agent: true },
+        caller: crate::ipc::ActionCaller {
+            agent: true,
+            now: true,
+            pane: Some(7),
+        },
     });
     test_client_roundtrip!(ClientToServerMsg::Action {
         action: Action::Write {

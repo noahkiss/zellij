@@ -970,6 +970,17 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub input_guard_typing: Option<String>,
+    /// How long a client's input must have been idle before an agent's focus change applies to
+    /// it: a span up to 60 s, or 0 to apply at once. Read by the session server, at start and on
+    /// reload. Unset means 2 s (`focus_wait::DEFAULT_IDLE_MS`)
+    #[clap(skip)]
+    #[serde(default)]
+    pub focus_wait_idle: Option<String>,
+    /// The longest an agent's focus change waits for that idle: a span up to an hour, or 0 to
+    /// apply at once. Read by the session server, at start and on reload. Unset means 5 min
+    #[clap(skip)]
+    #[serde(default)]
+    pub focus_wait_max: Option<String>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -1242,6 +1253,10 @@ impl Options {
         let input_guard_typing = other
             .input_guard_typing
             .or_else(|| self.input_guard_typing.clone());
+        let focus_wait_idle = other
+            .focus_wait_idle
+            .or_else(|| self.focus_wait_idle.clone());
+        let focus_wait_max = other.focus_wait_max.or_else(|| self.focus_wait_max.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1348,6 +1363,8 @@ impl Options {
             pane_frame_handle,
             input_guard_ms,
             input_guard_typing,
+            focus_wait_idle,
+            focus_wait_max,
         }
     }
 
@@ -1558,6 +1575,10 @@ impl Options {
         let input_guard_typing = other
             .input_guard_typing
             .or_else(|| self.input_guard_typing.clone());
+        let focus_wait_idle = other
+            .focus_wait_idle
+            .or_else(|| self.focus_wait_idle.clone());
+        let focus_wait_max = other.focus_wait_max.or_else(|| self.focus_wait_max.clone());
 
         Options {
             stacked_pane_list_orientation,
@@ -1664,6 +1685,8 @@ impl Options {
             pane_frame_handle,
             input_guard_ms,
             input_guard_typing,
+            focus_wait_idle,
+            focus_wait_max,
         }
     }
 

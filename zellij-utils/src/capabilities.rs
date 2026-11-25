@@ -117,6 +117,8 @@ pub const CAPABILITIES: &[&str] = &[
     "agent-message-receipt",
     // input_guard_ms, input_guard_typing: an agent's focus change holds the person's input
     "input-guard",
+    // focus_wait_idle, focus_wait_max, action --now: an agent's focus change waits for a pause
+    "focus-wait",
 ];
 
 /// The version, split into the parts that can actually be compared.

@@ -117,9 +117,12 @@ fn main() {
         }
         if let Some(Command::Action {
             json,
+            now,
             action: cli_action,
         }) = opts.command
         {
+            // fork addition: `action --now` rides on every action this process sends
+            zellij_utils::ipc::set_focus_now(now);
             commands::send_action_to_session(*cli_action, opts.session, config, json);
             std::process::exit(0);
         }

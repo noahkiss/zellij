@@ -209,6 +209,8 @@ fn option_values(options: &Options, values: &mut BTreeMap<SettingKey, Option<Str
         pane_frame_handle: _,
         input_guard_ms: _,
         input_guard_typing: _,
+        focus_wait_idle: _,
+        focus_wait_max: _,
     } = options;
     let entries = [
         (SettingKey::SimplifiedUi, display_text(simplified_ui)),

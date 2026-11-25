@@ -3547,6 +3547,8 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "expect_full_disk_access",
     "explicit_theme_hue",
     "focus_follows_mouse",
+    "focus_wait_idle",
+    "focus_wait_max",
     "grapheme_clusters",
     "hidden_bars_notification",
     "host_notification_protocol",
@@ -3862,6 +3864,18 @@ impl Options {
                 },
                 None => None,
             };
+        let focus_wait_idle = span_or_note(
+            "focus_wait_idle",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "focus_wait_idle"),
+            crate::focus_wait::IDLE_BOUNDS,
+            "0, or a span up to 60s, such as \"2s\"",
+        );
+        let focus_wait_max = span_or_note(
+            "focus_wait_max",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "focus_wait_max"),
+            crate::focus_wait::MAX_BOUNDS,
+            "0, or a span up to 1h, such as \"5m\"",
+        );
         let input_guard_typing =
             match kdl_property_first_arg_as_string_or_error!(kdl_options, "input_guard_typing") {
                 Some((value, _)) if value == "previous" || value == "drop" => {
@@ -4234,6 +4248,8 @@ impl Options {
             pane_frame_handle,
             input_guard_ms,
             input_guard_typing,
+            focus_wait_idle,
+            focus_wait_max,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -7180,6 +7196,23 @@ impl Options {
             let mut node = KdlNode::new("input_guard_typing");
             node.push(KdlValue::String(typing.to_owned()));
             nodes.push(node);
+        }
+        if let Some(idle) = Self::span_option_to_kdl(
+            "focus_wait_idle",
+            self.focus_wait_idle.as_ref(),
+            add_comments,
+            "// How long your input must be idle before an agent's focus change applies: 0 to 60s.\n\
+             // Unset, 2 seconds",
+        ) {
+            nodes.push(idle);
+        }
+        if let Some(max) = Self::span_option_to_kdl(
+            "focus_wait_max",
+            self.focus_wait_max.as_ref(),
+            add_comments,
+            "// The longest an agent's focus change waits for that: 0 to 1h. Unset, 5 minutes",
+        ) {
+            nodes.push(max);
         }
         if let Some(detect_agents) = self.detect_agents_to_kdl() {
             nodes.push(detect_agents);
@@ -12796,6 +12829,33 @@ fn remote_hosts_timeouts_are_read_for_the_server_and_warn_on_a_bad_value() {
         "{}",
         bad.warnings[0]
     );
+}
+
+#[test]
+fn focus_wait_idle_and_focus_wait_max_parse_cap_warn_and_round_trip() {
+    let read = |kdl: &str| Config::from_kdl(kdl, None).unwrap();
+    for (kdl, idle, max) in [
+        ("focus_wait_idle \"0\"", Some("0"), None),
+        (
+            "focus_wait_idle \"3s\"\nfocus_wait_max \"10m\"",
+            Some("3s"),
+            Some("10m"),
+        ),
+    ] {
+        let config = read(kdl);
+        assert_eq!(config.options.focus_wait_idle.as_deref(), idle, "{}", kdl);
+        assert_eq!(config.options.focus_wait_max.as_deref(), max, "{}", kdl);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let again = read(&config.to_string(false));
+        assert_eq!(again.options, config.options);
+    }
+    let bad = read("focus_wait_idle \"soon\"");
+    assert_eq!(bad.options.focus_wait_idle, None);
+    assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
+    let capped = read("focus_wait_idle \"5m\"\nfocus_wait_max \"3h\"");
+    assert_eq!(capped.options.focus_wait_idle.as_deref(), Some("60s"));
+    assert_eq!(capped.options.focus_wait_max.as_deref(), Some("3600s"));
+    assert_eq!(capped.warnings.len(), 2, "{:?}", capped.warnings);
 }
 
 #[test]
