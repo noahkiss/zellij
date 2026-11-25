@@ -723,6 +723,45 @@ fn write_input_call(
     ])))
 }
 
+/// What `zellij_close` closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseOperation {
+    Pane,
+    Tab,
+}
+
+/// What a `zellij_close` call closes: `operation` when it names one, otherwise the one target the
+/// call gave.
+///
+/// The tool cannot be undone, so it infers only what the call settles: `pane` alone closes that
+/// pane, `tab` alone that tab, and `close` is read the same way. Both, or neither, is refused
+/// rather than guessed at.
+fn close_operation(args: &Args) -> Result<CloseOperation, String> {
+    let pane = args.string("pane").is_some();
+    let tab = args.string("tab").is_some();
+    match args.string("operation").as_deref() {
+        Some("close_pane") => Ok(CloseOperation::Pane),
+        Some("close_tab") => Ok(CloseOperation::Tab),
+        None | Some("close") => match (pane, tab) {
+            (true, false) => Ok(CloseOperation::Pane),
+            (false, true) => Ok(CloseOperation::Tab),
+            (true, true) => Err(
+                "Pass `pane` or `tab`, not both: closing cannot be undone, so \
+                 this tool does not pick one."
+                    .to_owned(),
+            ),
+            (false, false) => Err("Nothing to close: pass `pane` (a handle) or `tab` (an id \
+                 from zellij_overview)."
+                .to_owned()),
+        },
+        Some(other) => Err(format!(
+            "`operation` must be close_pane or close_tab, not `{}`. Or leave it out: `pane` or \
+             `tab` says what to close.",
+            other
+        )),
+    }
+}
+
 /// How a create runs its `command`: `shell` or `exec`, refused when it is neither.
 fn run_in(args: &Args) -> Result<String, String> {
     let run_in = args.enumerated("run_in", RUN_IN_DEFAULT);
@@ -1051,9 +1090,8 @@ fn argv_in(
         // whatever gates tool calls, so it answers the confirmation here rather than hanging on a
         // prompt nobody can see
         "zellij_close" => {
-            let operation = args.required("operation")?;
-            let rest = match operation.as_str() {
-                "close_pane" => vec![
+            let rest = match close_operation(&args)? {
+                CloseOperation::Pane => vec![
                     "action".to_owned(),
                     "close-pane".to_owned(),
                     "--pane-id".to_owned(),
@@ -1063,17 +1101,11 @@ fn argv_in(
                 // `close-tab-by-id` takes its id as an argument rather than behind `--tab-id`, and
                 // it has no confirmation to answer: the flags the pane verb takes were a clap
                 // error here, on every call, from the day this tool was written
-                "close_tab" => vec![
+                CloseOperation::Tab => vec![
                     "action".to_owned(),
                     "close-tab-by-id".to_owned(),
                     args.required("tab")?,
                 ],
-                other => {
-                    return Err(format!(
-                        "`operation` must be close_pane or close_tab, not `{}`.",
-                        other
-                    ))
-                },
             };
             Ok(scoped(rest))
         },
@@ -2198,6 +2230,47 @@ mod tests {
             ),
             "action close-tab-by-id 2"
         );
+    }
+
+    #[test]
+    fn the_target_alone_says_what_to_close() {
+        // `operation` was required, and agents left it out or wrote `close`: five refusals in
+        // sixty-two calls, each for a call whose target already settled it
+        for value in [
+            json!({"pane": "sunny-otter"}),
+            json!({"operation": "close", "pane": "sunny-otter"}),
+        ] {
+            assert_eq!(
+                line("zellij_close", value, None),
+                "action close-pane --pane-id sunny-otter --yes"
+            );
+        }
+        for value in [json!({"tab": 2}), json!({"operation": "close", "tab": 2})] {
+            assert_eq!(
+                line("zellij_close", value, None),
+                "action close-tab-by-id 2"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_the_target_does_not_settle_is_refused_not_guessed() {
+        for operation in [None, Some("close")] {
+            let mut both = json!({"pane": "sunny-otter", "tab": 2});
+            let mut neither = json!({});
+            if let Some(operation) = operation {
+                both["operation"] = json!(operation);
+                neither["operation"] = json!(operation);
+            }
+            assert!(refusal("zellij_close", both).contains("not both"));
+            assert!(refusal("zellij_close", neither).contains("Nothing to close"));
+        }
+        // a named operation still wants its own target
+        assert!(refusal(
+            "zellij_close",
+            json!({"operation": "close_tab", "pane": "sunny-otter"})
+        )
+        .contains("`tab` is required"));
     }
 
     #[test]

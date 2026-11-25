@@ -640,9 +640,10 @@ pub const TOOLS: &[ToolSpec] = &[
             ParamSpec {
                 name: "operation",
                 kind: ParamKind::Enum(&["close_pane", "close_tab"]),
-                required: true,
+                required: false,
                 from: None,
-                describe: "What to close. close_pane takes pane; close_tab takes tab.",
+                describe: "What to close. Leave it out: pane alone closes that pane, and tab \
+                           alone that tab. close_pane takes pane; close_tab takes tab.",
                 default: None,
             },
             ParamSpec {

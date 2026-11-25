@@ -5271,6 +5271,12 @@ A client that validates `structuredContent` then dropped the answer, and with it
 pane that exists. The reasons now live in one list, `tools::reason`, the enum is built from it, and
 a test reads the `src/mcp` source and fails on a reason written as a bare literal.
 
+**`zellij_close` reads what to close from its target (nkmk.47).** `operation` was required, and
+agents left it out or wrote `close`: five refusals in sixty-two calls, each for a call whose target
+already settled it. `operation` is now optional. `pane` alone closes that pane, `tab` alone that
+tab, and `operation: close` reads the same way. The tool cannot be undone, so it guesses no further:
+both targets, or neither, without a named operation is refused with a line that says so.
+
 ### `session up` comes back with the shape the session had
 
 ```
