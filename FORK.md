@@ -5324,6 +5324,19 @@ matches, or none, keep the refusal that lists the hosts. Only a word written as 
 this way: `zellij_send` tries the first word of `to` as a host before it reads it as a session, and
 that lookup stays exact, so a session is never sent to another machine for sharing a host's prefix.
 
+**`zellij_write_input` `then` waits and reads in the same call (nkmk.47).** Write, then
+`zellij_wait_for`, then `zellij_read_pane` was the commonest chain in agent transcripts, about 140
+times each. `then: quiet | agent_idle | match`, with `pattern`, `quiet_ms` and `timeout_s` as
+`zellij_wait_for` takes them, waits after the input and returns the pane's visible screen. The
+answer adds `waited`, the wait's own answer in the usual shape (`timed_out` included), and `screen`.
+The wait and the read are built by the same code as the two tools, so `timeout_s` defaults to
+`mcp_wait_timeout` and the tips say to keep it under the client's deadline. `then=match` starts its
+wait before the input goes in (300 ms ahead, 1.5 s over ssh), because a match sees only lines drawn
+after the wait began and a fast command's output can beat a wait started after it; `quiet` and
+`agent_idle` count from the input and start after it. A wait that fails leaves the call a success
+and says the input went in, so the caller does not send it twice. `pattern`, `quiet_ms` or
+`timeout_s` without `then` is refused before anything is typed.
+
 ### `session up` comes back with the shape the session had
 
 ```

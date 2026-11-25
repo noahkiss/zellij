@@ -744,6 +744,102 @@ fn write_input_call(
     ])))
 }
 
+/// What `zellij_write_input` with `then` runs once its input went in: the wait, as
+/// `zellij_wait_for` builds it, and the read, as `zellij_read_pane` builds it.
+pub struct ThenWait {
+    /// What the wait is for: `quiet`, `agent_idle` or `match`.
+    pub until: String,
+    pub wait: Vec<String>,
+    pub read: Vec<String>,
+    /// Start the wait before the input goes in. `until=match` sees only lines drawn after the wait
+    /// began, and a fast command's output can beat a wait started after it. `quiet` and
+    /// `agent_idle` count from the input, so they start after it.
+    pub before_write: bool,
+}
+
+/// The values `then` takes.
+pub const THEN_VALUES: &[&str] = &["quiet", "agent_idle", "match"];
+
+/// How long a `then=match` wait runs before the input goes in, so it is listening when the first
+/// line comes back. Longer for another machine, where the wait goes over ssh first.
+pub fn wait_head_start_ms(remote: bool) -> u64 {
+    if remote {
+        1500
+    } else {
+        300
+    }
+}
+
+/// `zellij_write_input`'s `then`: the wait and the read that follow the input, built by the same
+/// code that builds `zellij_wait_for` and `zellij_read_pane`. `None` when the call has no `then`.
+pub fn then_wait(
+    args: &Map<String, Value>,
+    ambient_session: Option<&str>,
+    target: &Target,
+) -> Result<Option<ThenWait>, String> {
+    let mut env = CallEnv::from_process();
+    env.remote = target.is_remote();
+    let ambient_session = if target.is_remote() {
+        None
+    } else {
+        ambient_session
+    };
+    then_wait_in(args, ambient_session, &env)
+}
+
+fn then_wait_in(
+    args: &Map<String, Value>,
+    ambient_session: Option<&str>,
+    env: &CallEnv,
+) -> Result<Option<ThenWait>, String> {
+    let read = Args::new(args);
+    let Some(until) = read.string("then") else {
+        if let Some(param) = ["pattern", "quiet_ms", "timeout_s"]
+            .into_iter()
+            .find(|param| args.contains_key(*param))
+        {
+            return Err(format!(
+                "`{}` belongs to the wait after the input: pass `then` too.",
+                param
+            ));
+        }
+        return Ok(None);
+    };
+    if !THEN_VALUES.contains(&until.as_str()) {
+        return Err(format!(
+            "`then` must be quiet, agent_idle or match, not `{}`.",
+            until
+        ));
+    }
+    let mut wait = Map::new();
+    let mut screen = Map::new();
+    for (key, value) in args {
+        match key.as_str() {
+            "session" | "pane" => {
+                wait.insert(key.clone(), value.clone());
+                screen.insert(key.clone(), value.clone());
+            },
+            "pattern" | "quiet_ms" | "timeout_s" => {
+                wait.insert(key.clone(), value.clone());
+            },
+            _ => {},
+        }
+    }
+    wait.insert("until".to_owned(), Value::String(until.clone()));
+    if until != "match" && wait.contains_key("pattern") {
+        return Err("`pattern` goes with then=match.".to_owned());
+    }
+    let wait_argv = argv_in("zellij_wait_for", &wait, ambient_session, env, None)
+        .map_err(|said| said.replace("`until: match`", "`then: match`"))?;
+    let read_argv = argv_in("zellij_read_pane", &screen, ambient_session, env, None)?;
+    Ok(Some(ThenWait {
+        before_write: until == "match",
+        until,
+        wait: wait_argv,
+        read: read_argv,
+    }))
+}
+
 /// What `zellij_close` closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseOperation {
@@ -2285,6 +2381,69 @@ mod tests {
             json!({"pane": "3", "keys": ["Enter"], "text": "x"})
         )
         .contains("not both"));
+    }
+
+    fn then_line(value: Value, session: Option<&str>) -> Option<(String, String, bool)> {
+        then_wait_in(&args(value), session, &a_shell_env())
+            .expect("a then that builds")
+            .map(|then| (then.wait.join(" "), then.read.join(" "), then.before_write))
+    }
+
+    #[test]
+    fn then_waits_and_reads_as_the_wait_and_read_tools_do() {
+        assert!(then_line(json!({"pane": "3", "keys": "Enter"}), None).is_none());
+        let (wait, read, before) = then_line(
+            json!({"pane": "sunny-otter", "text": "hi", "submit": true, "then": "agent_idle",
+                   "timeout_s": 50}),
+            Some("work"),
+        )
+        .unwrap();
+        assert_eq!(
+            wait,
+            "-s work action wait sunny-otter --for agent-idle --timeout 50"
+        );
+        assert_eq!(read, "-s work action dump-screen --pane-id sunny-otter");
+        assert!(
+            !before,
+            "agent_idle counts from the input, so it starts after it"
+        );
+        // the default timeout is the wait tool's own
+        let (wait, _, _) = then_line(
+            json!({"pane": "3", "keys": "Enter", "then": "quiet",
+                                            "quiet_ms": 800}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            wait,
+            "action wait 3 --for quiet --quiet-ms 800 --timeout 300"
+        );
+        // a match has to be listening before the line it waits for can arrive
+        let (wait, _, before) = then_line(
+            json!({"pane": "3", "text": "make", "then": "match", "pattern": "^done"}),
+            None,
+        )
+        .unwrap();
+        assert!(wait.contains("--for match --match ^done"), "{}", wait);
+        assert!(before);
+    }
+
+    #[test]
+    fn then_refuses_what_it_cannot_wait_for() {
+        let refused = |value: Value| {
+            then_wait_in(&args(value), None, &a_shell_env())
+                .err()
+                .expect("a refusal")
+        };
+        assert!(
+            refused(json!({"pane": "3", "then": "exit"})).contains("quiet, agent_idle or match")
+        );
+        assert!(refused(json!({"pane": "3", "then": "match"})).contains("`then: match`"));
+        assert!(refused(json!({"pane": "3", "pattern": "x"})).contains("pass `then` too"));
+        assert!(refused(json!({"pane": "3", "timeout_s": 5})).contains("pass `then` too"));
+        assert!(
+            refused(json!({"pane": "3", "then": "quiet", "pattern": "x"})).contains("then=match")
+        );
     }
 
     #[test]

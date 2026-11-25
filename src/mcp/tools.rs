@@ -333,7 +333,10 @@ pub const TOOLS: &[ToolSpec] = &[
                    sending a line to a shell, talking to an agent in another pane.",
         not_for: "starting something in a NEW pane, and not for a pane you have not named. There \
                   is no focused pane here: an unnamed target would be a pane you have never seen.",
-        follow_up: Some("zellij_wait_for or zellij_read_pane to see what the pane did with it"),
+        follow_up: Some(
+            "zellij_wait_for or zellij_read_pane to see what the pane did with it, unless you \
+             passed then",
+        ),
         // `keys` presses keys and `text` writes characters, which are two verbs, not one with a
         // flag: a tool that multiplexes says what each of its commands returns
         reports: &["action send-keys", "action write-chars"],
@@ -345,7 +348,14 @@ pub const TOOLS: &[ToolSpec] = &[
                agent is idle and nobody is typing there. Successful input to an agent adds that \
                hint. To send pane input, pass text with \
                submit=true: the text goes in as one bracketed paste, so its newlines do not send \
-               it early, and then Enter sends it. Follow with zellij_wait_for until=agent_idle.",
+               it early, and then Enter sends it. then waits after the input and returns the \
+               screen in the same call: then=agent_idle after a message to an agent, then=quiet \
+               or then=match after a command line. The answer adds waited (what the wait \
+               said, as zellij_wait_for answers, timed_out included) and screen (the pane's \
+               visible screen, as zellij_read_pane returns it). A wait that times out still \
+               returns the screen; a wait that fails says so, and the input stays sent - do \
+               not send it again. Without timeout_s the wait gives up after {wait_timeout_s} \
+               seconds; keep timeout_s under your MCP client's own request deadline.",
         params: &[
             SESSION,
             ParamSpec {
@@ -388,6 +398,46 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "With text: paste it as one bracketed paste, then press Enter. How to \
                            send a message to a coding agent, or several lines to a shell at once.",
                 default: None,
+            },
+            ParamSpec {
+                name: "then",
+                kind: ParamKind::Enum(invoke::THEN_VALUES),
+                required: false,
+                from: None,
+                describe: "After the input goes in, wait as zellij_wait_for would - until the \
+                           pane is quiet, the agent in it stops working, or a line matches \
+                           pattern - then return the pane's screen. One call instead of write, \
+                           wait and read.",
+                default: None,
+            },
+            ParamSpec {
+                name: "pattern",
+                kind: ParamKind::Str,
+                required: false,
+                from: Some(("action wait", "--match")),
+                describe: "With then=match: the regex a new line must match, tested one screen \
+                           line at a time.",
+                default: None,
+            },
+            ParamSpec {
+                name: "quiet_ms",
+                kind: ParamKind::Int,
+                required: false,
+                from: Some(("action wait", "--quiet-ms")),
+                describe: "With then=quiet: how long the pane must produce nothing to count as \
+                           quiet. For then=agent_idle on an agent that reports no state, 3000 \
+                           unless given.",
+                default: None,
+            },
+            ParamSpec {
+                name: "timeout_s",
+                kind: ParamKind::Int,
+                required: false,
+                from: Some(("action wait", "--timeout")),
+                describe: "With then: seconds the wait gives up after. Keep it at least 5 \
+                           seconds under your MCP client's own request deadline, which is often \
+                           60 seconds.",
+                default: Some(WAIT_TIMEOUT_PLACEHOLDER),
             },
         ],
         read_only: false,
@@ -823,6 +873,22 @@ fn output_schema() -> JsonObject {
             "type": "boolean",
             "description": "zellij_wait_for: true when the wait ran out of time. The call \
                             succeeds with reason miss: nothing happened in time.",
+        }),
+    );
+    properties.insert(
+        "waited".to_owned(),
+        json!({
+            "type": "object",
+            "description": "zellij_write_input with then: what the wait after the input said, \
+                            in this same shape.",
+        }),
+    );
+    properties.insert(
+        "screen".to_owned(),
+        json!({
+            "type": "string",
+            "description": "zellij_write_input with then: the pane's visible screen once the \
+                            wait returned.",
         }),
     );
     properties.insert(

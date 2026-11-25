@@ -173,8 +173,27 @@ impl ZellijMcp {
                     )
                 },
             };
+        // `zellij_write_input` with `then`: refused here, before anything is typed, when the wait
+        // it asks for cannot be built
+        let then = if name == "zellij_write_input" {
+            match invoke::then_wait(&arguments, self.ambient_session.as_deref(), &target) {
+                Ok(then) => then,
+                Err(message) => {
+                    return with_host(
+                        failed(message, json!({"reason": reason::BAD_ARGUMENTS})),
+                        &target,
+                    )
+                },
+            }
+        } else {
+            None
+        };
         let then_type = plan.then_type;
-        let (argv, mut outcome) = match self.run_plan(plan.call, &target).await {
+        let (ran, early_wait) = match then.as_ref().filter(|then| then.before_write) {
+            Some(then) => self.write_while_waiting(plan.call, then, &target).await,
+            None => (self.run_plan(plan.call, &target).await, None),
+        };
+        let (argv, mut outcome) = match ran {
             Ok(ran) => ran,
             Err(message) => {
                 return with_host(failed(message, json!({"reason": reason::NOT_RUN})), &target)
@@ -218,7 +237,64 @@ impl ZellijMcp {
                 structure.insert("hint".to_owned(), json!(hint));
             }
         }
+        if let (Some(then), false) = (&then, result.is_error == Some(true)) {
+            let waited = match early_wait {
+                Some(waited) => waited,
+                None => invoke::run_on(&target, &then.wait).await,
+            };
+            let screen = match invoke::run_on(&target, &then.read).await {
+                Ok(read) if !read.is_error() => Some(read.stdout),
+                _ => None,
+            };
+            let waited = match waited {
+                Ok(waited) => self.report(&then.wait, waited, None),
+                Err(message) => failed(message, json!({"reason": reason::NOT_RUN})),
+            };
+            then_answer(&mut result, &then.until, waited, screen);
+        }
         with_host(result, &target)
+    }
+
+    /// A `then=match` write: the wait starts first and is listening when the input goes in, so a
+    /// line the input brings back at once is not missed.
+    ///
+    /// Returns what the write said, and the wait's answer once the write succeeded. A write that
+    /// failed drops the wait, which kills its child: there is nothing to wait for.
+    async fn write_while_waiting(
+        &self,
+        call: invoke::Call,
+        then: &invoke::ThenWait,
+        target: &remote::Target,
+    ) -> (
+        Result<(Vec<String>, invoke::Outcome), String>,
+        Option<Result<invoke::Outcome, String>>,
+    ) {
+        let wait = invoke::run_on(target, &then.wait);
+        tokio::pin!(wait);
+        let write = async {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                invoke::wait_head_start_ms(target.is_remote()),
+            ))
+            .await;
+            self.run_plan(call, target).await
+        };
+        tokio::pin!(write);
+        let mut early = None;
+        let wrote = tokio::select! {
+            wrote = write.as_mut() => wrote,
+            waited = wait.as_mut() => {
+                early = Some(waited);
+                write.as_mut().await
+            },
+        };
+        if !matches!(&wrote, Ok((_, outcome)) if !outcome.is_error()) {
+            return (wrote, None);
+        }
+        let waited = match early {
+            Some(waited) => waited,
+            None => wait.as_mut().await,
+        };
+        (wrote, Some(waited))
     }
 
     /// `zellij_send`: resolve where the message goes, then run `action send-message` there.
@@ -896,6 +972,51 @@ fn same_dir(a: &str, b: &str, target: &remote::Target) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
+    }
+}
+
+/// Add a `then` wait and the screen after it to a write's answer: `waited` and `screen` in the
+/// structure, and the wait's line and the screen in the text.
+///
+/// The write went in whatever the wait says, so a wait that failed does not make the call an
+/// error: a caller told the write failed would send it a second time.
+fn then_answer(
+    result: &mut CallToolResult,
+    until: &str,
+    waited: CallToolResult,
+    screen: Option<String>,
+) {
+    let said = waited
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line = if waited.is_error == Some(true) {
+        format!(
+            "then={}: the input went in, but the wait failed - do not send it again. {}",
+            until,
+            said.trim()
+        )
+    } else {
+        format!("then={}: {}", until, said.trim())
+    };
+    result.content.push(ContentBlock::text(line));
+    match &screen {
+        Some(screen) => result
+            .content
+            .push(ContentBlock::text(format!("screen:\n{}", screen))),
+        None => result.content.push(ContentBlock::text(
+            "screen: the pane could not be read after the wait.",
+        )),
+    }
+    if let Some(Value::Object(structure)) = result.structured_content.as_mut() {
+        if let Some(waited) = waited.structured_content {
+            structure.insert("waited".to_owned(), waited);
+        }
+        if let Some(screen) = screen {
+            structure.insert("screen".to_owned(), json!(screen));
+        }
     }
 }
 
@@ -1685,6 +1806,56 @@ mod tests {
             assert!(!said.contains("agent-change"), "{}", said);
         }
         assert!(INSTRUCTIONS.contains("until=agent_change"));
+    }
+
+    #[test]
+    fn a_write_with_then_carries_the_wait_and_the_screen() {
+        let server = ZellijMcp::default();
+        let write: Vec<String> = "action send-keys --pane-id 3 -- Enter"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let wait: Vec<String> = "action wait 3 --for quiet --timeout 50"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let mut result = server.report(&write, outcome(0, "", ""), None);
+        let waited = server.report(&wait, outcome(0, "quiet_by: quiet\n", ""), None);
+        then_answer(
+            &mut result,
+            "quiet",
+            waited,
+            Some("$ ls\nfile\n$ ".to_owned()),
+        );
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(structured["screen"], json!("$ ls\nfile\n$ "));
+        assert_eq!(structured["waited"]["exit_code"], json!(0));
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("then=quiet: quiet_by: quiet"), "{}", text);
+        assert!(text.contains("screen:\\n$ ls"), "{}", text);
+
+        // a timed-out wait is an outcome, and the screen still comes back
+        let mut result = server.report(&write, outcome(0, "", ""), None);
+        let waited = server.report(
+            &wait,
+            outcome(2, "", "The wait on terminal_3 timed out.\n"),
+            None,
+        );
+        then_answer(&mut result, "quiet", waited, Some("$ ".to_owned()));
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(structured["waited"]["timed_out"], json!(true));
+        assert_eq!(result.is_error, Some(false));
+
+        // a wait that failed leaves the write a success, and says not to send it again
+        let mut result = server.report(&write, outcome(0, "", ""), None);
+        let waited = server.report(&wait, outcome(2, "", "terminal_3 is gone.\n"), None);
+        then_answer(&mut result, "quiet", waited, None);
+        assert_eq!(result.is_error, Some(false));
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("do not send it again"), "{}", text);
+        assert!(text.contains("could not be read"), "{}", text);
+        assert!(result.structured_content.unwrap().get("screen").is_none());
     }
 
     #[test]
