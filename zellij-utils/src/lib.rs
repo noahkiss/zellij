@@ -6,6 +6,7 @@ pub mod capabilities;
 pub mod cli;
 pub mod cli_surface;
 pub mod client_server_contract;
+pub mod config_span;
 pub mod consts;
 pub mod data;
 pub mod desktop_integration;

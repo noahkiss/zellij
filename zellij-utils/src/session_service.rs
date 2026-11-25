@@ -1040,6 +1040,10 @@ pub struct SessionServiceOptions {
     /// onto a newer pinned build. Unset is [`UpgradeRestarts::Clientless`].
     #[serde(default)]
     pub upgrade_restarts: Option<UpgradeRestarts>,
+    /// fork addition: how long, in seconds, a session must have had no client before the
+    /// watchdog's upgrade restart takes it. Unset is 0: at the first clientless tick.
+    #[serde(default)]
+    pub upgrade_restart_clientless_for: Option<u64>,
     /// Entries in this block that this binary does not know, in the words a human should read.
     ///
     /// A block that parses its own children used to REJECT an unknown one, and a rejection here
@@ -1091,6 +1095,27 @@ impl UpgradeRestarts {
 pub fn configured_upgrade_restarts(extras: Option<&SessionServiceOptions>) -> UpgradeRestarts {
     extras
         .map(|extras| extras.upgrade_restarts())
+        .unwrap_or_default()
+}
+
+/// The bounds of `session_service { upgrade_restart_clientless_for }`: zero (the default, restart
+/// at the first clientless tick) or whole seconds up to 30 days. The watchdog ticks every 15
+/// seconds, so a shorter span is met at the next tick that finds no client.
+pub const UPGRADE_RESTART_CLIENTLESS_FOR_BOUNDS: crate::config_span::SpanBounds =
+    crate::config_span::SpanBounds {
+        min: std::time::Duration::from_secs(1),
+        max: std::time::Duration::from_secs(30 * 24 * 60 * 60),
+        zero: true,
+        whole_seconds: true,
+    };
+
+/// [`SessionServiceOptions::upgrade_restart_clientless_for`] for a caller that may have no
+/// `session_service` block at all.
+pub fn configured_upgrade_restart_clientless_for(
+    extras: Option<&SessionServiceOptions>,
+) -> std::time::Duration {
+    extras
+        .map(|extras| extras.upgrade_restart_clientless_for())
         .unwrap_or_default()
 }
 
@@ -1198,6 +1223,7 @@ impl SessionServiceOptions {
             && self.pin_exe.is_none()
             && self.restart_via_launchd.is_none()
             && self.upgrade_restarts.is_none()
+            && self.upgrade_restart_clientless_for.is_none()
     }
 
     /// Record an entry of this block that this binary does not know, and say so in the log.
@@ -1250,6 +1276,12 @@ impl SessionServiceOptions {
     /// [`UpgradeRestarts::Clientless`].
     pub fn upgrade_restarts(&self) -> UpgradeRestarts {
         self.upgrade_restarts.unwrap_or_default()
+    }
+
+    /// fork addition: how long a session must have been clientless before the watchdog's upgrade
+    /// restart takes it. Unset is zero.
+    pub fn upgrade_restart_clientless_for(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.upgrade_restart_clientless_for.unwrap_or(0))
     }
 
     /// Add a literal directive line to one section of the generated service file.

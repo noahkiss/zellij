@@ -758,6 +758,16 @@ context_menu {
 //     }
 // }
 
+// How long a session must have had no client before the watchdog restarts it onto an upgraded
+// build (session_service { upgrade_restarts }). Counted from the first watchdog tick that finds an
+// upgrade pending and no client attached; a client that attaches starts the count again
+// Whole seconds, or a number with s, m or h. The watchdog ticks every 15 seconds
+// Default: "0s", the first clientless tick
+//
+// session_service {
+//     upgrade_restart_clientless_for "15m"
+// }
+
 // How to record the command of a pane that is running a tool with its own session state, so that
 // a resurrected pane offers to RESUME that state instead of starting over
 // A pane comes back holding the command it was running, and Enter re-runs it - which for a coding

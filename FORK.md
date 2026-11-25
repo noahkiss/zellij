@@ -6049,6 +6049,7 @@ Capability: `session-restart-when-idle`.
 session_service {
     upgrade_restarts "clientless"   // the default
     upgrade_restarts "never"        // leave every session on its build until someone restarts it
+    upgrade_restart_clientless_for "15m"   // wait until nobody has been attached this long
 }
 ```
 
@@ -6084,6 +6085,7 @@ gate, in order:
 | the server is PROVEN another build than the pin (`compare_builds` says `Different`) | nothing; "cannot tell" never restarts |
 | no restart was tried for this pin build yet (`<state-dir>/upgrade-restarted/<session>`) | nothing |
 | the server answers that 0 clients are attached (`ListClients`, asked live) | asked again next tick |
+| the session has been clientless for `upgrade_restart_clientless_for` (`<state-dir>/clientless-since/<session>`) | asked again next tick |
 | the server answers, and no agent is working by the teardown guard's rule | asked again next tick |
 | no Claude agent's own record (`~/.claude/sessions/<pid>.json`) says `busy` or `shell` | asked again next tick |
 | the pin passes the restart pre-flight (`--version`, `setup --check`) | a warning, once per pin build |
@@ -6093,6 +6095,17 @@ gate, in order:
   person at a terminal loses whatever was in it, with no warning and no way to say no. The client
   count is asked of the server, not read from the metadata it last wrote. A session that does not
   answer is not restarted: nobody typed this restart.
+- **`upgrade_restart_clientless_for` waits out a short detach.** An ssh drop or a detach during a
+  long shell job can land on a `brew upgrade`, and the next tick would kill that job. With a span
+  set, the restart waits until the session has had no client that long. The count starts at the
+  first tick that finds a restart pending and no client: the tick writes the time to
+  `<state-dir>/clientless-since/<session>`. A tick that sees a client, a tick with no restart
+  pending, and the restart itself remove the file, so a later upgrade counts afresh. The tick is
+  15 s, so a span is met to within a tick. The value is whole seconds or a number with `s`, `m` or
+  `h`; `"0s"`, the default, restarts at the first clientless tick and writes no file. A value that
+  is no span, a fraction of a second or a non-string warns in `setup --check` and keeps `0s`; a
+  span past 30 days is cut to 30 days, with a warning. The watchdog reads the config at every
+  tick, so an edit applies at the next one.
 - **`shell` counts as working here.** A Claude turn that ends while a background shell runs reports
   `done`, and its `OSC 7501` records count subagents, not shells. Its per-process record says
   `shell`, and a teardown would kill that shell. The record is matched by the agent's session id,
@@ -6116,8 +6129,11 @@ A release that left the server unchanged still restarts a clientless, idle sessi
 **An older binary ignores the key.** From nkmk.18 an unknown `session_service` entry warns and is
 skipped (see `docs/config-compatibility.md`). A value this build does not know warns the same way and
 keeps `clientless`. No `Action`, protobuf tag or client/server message is added.
+`upgrade_restart_clientless_for` is the same kind of entry: a build from nkmk.18 on warns that it
+is unknown and restarts at the first clientless tick; a build at or before nkmk.17 rejects the
+whole config.
 
-Capability: `session-upgrade-restarts`.
+Capabilities: `session-upgrade-restarts`; `upgrade-restart-clientless-for` for the dwell.
 
 ### A pin the launcher does not run is inert everywhere, not only in the message
 

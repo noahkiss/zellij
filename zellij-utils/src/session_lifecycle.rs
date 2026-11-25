@@ -6217,6 +6217,14 @@ pub fn upgrade_restart_allowed(clients: Option<usize>, busy_agents: Option<usize
     clients == Some(0) && busy_agents == Some(0)
 }
 
+/// fork addition: whether a session the watchdog first found clientless at `since_s` (seconds
+/// since the epoch) has been so for `dwell` at `now_s`: `session_service {
+/// upgrade_restart_clientless_for }`. Zero is always met, so the default restarts at the first
+/// clientless tick as before; a dwell with nothing recorded yet is not met.
+pub fn clientless_dwell_met(since_s: Option<u64>, now_s: u64, dwell: std::time::Duration) -> bool {
+    dwell.is_zero() || since_s.is_some_and(|since| now_s.saturating_sub(since) >= dwell.as_secs())
+}
+
 /// Whether one of Claude Code's per-process records (`<sessions dir>/<pid>.json`) says the claude
 /// running session `session_id` is still at work: `busy` mid-turn, or `shell`, a turn that ended
 /// while background shells or subagents still run. Its `OSC 7501` report can read `done` over
@@ -6364,6 +6372,20 @@ mod upgrade_tests {
         // no answer is no restart
         assert!(!upgrade_restart_allowed(None, Some(0)));
         assert!(!upgrade_restart_allowed(Some(0), None));
+    }
+
+    #[test]
+    fn the_clientless_dwell_is_met_only_after_its_span_and_zero_at_once() {
+        use std::time::Duration;
+        let dwell = Duration::from_secs(900);
+        // zero is the old rule: the first clientless tick
+        assert!(clientless_dwell_met(None, 1_000, Duration::ZERO));
+        // nothing recorded yet: the tick that records it does not restart
+        assert!(!clientless_dwell_met(None, 1_000, dwell));
+        assert!(!clientless_dwell_met(Some(1_000), 1_899, dwell));
+        assert!(clientless_dwell_met(Some(1_000), 1_900, dwell));
+        // a clock that went back never meets it early
+        assert!(!clientless_dwell_met(Some(2_000), 1_000, dwell));
     }
 
     #[test]

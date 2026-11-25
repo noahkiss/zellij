@@ -4774,6 +4774,37 @@ impl Options {
                         )),
                     }
                 },
+                // fork addition: how long a session must have had no client before the upgrade
+                // restart takes it. A value that is no span warns and keeps the default
+                "upgrade_restart_clientless_for" => {
+                    let value = kdl_first_entry_as_string!(init_system);
+                    let span = value.map(|value| {
+                        crate::config_span::parse_span(
+                            value,
+                            crate::session_service::UPGRADE_RESTART_CLIENTLESS_FOR_BOUNDS,
+                        )
+                    });
+                    match span {
+                        Some(Ok(span)) => {
+                            if span.capped {
+                                session_service.note_unknown_entry(format!(
+                                    "upgrade_restart_clientless_for {:?} in session_service is \
+                                     longer than {}, which is used instead",
+                                    value.unwrap_or_default(),
+                                    crate::config_span::format_span(span.duration)
+                                ));
+                            }
+                            session_service.upgrade_restart_clientless_for =
+                                Some(span.duration.as_secs());
+                        },
+                        _ => session_service.note_unknown_entry(format!(
+                            "unknown upgrade_restart_clientless_for value {:?} in \
+                             session_service, ignored (expected a span of whole seconds such as \
+                             \"0s\", \"90s\", \"15m\" or \"2h\"; the default is \"0s\")",
+                            value.unwrap_or_default()
+                        )),
+                    }
+                },
                 "systemd" => {
                     for section in kdl_children_nodes_or_error!(init_system, "empty systemd block")
                     {
@@ -4855,7 +4886,8 @@ impl Options {
                 other => {
                     session_service.note_unknown_entry(format!(
                         "unknown session_service entry {:?}, ignored (expected systemd, launchd, \
-                         pin_exe, restart_via_launchd or upgrade_restarts)",
+                         pin_exe, restart_via_launchd, upgrade_restarts or \
+                         upgrade_restart_clientless_for)",
                         other
                     ));
                 },
@@ -4894,6 +4926,14 @@ impl Options {
         if let Some(mode) = session_service.upgrade_restarts {
             let mut node = KdlNode::new("upgrade_restarts");
             node.push(KdlValue::String(mode.config_value().to_owned()));
+            init_systems.nodes_mut().push(node);
+        }
+
+        if let Some(seconds) = session_service.upgrade_restart_clientless_for {
+            let mut node = KdlNode::new("upgrade_restart_clientless_for");
+            node.push(KdlValue::String(crate::config_span::format_span(
+                std::time::Duration::from_secs(seconds),
+            )));
             init_systems.nodes_mut().push(node);
         }
 
@@ -14329,6 +14369,81 @@ fn upgrade_restarts_is_clientless_unless_the_config_says_never() {
         config.options.session_service.unwrap().upgrade_restarts,
         Some(UpgradeRestarts::Never)
     );
+}
+
+/// fork addition: `upgrade_restart_clientless_for` is a span of whole seconds, zero by default; a
+/// value that is no span warns and keeps the default, and a long one is capped at 30 days.
+#[test]
+fn upgrade_restart_clientless_for_parses_warns_and_round_trips() {
+    use crate::session_service::configured_upgrade_restart_clientless_for;
+    use std::time::Duration;
+
+    let options = |kdl: &str| Config::from_kdl(kdl, None).unwrap().options.session_service;
+    let block = |value: &str| {
+        format!(
+            "session_service {{\n    upgrade_restart_clientless_for {}\n}}",
+            value
+        )
+    };
+    assert_eq!(
+        configured_upgrade_restart_clientless_for(None),
+        Duration::ZERO
+    );
+    for (value, secs) in [
+        ("\"0s\"", 0),
+        ("\"90\"", 90),
+        ("\"15m\"", 900),
+        ("\"2h\"", 7200),
+    ] {
+        let parsed = options(&block(value)).unwrap();
+        assert_eq!(
+            configured_upgrade_restart_clientless_for(Some(&parsed)),
+            Duration::from_secs(secs),
+            "{}",
+            value
+        );
+        assert!(
+            parsed.unknown_entries.is_empty(),
+            "{:?}",
+            parsed.unknown_entries
+        );
+        // the dump writes it back, and reads back the same
+        let config = Config::from_kdl(&block(value), None).unwrap();
+        let dumped = config.to_string(false);
+        let again = Config::from_kdl(&dumped, None).unwrap();
+        assert_eq!(
+            again
+                .options
+                .session_service
+                .and_then(|s| s.upgrade_restart_clientless_for),
+            Some(secs),
+            "{}",
+            dumped
+        );
+    }
+    // garbage, a fraction of a second and a value of the wrong type warn and keep the default
+    for value in ["\"soon\"", "\"500ms\"", "true", "15"] {
+        let parsed = options(&block(value)).unwrap();
+        assert_eq!(parsed.upgrade_restart_clientless_for, None, "{}", value);
+        assert_eq!(
+            parsed.unknown_entries.len(),
+            1,
+            "{:?}",
+            parsed.unknown_entries
+        );
+        assert!(
+            parsed.unknown_entries[0].contains("upgrade_restart_clientless_for"),
+            "{}",
+            parsed.unknown_entries[0]
+        );
+    }
+    // a span past 30 days is capped, and says so
+    let capped = options(&block("\"9999h\"")).unwrap();
+    assert_eq!(
+        capped.upgrade_restart_clientless_for,
+        Some(30 * 24 * 60 * 60)
+    );
+    assert_eq!(capped.unknown_entries.len(), 1);
 }
 
 /// The `session_service` block parses its OWN children, and an unknown one is ignored the way an

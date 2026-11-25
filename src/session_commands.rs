@@ -2220,7 +2220,9 @@ fn upgrade_clientless_session(name: &str, opts: &CliArgs, theirs: Option<&Execut
     }
     refresh_the_pin_from_the_installed_build(name, &pin);
     let mode = session_service::configured_upgrade_restarts(extras.as_ref());
-    restart_onto_the_pin(name, &pin, theirs, mode, opts);
+    let clientless_for =
+        session_service::configured_upgrade_restart_clientless_for(extras.as_ref());
+    restart_onto_the_pin(name, &pin, theirs, mode, clientless_for, opts);
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2240,6 +2242,21 @@ fn upgrade_restart_stamp(session: &str) -> PathBuf {
     zellij_utils::consts::ZELLIJ_STATE_DIR
         .join("upgrade-restarted")
         .join(session)
+}
+
+/// Where the watchdog records when it first found `session` clientless with an upgrade restart
+/// pending, for `session_service { upgrade_restart_clientless_for }`: seconds since the epoch.
+/// Removed when a client is seen, when no restart is pending, and when the restart starts.
+fn clientless_since_stamp(session: &str) -> PathBuf {
+    zellij_utils::consts::ZELLIJ_STATE_DIR
+        .join("clientless-since")
+        .join(session)
+}
+
+fn now_epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 fn write_stamp(stamp: &Path, contents: &str) {
@@ -2320,27 +2337,52 @@ fn restart_onto_the_pin(
     pin: &Path,
     theirs: Option<&ExecutableIdentity>,
     mode: session_service::UpgradeRestarts,
+    clientless_for: std::time::Duration,
     opts: &CliArgs,
 ) {
     use std::sync::atomic::Ordering;
     use zellij_utils::session_lifecycle::{
-        compare_builds, identify_executable, upgrade_restart_allowed, upgrade_restart_wanted,
+        clientless_dwell_met, compare_builds, identify_executable, upgrade_restart_allowed,
+        upgrade_restart_wanted,
     };
     let pinned = identify_executable(pin.to_path_buf());
     let build = compare_builds(Some(&pinned), theirs);
     let stamp = upgrade_restart_stamp(name);
     let attempt = build_pair(Some(&pinned), None);
     let tried = std::fs::read_to_string(&stamp).map_or(false, |last| last == attempt);
+    // the dwell counts from the first tick that finds a restart pending and no client: a stamp
+    // left from an earlier upgrade must not meet the next one's dwell at once
+    let since_stamp = clientless_since_stamp(name);
     if !upgrade_restart_wanted(mode, build, tried) {
+        if !clientless_for.is_zero() {
+            let _ = std::fs::remove_file(&since_stamp);
+        }
         return;
     }
     // The gate, cheapest first. Every miss returns without a word and is asked again next tick.
-    if !upgrade_restart_allowed(attached_clients(name), Some(0)) {
+    let clients = attached_clients(name);
+    if !clientless_for.is_zero() {
+        if clients == Some(0) {
+            if !since_stamp.exists() {
+                write_stamp(&since_stamp, &now_epoch_s().to_string());
+            }
+        } else {
+            let _ = std::fs::remove_file(&since_stamp);
+        }
+    }
+    if !upgrade_restart_allowed(clients, Some(0)) {
+        return;
+    }
+    let since = std::fs::read_to_string(&since_stamp)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    if !clientless_dwell_met(since, now_epoch_s(), clientless_for) {
         return;
     }
     if !upgrade_restart_allowed(Some(0), working_agents(name)) {
         return;
     }
+    let _ = std::fs::remove_file(&since_stamp);
     // Recorded before the pre-flight and the teardown: a build that fails its pre-flight, or a
     // restart that does not land on the pin, is tried once for this pin and not every 15 seconds.
     write_stamp(&stamp, &attempt);

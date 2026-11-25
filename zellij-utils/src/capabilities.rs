@@ -104,6 +104,8 @@ pub const CAPABILITIES: &[&str] = &[
     "send-default-harness",
     // agent_message_expire; expiry notices reach other sessions and machines; late messages name their age
     "agent-message-expire",
+    // session_service { upgrade_restart_clientless_for }: the upgrade restart waits for a dwell
+    "upgrade-restart-clientless-for",
 ];
 
 /// The version, split into the parts that can actually be compared.
