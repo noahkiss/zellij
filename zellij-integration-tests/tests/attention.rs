@@ -174,6 +174,10 @@ fn an_agent_reporting_its_status_is_shown_on_its_frame_until_seen() {
 #[test]
 fn the_focused_pane_reports_its_status_while_the_host_window_is_unfocused() {
     let (mut zellij, _left, focused) = start_with_two_panes(runner());
+    // `bell_clear_delay_ms` (default 1000) counts a look only once it has lasted the dwell, and
+    // this pane took focus as it opened: wait the look out, so the pane is one a person has been
+    // watching, which takes a report as seen at once
+    std::thread::sleep(Duration::from_millis(1_500));
     focused.output(&program_status("state=done:app=claude"));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(markers_on_screen(&zellij.snapshot().text), "");
