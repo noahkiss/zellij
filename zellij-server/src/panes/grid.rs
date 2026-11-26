@@ -673,6 +673,24 @@ pub fn parse_agent_session_user_var(raw: &[u8]) -> Option<String> {
     is_token.then(|| id.to_owned())
 }
 
+/// fork addition: the main turn in `SetUserVar=agent_turn=<base64 start|end>`, which a coding
+/// agent's own hook prints when its main turn starts (`UserPromptSubmit`) and ends (`Stop`):
+/// `Some(true)` for an ended turn, `Some(false)` for a started one, `None` for anything else.
+pub fn parse_agent_turn_user_var(raw: &[u8]) -> Option<bool> {
+    use base64::Engine;
+    let value = std::str::from_utf8(raw)
+        .ok()?
+        .strip_prefix("SetUserVar=agent_turn=")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()?;
+    match std::str::from_utf8(&decoded).ok()?.trim() {
+        "end" => Some(true),
+        "start" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn parse_osc7_path(raw: &[u8]) -> Option<std::path::PathBuf> {
     let s = std::str::from_utf8(raw).ok()?;
     let rest = s.strip_prefix("file://")?;
@@ -5736,6 +5754,11 @@ impl Handler for Grid {
                     .and_then(|raw| parse_agent_session_user_var(raw))
                 {
                     self.pending_agent_session = Some(id);
+                    return;
+                }
+                // fork addition: the agent's main turn, which its background work does not move
+                if let Some(ended) = params.get(1).and_then(|raw| parse_agent_turn_user_var(raw)) {
+                    self.program_status.note_turn(ended);
                     return;
                 }
                 if let Some(raw) = params.get(1).and_then(|p| str::from_utf8(p).ok()) {

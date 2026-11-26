@@ -1660,6 +1660,7 @@ impl Pane for TerminalPane {
             since_input: self.grid.program_status.since_input(now),
             reports: self.grid.program_status.reports(),
             queries: self.grid.program_status.queries(),
+            turn_ended: self.grid.program_status.turn_ended(),
         })
     }
     fn note_message_delivered(&mut self, now: std::time::Instant) {

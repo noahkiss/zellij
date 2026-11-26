@@ -628,6 +628,13 @@ pub struct GuardFacts<'a> {
     /// per-process record, read through [`claude_status_free`]. It speaks over a `working` state,
     /// never over `blocked` or a missing state.
     pub harness_free: Option<bool>,
+    /// The agent's main turn by its own hooks (`zellij setup --agent-hooks`): `Some(true)` when
+    /// its `Stop` hook ran last, `Some(false)` when its `UserPromptSubmit` hook did, `None` when
+    /// neither has since it started or since the last delivery. An ended turn speaks over
+    /// `working` and over [`Self::harness_free`], which both stay busy while background subagents
+    /// run; never over `blocked` or a missing state. A started turn adds nothing: a turn a person
+    /// interrupts runs no `Stop` hook.
+    pub turn_ended: Option<bool>,
 }
 
 /// What a `status` in Claude Code's per-process session record (`$CLAUDE_CONFIG_DIR/sessions/
@@ -678,6 +685,9 @@ pub fn guard(facts: &GuardFacts) -> Decision {
         },
         None => return Decision::Refuse(Reason::NoState),
         Some("blocked") => return Decision::Hold(Reason::Blocked),
+        // the agent's own hooks say its main turn is over: background subagents keep the report
+        // at `working` and the record at `busy`, and neither keeps the prompt from input
+        Some(_) if facts.turn_ended == Some(true) => {},
         // the harness's own record knows its main loop better than a report that stays
         // `working` while background work runs
         Some(_) if facts.harness_free == Some(false) => return Decision::Hold(Reason::Working),
@@ -960,7 +970,40 @@ mod tests {
             quiet_ms: QUIET_MS,
             startup_ms: STARTUP_MS,
             harness_free: None,
+            turn_ended: None,
         }
+    }
+
+    #[test]
+    fn an_ended_main_turn_takes_a_message_while_background_subagents_run() {
+        // the main prompt is free; subagents keep the report `working` and the record `busy`
+        let mut ended = facts(Some("claude"), Some("working"));
+        ended.harness_free = claude_status_free("busy");
+        ended.turn_ended = Some(true);
+        assert_eq!(guard(&ended), Decision::Deliver);
+        // a draft, typing, a permission prompt and a missing state still hold
+        let mut draft = ended;
+        draft.draft_pending = true;
+        assert_eq!(guard(&draft), Decision::Hold(Reason::Draft));
+        let mut typing = ended;
+        typing.since_input_ms = Some(QUIET_MS - 1);
+        assert_eq!(guard(&typing), Decision::Hold(Reason::Typing));
+        let mut blocked = ended;
+        blocked.state = Some("blocked");
+        assert_eq!(guard(&blocked), Decision::Hold(Reason::Blocked));
+        let mut starting = ended;
+        starting.state = None;
+        assert_eq!(guard(&starting), Decision::Hold(Reason::Starting));
+        // a started turn, or no hook at all, leaves today's rule
+        let mut started = ended;
+        started.turn_ended = Some(false);
+        assert_eq!(guard(&started), Decision::Hold(Reason::Working));
+        let mut idle_started = facts(Some("claude"), Some("idle"));
+        idle_started.turn_ended = Some(false);
+        assert_eq!(guard(&idle_started), Decision::Deliver);
+        let mut no_hook = ended;
+        no_hook.turn_ended = None;
+        assert_eq!(guard(&no_hook), Decision::Hold(Reason::Working));
     }
 
     #[test]

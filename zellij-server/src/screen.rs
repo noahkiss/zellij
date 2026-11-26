@@ -9024,6 +9024,11 @@ impl Screen {
             quiet_ms: self.agent_mail_quiet_ms,
             startup_ms: self.agent_mail_startup_ms,
             harness_free,
+            // a message just typed in is the agent's turn, whatever the hooks said before it
+            turn_ended: prompt
+                .as_ref()
+                .filter(|prompt| !prompt.message_pending)
+                .and_then(|prompt| prompt.turn_ended),
         };
         let decision = agent_mail::guard(&facts);
         if decision != Decision::Deliver {

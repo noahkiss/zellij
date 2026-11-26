@@ -169,6 +169,10 @@ pub struct ProgramStatusRecords {
     /// fork addition: how many times a program asked `OSC 7501 ; ?` here. Each ask is a program
     /// starting, which starts `send-message`'s startup window again.
     queries: u64,
+    /// fork addition: the agent's main turn, from its own hooks (`SetUserVar=agent_turn`):
+    /// `Some(true)` ended, `Some(false)` started, `None` not reported since the program started or
+    /// a message was delivered. See [`Self::turn_ended`].
+    turn_ended: Option<bool>,
 }
 
 impl ProgramStatusRecords {
@@ -260,6 +264,24 @@ impl ProgramStatusRecords {
         self.records.clear();
         self.draft.taken_up();
         self.queries += 1;
+        self.turn_ended = None;
+    }
+
+    /// fork addition: the agent's hook said its main turn started (`false`) or ended (`true`). A
+    /// started turn took up whatever its prompt held, a message the session typed in included.
+    pub fn note_turn(&mut self, ended: bool) {
+        if !ended {
+            self.draft.taken_up();
+        }
+        self.turn_ended = Some(ended);
+    }
+
+    /// fork addition: whether the agent's main turn is over by its own hooks' word. Its `OSC 7501`
+    /// state and Claude Code's per-process record both stay `working` and `busy` while background
+    /// subagents run after the main turn ended; this does not. `None` before the first hook since
+    /// the program started, and after a message was delivered until the hook reports again.
+    pub fn turn_ended(&self) -> Option<bool> {
+        self.turn_ended
     }
 
     /// fork addition: how many reports the pane has taken, ever. A clear, a query or a reset
@@ -313,6 +335,8 @@ impl ProgramStatusRecords {
     pub fn note_delivered(&mut self, now: std::time::Instant) {
         self.input_since_report = true;
         self.draft.delivered(now);
+        // an ended turn is from before the message: the message starts the next one
+        self.turn_ended = None;
     }
 
     /// Whether input was typed into the pane after the program last reported or cleared.
@@ -397,6 +421,48 @@ mod tests {
             Some(Message::Report(report)) => report,
             other => panic!("{body:?} is not a report: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_main_turn_follows_the_hooks_and_a_delivery_or_a_new_program_forgets_it() {
+        let now = std::time::Instant::now();
+        let mut records = ProgramStatusRecords::default();
+        assert_eq!(records.turn_ended(), None);
+        records.note_turn(true);
+        assert_eq!(records.turn_ended(), Some(true));
+        // the message is the next turn: the ended mark is from before it
+        records.note_delivered(now);
+        assert!(records.message_pending(now));
+        assert_eq!(records.turn_ended(), None);
+        // UserPromptSubmit took the message up
+        records.note_turn(false);
+        assert!(!records.message_pending(now));
+        assert_eq!(records.turn_ended(), Some(false));
+        records.note_turn(true);
+        records.program_started();
+        assert_eq!(records.turn_ended(), None);
+    }
+
+    #[test]
+    fn the_turn_user_var_is_read_from_its_base64_value() {
+        use crate::panes::grid::parse_agent_turn_user_var;
+        let var = |value: &str| format!("SetUserVar=agent_turn={}", b64(value));
+        assert_eq!(parse_agent_turn_user_var(var("end").as_bytes()), Some(true));
+        assert_eq!(
+            parse_agent_turn_user_var(var("start").as_bytes()),
+            Some(false)
+        );
+        assert_eq!(parse_agent_turn_user_var(var("maybe").as_bytes()), None);
+        assert_eq!(
+            parse_agent_turn_user_var(b"SetUserVar=agent_turn=end"),
+            None
+        );
+        assert_eq!(
+            parse_agent_turn_user_var(
+                format!("SetUserVar=agent_session={}", b64("end")).as_bytes()
+            ),
+            None
+        );
     }
 
     #[test]

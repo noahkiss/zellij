@@ -6300,6 +6300,7 @@ gate, in order:
 | the server answers, and no agent is working by the teardown guard's rule | asked again next tick |
 | no Claude agent's own record (`~/.claude/sessions/<pid>.json`) says `busy` or `shell` | asked again next tick |
 | no pane runs a command that has not exited: a command pane neither exited nor held, or a shell whose OSC 133 marks or foreground tracker say `running` (agents are left to the rows above) | asked again next tick; the reason is printed once per change (`<state-dir>/upgrade-waiting/<session>`) |
+| the pin passes the restart pre-flight (`--version`, `setup --check`) | a warning, once per pin build |
 | still 0 clients, and still no command running, after the pre-flight | asked again next tick |
 
 - **A session with a client attached is never restarted.** A teardown kills every pane, and a
@@ -9178,6 +9179,8 @@ said so. The binary now owns the file.
   `XDG_CONFIG_HOME` do not move it.
 - The claude snippet now runs `claude start` and `claude context` on `SessionStart`, and
   `claude end` on `SessionEnd`. See the agent-session contract above for why.
+- The `turn start|end` mode prints the main-turn mark `send-message` reads; the claude snippet
+  runs it on `UserPromptSubmit` and `Stop`. See "Agent messages wait until the agent is idle".
 
 `setup --check --json` lists `agent-hooks-write`. No client/server contract changes.
 
@@ -9882,6 +9885,22 @@ reads stdin).
   record decides again. A key whose effect is unknown (Up, Tab) leaves a draft unknown until the
   agent next starts a turn, which a report stuck at `working` never shows; such a draft holds a
   message until it is cleared (Ctrl c or Ctrl u) or the background work ends.
+- **Claude's main turn, from its own hooks.** Claude Code 2.1.331 reports `working` over
+  `OSC 7501` and `busy` in its record while background subagents run, though its main turn has
+  ended and its prompt takes input; neither tells the two apart, and a message waited out its
+  expiry. The `--agent-hooks` snippet for claude now also runs `agent-session.sh claude turn
+  start` on `UserPromptSubmit` and `claude turn end` on `Stop`, which fires for the main agent
+  only (`SubagentStop` is its own event). The script prints `OSC 1337
+  SetUserVar=agent_turn=<base64 start|end>` to the agent's terminal, found by the same walk as
+  the session report, and the pane keeps the latest. A pane whose latest mark is `end` counts as
+  idle for delivery whatever its report or record says. It never overrides `blocked`, a missing
+  state, a draft or recent typing. `start` adds nothing: a turn a person interrupts runs no
+  `Stop` hook. A delivery forgets the mark, since the message starts the next turn, and so does
+  a program starting in the pane (`OSC 7501 ; ?`); `start` also takes a delivered message or a
+  draft up. A pane that has had no mark - an older hooks install - is judged as before. The one
+  gap: a turn Claude Code starts by itself, when a background task finishes, runs no
+  `UserPromptSubmit`, so a message typed in then waits in Claude Code's own input queue. No
+  client/server contract change: the mark travels in the pane's own output.
 - **The draft** is read from the bytes that reach the pane, the same ones that set
   `input_since_state`: characters and pastes add, Backspace and Delete take away, Ctrl c and
   Ctrl u clear, cursor moves change nothing, and a key whose effect cannot be known (Up, Tab, Esc

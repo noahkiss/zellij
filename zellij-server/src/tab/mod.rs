@@ -572,6 +572,9 @@ pub struct AgentPrompt {
     /// `ProgramStatusRecords::reports` and `queries`.
     pub reports: u64,
     pub queries: u64,
+    /// fork addition: the agent's main turn by its own hooks; see
+    /// `ProgramStatusRecords::turn_ended`.
+    pub turn_ended: Option<bool>,
 }
 
 pub trait Pane {

@@ -57,6 +57,7 @@ const EARLIER_SESSION_SCRIPTS: &[&str] = &[
     "f72dce7d091b9ffe196985571f754ca1e17b3d592e3affe31ae28692722ae1fb", // OSC 1337 report only
     "55cc7140a29fb6ba3ed22d70dfe892602ef7026a2f82fb6863650b5cc7ceab2f", // before the state mode
     "6eacd8a12d1a95445db6cc818efc603c5337978d4e8026e46c90caae2a8031d7", // before the context mode
+    "969d8d1e183c3510a3b767b83e21088ddedeae922e53f61a44de0727fe148fb7", // before the turn mode
 ];
 
 /// Both harnesses hand their hook a JSON object on stdin with a `session_id` field. A hook's
@@ -69,6 +70,7 @@ pub const SESSION_SCRIPT: &str = r#"#!/bin/sh
 # Agent session hook (zellij setup --agent-hooks).
 # Usage: sh agent-session.sh KIND start|end|osc|context
 #        sh agent-session.sh KIND state STATE [BLOCKED_KIND]
+#        sh agent-session.sh KIND turn start|end
 #   start: register the session in the agent-sessions registry, then report it to zellij
 #   end:   unregister it
 #   osc:   only report it to zellij
@@ -76,6 +78,8 @@ pub const SESSION_SCRIPT: &str = r#"#!/bin/sh
 #   state: only tell zellij what the agent is doing (OSC 7501): idle, working, done, blocked
 #          (with permission, question or auth) or error. For an agent that does not report
 #          it itself; claude and pi do.
+#   turn:  only tell zellij the agent's main turn started or ended, whatever its background
+#          work is doing (OSC 1337 SetUserVar=agent_turn)
 # Reads the hook's JSON on stdin for its "session_id".
 kind=$1
 mode=${2:-start}
@@ -91,7 +95,10 @@ if [ "$mode" = context ]; then
   wait "$watchdog_pid" 2>/dev/null
   exit 0
 fi
-if [ "$mode" = state ]; then
+if [ "$mode" = turn ]; then
+  cat >/dev/null
+  case "$3" in start|end) ;; *) exit 0 ;; esac
+elif [ "$mode" = state ]; then
   cat >/dev/null
   case "$3" in idle|working|done|blocked|error) ;; *) exit 0 ;; esac
   report="state=$3:app=$kind"
@@ -134,6 +141,11 @@ if [ "$mode" = state ]; then
   { printf '\033]7501;%s\007' "$report" > "/dev/$t"; } 2>/dev/null
   exit 0
 fi
+if [ "$mode" = turn ]; then
+  b64=$(printf %s "$3" | base64 | tr -d '\n')
+  { printf '\033]1337;SetUserVar=agent_turn=%s\007' "$b64" > "/dev/$t"; } 2>/dev/null
+  exit 0
+fi
 b64=$(printf %s "$id" | base64 | tr -d '\n')
 { printf '\033]1337;SetUserVar=agent_session=%s\007' "$b64" > "/dev/$t"; } 2>/dev/null
 exit 0
@@ -145,8 +157,11 @@ pub const AGENT_HOOKS: &[AgentHook] = &[
         file: "~/.claude/settings.json (or $CLAUDE_CONFIG_DIR/settings.json)",
         how: "merge into the top-level \"hooks\" object; SessionStart fires on start-up, /clear, \
               /resume and compaction",
-        covers: "register on SessionStart, unregister on SessionEnd, the zellij report, and live \
-                 pane context. Registration is this hook's job. `agent-sessions register` merges \
+        covers: "register on SessionStart, unregister on SessionEnd, the zellij report, live \
+                 pane context, and the main turn: started on UserPromptSubmit, ended on Stop, \
+                 which fires for the main agent only (SubagentStop is its own event). \
+                 `send-message` delivers to a claude whose main turn ended while its background \
+                 subagents still run. Registration is this hook's job. `agent-sessions register` merges \
                  into an existing entry, so bm's SessionStart hook may register the same id again \
                  to add bm_project, in either order. The env export ($CLAUDE_ENV_FILE) lives in \
                  bm's SessionStart hook; do not add it here",
@@ -164,6 +179,20 @@ pub const AGENT_HOOKS: &[AgentHook] = &[
       {
         "hooks": [
           { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude end" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude turn start" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude turn end" }
         ]
       }
     ]
@@ -908,7 +937,7 @@ mod tests {
     fn the_session_script_hash_is_pinned() {
         let current = sha256_hex(SESSION_SCRIPT.as_bytes());
         assert_eq!(
-            current, "969d8d1e183c3510a3b767b83e21088ddedeae922e53f61a44de0727fe148fb7",
+            current, "5f05c0797a1d0edad41b0cc75b8a30f2f042fb45a82960f8eb0062d5ab2daba0",
             "SESSION_SCRIPT changed: append the old hash to EARLIER_SESSION_SCRIPTS, then pin the \
              new one here"
         );
