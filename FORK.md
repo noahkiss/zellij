@@ -6299,8 +6299,8 @@ gate, in order:
 | the session has been clientless for `upgrade_restart_clientless_for` (`<state-dir>/clientless-since/<session>`) | asked again next tick |
 | the server answers, and no agent is working by the teardown guard's rule | asked again next tick |
 | no Claude agent's own record (`~/.claude/sessions/<pid>.json`) says `busy` or `shell` | asked again next tick |
-| the pin passes the restart pre-flight (`--version`, `setup --check`) | a warning, once per pin build |
-| still 0 clients after the pre-flight | asked again next tick |
+| no pane runs a command that has not exited: a command pane neither exited nor held, or a shell whose OSC 133 marks or foreground tracker say `running` (agents are left to the rows above) | asked again next tick; the reason is printed once per change (`<state-dir>/upgrade-waiting/<session>`) |
+| still 0 clients, and still no command running, after the pre-flight | asked again next tick |
 
 - **A session with a client attached is never restarted.** A teardown kills every pane, and a
   person at a terminal loses whatever was in it, with no warning and no way to say no. The client
@@ -6317,6 +6317,12 @@ gate, in order:
   is no span, a fraction of a second or a non-string warns in `setup --check` and keeps `0s`; a
   span past 30 days is cut to 30 days, with a warning. The watchdog reads the config at every
   tick, so an edit applies at the next one.
+- **A running command holds the restart.** A session that runs scheduled jobs as command panes
+  has no client and often no agent, and a teardown killed a job mid-run. No dwell outlasts a long
+  job, so the restart waits while any pane runs a command, however long. An idle shell, at its
+  prompt or back at it, runs nothing and never holds it; a shell with a program in the foreground
+  (an editor, `tail -f`) does, until it exits. A session that does not answer is not restarted.
+  `upgrade_restarts "never"` returns before any of this.
 - **`shell` counts as working here.** A Claude turn that ends while a background shell runs reports
   `done`, and its `OSC 7501` records count subagents, not shells. Its per-process record says
   `shell`, and a teardown would kill that shell. The record is matched by the agent's session id,

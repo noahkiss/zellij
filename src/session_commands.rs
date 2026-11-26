@@ -2382,6 +2382,9 @@ fn restart_onto_the_pin(
     if !upgrade_restart_allowed(Some(0), working_agents(name)) {
         return;
     }
+    if !no_command_running(name) {
+        return;
+    }
     let _ = std::fs::remove_file(&since_stamp);
     // Recorded before the pre-flight and the teardown: a build that fails its pre-flight, or a
     // restart that does not land on the pin, is tried once for this pin and not every 15 seconds.
@@ -2393,14 +2396,14 @@ fn restart_onto_the_pin(
         );
         return;
     }
-    // The pre-flight took a moment, and somebody may have attached in it.
-    if attached_clients(name) != Some(0) {
+    // The pre-flight took a moment, and somebody may have attached, or a job started, in it.
+    if attached_clients(name) != Some(0) || !no_command_running(name) {
         let _ = std::fs::remove_file(&stamp);
         return;
     }
     println!(
-        "upgrade: restarting '{}' onto the build pinned at {}: no client is attached and no agent \
-         is working",
+        "upgrade: restarting '{}' onto the build pinned at {}: no client is attached, no agent \
+         is working and no command is running",
         name,
         pin.display()
     );
@@ -2415,6 +2418,50 @@ fn restart_onto_the_pin(
         Ok(()) => 0,
         Err(()) => 1,
     });
+}
+
+/// Where the watchdog records why it last held an upgrade restart of `session` for a running
+/// command, so a job that runs for an hour costs one line, not one per tick.
+fn upgrade_waiting_stamp(session: &str) -> PathBuf {
+    zellij_utils::consts::ZELLIJ_STATE_DIR
+        .join("upgrade-waiting")
+        .join(session)
+}
+
+/// Whether no pane of `name` runs a command that has not exited: a command pane still running,
+/// or a shell with a foreground program. A teardown would kill it mid-run, and the watchdog asks
+/// again next tick. The reason is printed when it changes. A session that does not answer is
+/// not restarted.
+fn no_command_running(name: &str) -> bool {
+    let make_os_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
+        match zellij_client::os_input_output::get_cli_client_os_input() {
+            Ok(os_input) => Box::new(os_input),
+            Err(e) => {
+                eprintln!("upgrade: could not open a client: {}", e);
+                process::exit(1);
+            },
+        }
+    };
+    let stamp = upgrade_waiting_stamp(name);
+    let running =
+        match zellij_client::cli_client::running_commands_before_teardown(&make_os_input, name) {
+            Ok(running) => running,
+            Err(_) => return false,
+        };
+    if running.is_empty() {
+        let _ = std::fs::remove_file(&stamp);
+        return true;
+    }
+    let reason = format!(
+        "upgrade: '{}' waits to restart onto the pin while a command runs: {}",
+        name,
+        running.join(", ")
+    );
+    if std::fs::read_to_string(&stamp).map_or(true, |last| last != reason) {
+        println!("{}", reason);
+        write_stamp(&stamp, &reason);
+    }
+    false
 }
 
 /// How many clients are attached to `name`, or `None` when it does not answer.

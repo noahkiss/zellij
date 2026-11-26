@@ -1832,6 +1832,39 @@ pub fn agents_before_teardown(
     agent_snapshot(make_os_input, session_name, None)
 }
 
+/// fork addition: the panes of one session that run a command which has not exited, as
+/// `<handle> (<command>)`, for the watchdog's upgrade restart: a teardown would kill that command
+/// mid-run. An agent's pane is left to the agent rule ([`agents_before_teardown`]).
+pub fn running_commands_before_teardown(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<Vec<String>, String> {
+    Ok(panes_of_session(make_os_input(), session_name)?
+        .iter()
+        .filter(|pane| runs_a_command(pane))
+        .map(|pane| {
+            let command = pane
+                .pane_info
+                .pane_command
+                .as_deref()
+                .or(pane.pane_info.terminal_command.as_deref())
+                .unwrap_or("a command");
+            format!("{} ({})", pane.pane_info.handle, command)
+        })
+        .collect())
+}
+
+/// Whether a pane runs a command that has not exited: a command pane that has neither exited
+/// nor been held, or a shell whose own markers or foreground-process tracker say `running`. A
+/// shell at its prompt, or back at it, runs nothing, so an idle shell never holds a restart.
+fn runs_a_command(pane: &PaneListEntry) -> bool {
+    let info = &pane.pane_info;
+    if info.is_plugin || info.exited || info.is_held || pane.agent.is_some() {
+        return false;
+    }
+    info.terminal_command.is_some() || pane.command_state == Some(PaneCommandState::Running)
+}
+
 /// fork addition: how many clients are attached to the running session, asked of the server
 /// itself rather than read from the metadata it last wrote. A CLI query is a client of its own
 /// that the list does not include. `Err` when the session does not answer, or answers with
@@ -4460,6 +4493,52 @@ mod tests {
             })
             .collect();
         serde_json::to_string(&entries).unwrap()
+    }
+
+    #[test]
+    fn only_a_command_that_has_not_exited_holds_an_upgrade_restart() {
+        let mut panes: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (1, false, false, None),
+            (2, false, false, None),
+            (3, false, true, Some(0)),
+            (4, false, false, None),
+            (5, true, false, None),
+            (6, false, false, None),
+            (7, false, false, None),
+        ]))
+        .unwrap();
+        // a running command pane
+        panes[1].pane_info.terminal_command = Some("sleep 600".to_owned());
+        // one that exited, and one held for a re-run
+        panes[2].pane_info.terminal_command = Some("true".to_owned());
+        panes[3].pane_info.terminal_command = Some("make".to_owned());
+        panes[3].pane_info.is_held = true;
+        // a shell running a foreground program
+        panes[5].command_state = Some(PaneCommandState::Running);
+        // an agent: the agent rule decides, not this one
+        panes[6].pane_info.terminal_command = Some("claude".to_owned());
+        panes[6].agent = Some(zellij_utils::agent_detect::PaneAgent {
+            kind: "claude".to_owned(),
+            name: None,
+            agent_id: None,
+            source: "command".to_owned(),
+            session_source: None,
+        });
+        let running: Vec<u32> = panes
+            .iter()
+            .filter(|pane| runs_a_command(pane))
+            .map(|pane| pane.pane_info.id)
+            .collect();
+        assert_eq!(running, vec![2, 6]);
+        // an idle shell, at its prompt or back at it, holds nothing
+        for state in [
+            None,
+            Some(PaneCommandState::Prompt),
+            Some(PaneCommandState::Done),
+        ] {
+            panes[0].command_state = state;
+            assert!(!runs_a_command(&panes[0]));
+        }
     }
 
     #[test]
