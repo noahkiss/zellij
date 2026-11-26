@@ -655,12 +655,11 @@ impl ServerOsApi for ServerOsInputOutput {
                 }
                 let cmd = process.cmd();
                 if !cmd.is_empty() {
-                    cmds.insert(
-                        pid,
-                        cmd.iter()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .collect(),
-                    );
+                    let argv = cmd
+                        .iter()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .collect();
+                    cmds.insert(pid, crate::resurrect_hints::caller_argv(pid, argv));
                 }
             }
         }
@@ -926,6 +925,7 @@ fn foreground_cmds_by_pid(
         if command.is_empty() {
             continue;
         }
+        let command = crate::resurrect_hints::caller_argv(fg_pid, command);
         let command = apply_post_command_hook(command, post_hook);
         cmds.insert(terminal_id, command);
     }
@@ -985,6 +985,7 @@ fn foreground_cmds_by_child(
         if command.is_empty() {
             continue;
         }
+        let command = crate::resurrect_hints::caller_argv(child_pid, command);
         cmds.insert(terminal_id, apply_post_command_hook(command, post_hook));
     }
     cmds

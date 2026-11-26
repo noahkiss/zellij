@@ -4190,6 +4190,39 @@ ignored by a build that does not know it; nkmk.25 reports a config carrying one 
 A value this build does not know, or one that is not a string, is warned about and ignored, which
 means `"all"`. So the key can go into a shared config before every machine has the binary.
 
+### An agent started through a launcher wrapper is recorded with its caller's arguments
+
+A launcher wrapper for a coding agent - a `claude` script first on `PATH` that adds flags such as
+`--settings <file>`, then `exec`s the real binary - leaves its own flags in the agent's argv. zellij
+read that argv for `pane_command`, `list-agents` and the restore, and a restore runs the agent by
+name through `PATH`, so through the wrapper again: the flags came back twice, as `claude --settings
+X --settings X --resume <id>` on a pane whose argv already carried them.
+
+A wrapper may now say what its caller passed it. It exports two variables right before it `exec`s:
+
+| variable | value |
+|---|---|
+| `HARNESS_ORIGINAL_ARGS` | the caller's own arguments, as a JSON array of strings |
+| `HARNESS_ORIGINAL_ARGS_PID` | its own pid (`$$` in sh), which `exec` keeps |
+
+When zellij reads a process's argv and argv0 names a harness it knows (`claude`, `codex`,
+`opencode`, `pi`), it reads that process's environment, the same way the resume path reads one
+(`/proc/<pid>/environ` on Linux, `KERN_PROCARGS2` on macOS). When both variables are there and the
+pid is that process's own, the argv becomes the harness's bare name and the caller's arguments. A
+child that only inherited the variables has another pid and keeps its argv. A missing or unreadable
+variable, a value that is not a JSON array of strings, or another platform keeps the argv as
+before. The answer is kept per pid and argv, since a process's environment does not change after it
+`exec`s, so each agent process is read once.
+
+That one argv feeds `pane_command`, agent detection, the closed-pane prefill and the serialized
+layout, so each names only what the caller typed, by the bare name a restore runs through `PATH`.
+`resurrect_hints::caller_argv` holds the rule.
+
+Every place zellij starts or restores an agent runs it by name through `PATH`, so a wrapper runs:
+a layout `command` and a restored pane (`Command::new` with the recorded name), `resurrect_commands
+"prefill"` and `reopen-pane` (typed at a shell prompt), `zellij_create` (typed into a shell, or
+`$SHELL -c` with `run_in: exec`), and `default_harness` (typed into a shell). None resolves a path.
+
 ### A command pane is recorded as its own command, not its newest child
 
 From nkmk.29. A pane can run an agent directly: a layout's `command "claude"`, or a restored pane after Enter.

@@ -868,9 +868,128 @@ fn env_from_procargs2(procargs: &[u8], var: &str) -> Option<String> {
     }
 }
 
+/// fork addition: the variable a launcher wrapper sets to the arguments its caller passed it, as a
+/// JSON array of strings. A wrapper that adds its own flags before it `exec`s the real tool leaves
+/// those flags in the tool's argv; recording that argv and running it again through the wrapper
+/// would add them twice.
+pub const ORIGINAL_ARGS_ENV: &str = "HARNESS_ORIGINAL_ARGS";
+/// fork addition: the pid the wrapper's [`ORIGINAL_ARGS_ENV`] belongs to: its own, which `exec`
+/// keeps. A process that merely inherited the variable from an agent has another pid, so its
+/// argv is left alone.
+pub const ORIGINAL_ARGS_PID_ENV: &str = "HARNESS_ORIGINAL_ARGS_PID";
+
+/// The argv to record and report for process `pid`, whose live argv is `argv`.
+///
+/// For a coding agent this build knows, started through a launcher wrapper that set
+/// [`ORIGINAL_ARGS_ENV`] and [`ORIGINAL_ARGS_PID_ENV`] for this pid: the agent's bare name and the
+/// caller's own arguments, so a restore runs it through `PATH` - and the wrapper - with only what
+/// the caller typed. Anything else, or anything that cannot be read, is `argv` unchanged.
+///
+/// One environment read per new (pid, argv): a process's environment does not change after it
+/// `exec`s, so the answer is kept.
+pub fn caller_argv(pid: u32, argv: Vec<String>) -> Vec<String> {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<(u32, Vec<String>), Option<Vec<String>>>>> =
+        OnceLock::new();
+    let Some(argv0) = argv.first() else {
+        return argv;
+    };
+    if zellij_utils::agent_detect::harness_for_command(argv0).is_none() {
+        return argv;
+    }
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (pid, argv);
+    if let Some(found) = seen.lock().ok().and_then(|seen| seen.get(&key).cloned()) {
+        return found.unwrap_or(key.1);
+    }
+    let found = read_process_environ(pid).and_then(|environ| {
+        original_argv(
+            &key.1,
+            pid,
+            env_from_environ(&environ, ORIGINAL_ARGS_ENV).as_deref(),
+            env_from_environ(&environ, ORIGINAL_ARGS_PID_ENV).as_deref(),
+        )
+    });
+    if let Ok(mut seen) = seen.lock() {
+        // pids are reused and argvs change: a bound keeps the map from growing for ever
+        if seen.len() >= 256 {
+            seen.clear();
+        }
+        seen.insert(key.clone(), found.clone());
+    }
+    found.unwrap_or(key.1)
+}
+
+/// [`caller_argv`]'s rule, over the two values read from `pid`'s environment.
+fn original_argv(
+    argv: &[String],
+    pid: u32,
+    original_args: Option<&str>,
+    owner_pid: Option<&str>,
+) -> Option<Vec<String>> {
+    if owner_pid?.trim().parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let args: Vec<String> = serde_json::from_str(original_args?).ok()?;
+    let argv0 = argv.first()?;
+    let name = Path::new(argv0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(argv0);
+    Some(std::iter::once(name.to_owned()).chain(args).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_wrappers_own_flags_are_not_recorded() {
+        let argv = words(&["claude", "--settings", "/s.json", "--resume", "abc"]);
+        assert_eq!(
+            original_argv(&argv, 42, Some(r#"["--resume","abc"]"#), Some("42")),
+            Some(words(&["claude", "--resume", "abc"]))
+        );
+    }
+
+    #[test]
+    fn a_wrapper_that_execs_the_real_path_is_recorded_by_its_bare_name() {
+        let argv = words(&["/opt/tools/bin/codex", "-c", "k=v", "resume", "x"]);
+        assert_eq!(
+            original_argv(&argv, 7, Some(r#"["resume","x"]"#), Some("7")),
+            Some(words(&["codex", "resume", "x"]))
+        );
+    }
+
+    #[test]
+    fn arguments_with_spaces_quotes_and_newlines_survive() {
+        let argv = words(&["claude", "--settings", "s", "fix \"this\"\nnow"]);
+        assert_eq!(
+            original_argv(&argv, 1, Some(r#"["fix \"this\"\nnow"]"#), Some("1")),
+            Some(words(&["claude", "fix \"this\"\nnow"]))
+        );
+    }
+
+    #[test]
+    fn an_inherited_variable_or_a_bad_value_leaves_the_argv_alone() {
+        let argv = words(&["claude", "-p", "x"]);
+        // another process's pid: this one only inherited the variable
+        assert_eq!(original_argv(&argv, 9, Some("[]"), Some("8")), None);
+        assert_eq!(original_argv(&argv, 9, Some("[]"), None), None);
+        assert_eq!(original_argv(&argv, 9, None, Some("9")), None);
+        assert_eq!(original_argv(&argv, 9, Some("not json"), Some("9")), None);
+        assert_eq!(original_argv(&argv, 9, Some(r#"[1]"#), Some("9")), None);
+    }
+
+    #[test]
+    fn a_command_that_is_no_agent_is_never_read() {
+        // no environment is read for it: pid 0 would not answer anyway
+        assert_eq!(caller_argv(0, words(&["vim", "x"])), words(&["vim", "x"]));
+    }
 
     fn tree(edges: &[(u32, &[u32])]) -> ProcessTree {
         ProcessTree::from_children(
