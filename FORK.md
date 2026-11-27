@@ -741,9 +741,9 @@ error without `--wait-ready`.
 - **It is the client's to hold**: taken off the request before the action is built, so nothing about it reaches the action or the client/server contract.
 - `action --json` carries both lines: `"ready_by": "prompt"`, `"ready_ms": 252`.
 
-There is no `run --shell`. Running a command inside the user's interactive shell is what the MCP
-`zellij_create` does by default — make a shell pane with `--wait-ready`, then type the command —
-and that covers the case without a second way to spawn a command pane.
+There is no `run --shell`. Running a command inside the user's interactive shell is what an MCP
+caller does — `zellij_create` makes a shell pane with `--wait-ready`, then `zellij_write_input`
+types the command — and that covers the case without a second way to spawn a command pane.
 
 `zellij-utils/src/cli.rs` (`ReadyFlags`, flattened into the five verbs, and
 `CliAction::take_wait_ready`), `src/commands.rs` and `src/lib.rs` to plumb it, and
@@ -4220,8 +4220,8 @@ layout, so each names only what the caller typed, by the bare name a restore run
 
 Every place zellij starts or restores an agent runs it by name through `PATH`, so a wrapper runs:
 a layout `command` and a restored pane (`Command::new` with the recorded name), `resurrect_commands
-"prefill"` and `reopen-pane` (typed at a shell prompt), `zellij_create` (typed into a shell, or
-`$SHELL -c` with `run_in: exec`), and `default_harness` (typed into a shell). None resolves a path.
+"prefill"` and `reopen-pane` (typed at a shell prompt), `zellij_write_input` (typed into a shell),
+`zellij_create` (`$SHELL -c` with `exec`), and `default_harness` (typed into a shell). None resolves a path.
 
 ### A command pane is recorded as its own command, not its newest child
 
@@ -7975,9 +7975,10 @@ before the CLI runs:
 `zellij_wait_for` or `list-panes`, exactly as before.
 
 **The cost, and it is visible: the pane's title and its `terminal_command` now name the shell** -
-an unnamed pane read `/path/to/zsh -c sleep 30` where it used to read `sleep`. The tool now names a
-command pane after its command (below); the consumer repo never makes command panes, so nothing
-there reads either field.
+an unnamed pane read `/path/to/zsh -c sleep 30` where it used to read `sleep`. The tool now names an
+`exec` pane after its command (below); the consumer repo never makes command panes, so nothing
+there reads either field. This `$SHELL -c` path is `exec` today: a plain create runs nothing (see
+"`zellij_create` makes a ready shell pane and runs nothing in it").
 
 CLI-side only: `src/mcp/invoke.rs` and one dependency the tree already carried (`shellexpand`). No
 protobuf, no contract change, and `zellij action new-pane` itself is untouched.
@@ -8080,50 +8081,50 @@ CLI-side only: `src/mcp/`, and one row of `zellij-utils/src/cli_surface.rs`. No 
 contract change, and no CLI flag added - every flag this uses (`--in-tab`, `--new-tab`,
 `--no-focus`, `--near-current-pane`) already shipped.
 
-### `zellij_create` types its command into a ready interactive shell
+### `zellij_create` makes a ready shell pane and runs nothing in it
 
 ```
-# before - zellij_create {"command": "secret-cli read …"}
-action new-pane --in-tab=work-zj --no-focus --name=… -- /bin/zsh -c 'secret-cli …'
-  # `zsh -c` reads .zshenv only: no .zshrc, no aliases, no `mise activate`
+# before - zellij_create {"command": "cargo test"}
+action new-pane --in-tab=work-zj --no-focus --name=cargo test --wait-ready --ready-timeout=10
+action write-chars --pane-id=terminal_7 -- 'cargo test'
+  # the pane is titled "cargo test" for good; when the test fails, the agent makes another pane
 
-# after
-action new-pane --in-tab=work-zj --no-focus --name=… --wait-ready --ready-timeout=10
-action write-chars --pane-id=terminal_7 -- 'secret-cli …'
-action send-keys --pane-id=terminal_7 -- Enter
-  # result: ready: true, ready_by: prompt, ready_ms: 212, input_sent: true
+# after - zellij_create {"cwd": "~/src/app"}, then zellij_write_input
+action new-pane --in-tab=work-zj --no-focus --cwd=/home/<user>/src/app --wait-ready --ready-timeout=10
+  # result: ready: true, ready_by: prompt, ready_ms: 212, pane_cwd: /home/<user>/src/app
+zellij_write_input {"pane": "sunny-otter", "text": "cargo test", "submit": true}
 ```
 
-**A command now runs where a person would run it.** `$SHELL -c` is non-interactive, so a
-command from the MCP tool missed everything the interactive rc chain sets up, and a command typed
-by hand in the pane beside it did not. Two parameters change that, and the default is the new
-behaviour:
+**A create makes the pane; the command goes in second.** When one call made a pane and ran a
+command in it, agents read the pane as spent once the command failed, and made a new pane for the
+retry. In the agents' own transcripts, no create came without a command. Leaving out agent
+launches, about one task command in five was followed by another create instead of a write, and
+most of those retried the identical command. So the tool no longer takes one:
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `run_in` | `shell` | `shell` makes a plain shell pane, waits for it to be ready, then types `command` and presses Enter through the same two verbs `zellij_write_input` uses. The pane stays a shell when the command ends. `exec` is the old behaviour, `$SHELL -c`, for a one-shot command whose exit status the caller wants from `zellij_wait_for until=exit`. |
-| `wait_ready` | `true` | Passes `--wait-ready --ready-timeout=10` to the create. Applies in `shell` mode, with or without a `command`. `false` types at once, into a shell that may not be listening yet. |
+| `wait_ready` | `true` | Passes `--wait-ready --ready-timeout=10`, so the answer is a shell ready for input. `false` answers at once. |
+| `exec` | none | A one-shot whose exit status the caller wants: `$SHELL -c <exec>` is the pane's own process, the pane is named after it and ends with it, and `zellij_wait_for until=exit` reads `exit_status`. It ignores `wait_ready`. |
 
-- **A readiness timeout types nothing.** The create exits 2 and still names its pane; the tool
-  reports `reason: not_ready`, `ready: false`, `input_sent: false` and the pane's `pane_id` and
-  `handle`, so the caller can write to it later or close it. It is not reported as the ordinary
-  "nothing matched" miss, because the pane is there.
-- **A write that fails is the call's failure.** A pane that is ready and empty is not a command
-  that ran.
-- A created pane that waited carries `ready`, `ready_by` and `ready_ms` in the structured result;
-  one that had a command to type also carries `input_sent`.
-- `exec` ignores `wait_ready`: a one-shot command can end before it ever looks ready, which the wait
-  would report as a miss.
+- **`command` and `run_in` are refused**, by name, with the two-step instruction: make the pane,
+  type with `zellij_write_input`, keep the pane. A silent ignore would make an empty pane and look
+  like success. A client that enforces the schema's `additionalProperties: false` refuses the call
+  itself, before the server sees it, and without the hint.
+- **A shell pane takes no name.** Its title is what the shell sets: the directory at the prompt,
+  the running command while one runs. A fixed name outlived the command and marked the pane as
+  done.
+- **A readiness timeout** exits 2 and still names its pane; the tool reports `reason: not_ready`,
+  `ready: false` and the pane's `pane_id` and `handle`, so the caller can write to it later or close
+  it. It is not the ordinary "nothing matched" miss, because the pane is there.
+- A created pane that waited carries `ready`, `ready_by` and `ready_ms` in the structured result.
 
-The 10-second bound sits well under the request deadline an MCP client keeps. The tool cap went
-from eight parameters to nine to make room; the alternative was folding `floating` into `kind`,
-which breaks every caller that passes it.
+The 10-second bound sits well under the request deadline an MCP client keeps.
 
-`src/mcp/invoke.rs` (`Plan`, `TypeAfter`, `run_in`, the `finish` step of the create),
-`src/mcp/mod.rs` (`type_into_created_pane`, the readiness fields in `report`) and
-`src/mcp/tools.rs` (the two parameters, the tips, and a boolean default written as a boolean).
-Tests: the shell-mode command lines for each `kind`; `exec` unchanged with either `wait_ready`; the
-plan's write and Enter; nothing typed after a timeout; the `not_ready` and ready result shapes.
+`src/mcp/invoke.rs` (`Plan`, `CreatedPane`, the refusal in `create_kind_allowed`, the `finish` step
+of the create), `src/mcp/mod.rs` (`read_back_created`, the readiness fields in `report`, the server
+instructions) and `src/mcp/tools.rs` (the parameters and the tips). Tests: the shell-pane command
+lines for each `kind`; `exec` with either `wait_ready`; `command` and `run_in` refused; the read-back
+plan; nothing read back after a timeout; the `not_ready` and ready result shapes.
 
 ### `zellij_wait_for until=ready`: the command I typed has finished
 
@@ -8956,7 +8957,7 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   it needs the caller's own pane, which is not in that session. `agent_tab` and `tab` work. The
   agent tab is named after the caller's own tab on this machine, so a caller has one tab name on
   every host, and the remote session is asked whether it has it yet. `cwd` must be absolute; `~`,
-  `$VAR` and a relative path are refused, because they would mean this machine. `run_in=exec` runs
+  `$VAR` and a relative path are refused, because they would mean this machine. `exec` runs
   through `/bin/sh -c`, not this machine's `$SHELL`.
 - **`scope=my_agents` with `host/session`** lists the agents in that remote session's tab of the
   caller's tab name. Without a host it is this machine's session, as before. No call lists "my
@@ -9184,30 +9185,20 @@ said so. The binary now owns the file.
 
 `setup --check --json` lists `agent-hooks-write`. No client/server contract changes.
 
-### `zellij_create` reads its pane back before it says `input_sent`
+### `zellij_create` reads its pane back for the directory its shell started in
 
-`input_sent: true` used to mean only that `write-chars` and `send-keys` exited 0. That is the
-server taking the keystrokes, not the pane showing them. A report from a Mac had a tab open in the
-session's default directory with nothing typed, while the tool answered `ready: true`,
-`input_sent: true`. The report could not be reproduced on Linux with nkmk.30, .35 or .37 as the
-server. The answer now comes from the pane:
+A report from a Mac had a tab open in the session's default directory while the tool answered
+`ready: true`. The answer now comes from the pane. Once a shell create is ready, one
+`list-panes --json` reads the fresh shell's `pane_cwd`, and the result carries it. A fresh tab's
+row can arrive before its directory is measured, so the read repeats every 100 ms for up to a
+second. A create that
+passed `cwd` also carries `cwd_honoured`. When it is `false`, the result has a note naming both
+directories. On this machine the two are compared through the filesystem, so a symlinked `/tmp` is
+not a mismatch. On a remote host they are compared as text. An `exec` create is not read back.
 
-- **Before typing**, one `list-panes --json` reads the fresh shell's `pane_cwd`, before the
-  typed command can `cd`. The result carries `pane_cwd`. A create that passed `cwd` also carries
-  `cwd_honoured`. When it is `false`, the result has a note naming both directories. On this
-  machine the two are compared through the filesystem, so a symlinked `/tmp` is not a mismatch.
-  On a remote host they are compared as text.
-- **After typing**, the pane is read for up to 2 seconds. The command counts as seen when the
-  shell's OSC 133 state is `running` or `done`, or when the first 24 characters of the command's
-  first line are on the pane's screen.
-- `input_sent` turns `false` only when the pane was read and showed neither. The result then has a
-  note: the command was handed to the pane, so read the pane before you type it again. A pane that
-  could not be read at all keeps the write's own answer.
-
-`src/mcp/mod.rs` (`type_and_read_back`, `typed_command_seen`, `terminal_pane_row`) and
-`src/mcp/invoke.rs` (`TypeAfter::read_back_argvs`). Tests: what counts as seen, the requested
-`cwd` and the directory comparison, the pane row by reported id, and nothing read back from a pane
-that was not ready.
+`src/mcp/mod.rs` (`read_back_created`, `terminal_pane_row`) and `src/mcp/invoke.rs`
+(`CreatedPane`). Tests: the requested `cwd` and the directory comparison, the pane row by reported
+id, and nothing read back from a pane that was not ready.
 
 The same change gives `zellij_wait_for`'s `timeout_s` a description of its own, replacing the CLI
 help it borrowed. Every wait answers a fraction of a second after `timeout_s`, and many MCP clients
@@ -9256,8 +9247,8 @@ action new-tab --no-focus --name=build --wait-ready --ready-timeout=10
 Without `name`, a tab an agent makes is called `Tab #N`. `name` names the tab, and only the tab: it
 is used with `kind: tab` alone. `reopen` refuses it with one line before a session is asked
 anything. Any other kind makes the pane and lists `name` as ignored, with the pane's generated
-handle (nkmk.47; it refused the call before). A pane still keeps its generated handle, and a
-command pane is still named after its command.
+handle (nkmk.47; it refused the call before). A pane still keeps its generated handle, and an
+`exec` pane is still named after its command.
 
 `src/mcp/tools.rs` (the `name` parameter and the tool's tips) and `src/mcp/invoke.rs`
 (`create_kind_allowed`, the `tab` arm of `argv_in`). Tests: the tab's name on the command line, a

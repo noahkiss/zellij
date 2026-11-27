@@ -571,32 +571,35 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_create",
-        summary: "Make a pane to work in, optionally running a command in it.",
-        best_for: "starting work when you have no pane of your own yet. One pane per job is the \
-                   norm; after that, write to the one you have.",
+        summary: "Make a shell pane to work in, in the directory you name.",
+        best_for: "starting work when you have no pane of your own yet. Make one pane, then \
+                   type every command into it.",
         not_for:
             "running something in a pane that already exists - write to it instead. Not for a \
                   second pane when your first one is idle, and not for replacing a pane whose \
                   command failed: reuse it, or close it.",
-        follow_up: Some("zellij_write_input or zellij_wait_for, using the handle this returns"),
+        follow_up: Some(
+            "zellij_write_input with the handle this returns, to type your command into the pane",
+        ),
         // `kind: tab` runs `new-tab`, which prints the same three keys today and need not keep
         // doing so. A tool that multiplexes says what each of its commands returns
         reports: &["action new-pane", "action new-tab", "action reopen-pane"],
         tips:
-            "By default the pane runs your interactive shell, with your full rc files, and the \
-               call waits until that shell is ready before it types `command` and presses Enter - \
-               what you would get by typing it yourself. The pane stays a shell after the command \
-               ends. Success means the pane was MADE and the command typed, not that it worked: \
-               follow with zellij_wait_for until=match or until=quiet, or zellij_read_pane. For a \
-               one-shot command whose exit status you want, pass run_in=exec and follow with \
-               zellij_wait_for until=exit, then read `exit_status`. A shell that is not ready in \
-               time is reported as `ready: false` with the pane's handle, and nothing is typed. \
-               The answer carries the pane's id and its generated handle. The handle is the \
-               pane's address and survives a session restore: use it, not the integer id, for \
-               every later call on the pane. You cannot choose a pane's name or handle; a pane \
-               running a command is named after the command. kind=tab takes `name` for the \
-               tab itself. On another machine (session host/session) kind is \
-               agent_tab or tab, cwd is an absolute path there, and exec runs through /bin/sh.",
+            "The pane runs your interactive shell, with your full rc files, and the call \
+               waits until that shell is ready for input. It runs nothing in it: type your \
+               command with zellij_write_input (`text`, `submit: true`), then follow with \
+               zellij_wait_for. When the command fails, fix it and type again in the same pane. \
+               The answer carries the pane's id, its generated handle and `pane_cwd`, the \
+               directory its shell started in. The handle is the pane's address and survives a \
+               session restore: use it, not the integer id, for every later call on the pane. A \
+               shell that is not ready in time is reported as `ready: false` with the pane's \
+               handle. You cannot choose a pane's name or handle; a shell pane's title is what \
+               its shell sets. kind=tab takes `name` for the tab itself. `exec` is the one \
+               exception, for a one-shot whose exit status you want: the command is the pane's \
+               process, the pane ends with it, and zellij_wait_for until=exit reads \
+               `exit_status`. Close that pane after. On another machine (session host/session) \
+               kind is agent_tab or tab, cwd is an absolute path there, and exec runs through \
+               /bin/sh.",
         params: &[
             SESSION,
             ParamSpec {
@@ -614,26 +617,15 @@ pub const TOOLS: &[ToolSpec] = &[
                 default: Some(invoke::CREATE_KIND_DEFAULT),
             },
             ParamSpec {
-                name: "command",
+                name: "exec",
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action new-pane", "command")),
-                describe: "The command to run in the pane, through your shell: quotes, pipes, \
-                           `&&`, `~` and `$VAR` all work. Without one the pane runs your shell.",
+                describe: "Only for a one-shot whose exit status you want: run this as the \
+                           pane's own process, `$SHELL -c` with no interactive rc file. The pane \
+                           ends with it and is not reusable. For anything else leave it out and \
+                           type the command with zellij_write_input.",
                 default: None,
-            },
-            ParamSpec {
-                name: "run_in",
-                kind: ParamKind::Enum(&["shell", "exec"]),
-                required: false,
-                from: None,
-                describe: "How `command` runs. shell, the default, types it into your interactive \
-                           shell once the pane is ready, so your rc files, aliases and PATH all \
-                           apply, and the pane stays a shell afterwards. exec runs it as \
-                           `$SHELL -c`, which reads no interactive rc file, ends the pane's \
-                           command when it ends, and keeps its exit status for zellij_wait_for \
-                           until=exit.",
-                default: Some(invoke::RUN_IN_DEFAULT),
             },
             ParamSpec {
                 name: "wait_ready",
@@ -641,10 +633,10 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action new-pane", "--wait-ready")),
                 describe: "Wait until the new pane's shell is ready for input - it drew a prompt, \
-                           or drew something and fell quiet - before answering and before typing \
-                           `command`. The answer says `ready_by` (prompt or quiet) and \
-                           `ready_ms`. Gives up after 10 seconds. Applies when run_in is shell; \
-                           false types at once, into a shell that may not be listening yet.",
+                           or drew something and fell quiet - before answering. The answer says \
+                           `ready_by` (prompt or quiet) and `ready_ms`. Gives up after 10 \
+                           seconds. Does not apply with `exec`; false answers at once, with a \
+                           shell that may not be listening yet.",
                 default: Some("true"),
             },
             ParamSpec {
@@ -730,6 +722,9 @@ pub const TOOLS: &[ToolSpec] = &[
 pub const UNLISTED: &[(&str, &str)] = &[
     // refused by name: `floating` was removed, and the refusal says what to use instead
     ("zellij_create", "floating"),
+    // refused by name: a create runs nothing, and the refusal says to type with zellij_write_input
+    ("zellij_create", "command"),
+    ("zellij_create", "run_in"),
     // the target says what to close; a client with a cached schema still sends `operation`
     ("zellij_close", "operation"),
 ];
@@ -1243,10 +1238,16 @@ mod tests {
         assert_eq!(
             ignored_parameters(
                 "zellij_create",
-                &given(json!({"command": "ls", "handle": "my-pane", "kind": "tab"}))
+                &given(json!({"exec": "ls", "handle": "my-pane", "kind": "tab"}))
             ),
             vec!["handle".to_owned()]
         );
+        // a refused parameter is answered by its refusal, not also listed as ignored
+        assert!(ignored_parameters(
+            "zellij_create",
+            &given(json!({"command": "ls", "run_in": "shell"}))
+        )
+        .is_empty());
         assert_eq!(
             ignored_parameters(
                 "zellij_read_pane",
@@ -1381,7 +1382,7 @@ mod tests {
             ("zellij_write_input", "keys"),
             ("zellij_write_input", "text"),
             ("zellij_read_pane", "pane"),
-            ("zellij_create", "command"),
+            ("zellij_create", "exec"),
         ] {
             let spec = tool_spec(tool).expect("a tool");
             let param = spec
