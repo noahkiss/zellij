@@ -63,6 +63,9 @@ command fail? Reuse that pane, or close it with zellij_close. Do not answer a fa
 another pane. A person is watching this terminal, and a session that grows a pane per command is
 one they cannot read.
 
+zellij_create makes a shell pane in the directory you name, and runs nothing in it. Type each
+command into that pane with zellij_write_input; the pane outlives every command you run there.
+
 zellij_create puts your pane in your own tab: the tab you are in with `-zj` on the end, made the
 first time and reused after. It does not take the person's focus. That keeps your work in one
 place and out of the pane they are looking at.
@@ -188,7 +191,7 @@ impl ZellijMcp {
         } else {
             None
         };
-        let then_type = plan.then_type;
+        let created = plan.created;
         let (ran, early_wait) = match then.as_ref().filter(|then| then.before_write) {
             Some(then) => self.write_while_waiting(plan.call, then, &target).await,
             None => (self.run_plan(plan.call, &target).await, None),
@@ -207,13 +210,9 @@ impl ZellijMcp {
                 outcome.stdout = shaped;
             }
         }
-        let (input_sent, checked) = match then_type {
-            Some(then_type) => {
-                let (sent, checked) =
-                    type_and_read_back(&then_type, &argv, &mut outcome, &target).await;
-                (Some(sent), checked)
-            },
-            None => (None, Map::new()),
+        let checked = match created {
+            Some(created) => read_back_created(&created, &argv, &outcome, &target).await,
+            None => Map::new(),
         };
         let hint = if name == "zellij_write_input" && !outcome.is_error() {
             self.input_hint(&arguments, &target).await
@@ -221,7 +220,7 @@ impl ZellijMcp {
             None
         };
         let listed_agents = plan.agents.is_some() && !outcome.is_error();
-        let mut result = self.report(&argv, outcome, input_sent);
+        let mut result = self.report(&argv, outcome);
         if listed_agents {
             self.group_agents(&mut result, &arguments, &target, local);
         }
@@ -247,7 +246,7 @@ impl ZellijMcp {
                 _ => None,
             };
             let waited = match waited {
-                Ok(waited) => self.report(&then.wait, waited, None),
+                Ok(waited) => self.report(&then.wait, waited),
                 Err(message) => failed(message, json!({"reason": reason::NOT_RUN})),
             };
             then_answer(&mut result, &then.until, waited, screen);
@@ -437,7 +436,7 @@ impl ZellijMcp {
         let record =
             serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(outcome.stdout.trim())
                 .ok();
-        let mut result = self.report(&argv, outcome, None);
+        let mut result = self.report(&argv, outcome);
         record_on_top(&mut result, record);
         with_host(result, &route.target)
     }
@@ -482,7 +481,7 @@ impl ZellijMcp {
                 .ok()
             })
             .flatten();
-        let mut result = self.report(&argv, outcome, None);
+        let mut result = self.report(&argv, outcome);
         record_on_top(&mut result, record);
         with_host(result, &target)
     }
@@ -663,15 +662,7 @@ impl ZellijMcp {
     }
 
     /// What the CLI said, as the protocol carries it.
-    ///
-    /// `input_sent` is a shell-mode create's second half: whether its command was typed into the
-    /// pane. `None` for every call that had nothing to type.
-    fn report(
-        &self,
-        argv: &[String],
-        outcome: invoke::Outcome,
-        input_sent: Option<bool>,
-    ) -> CallToolResult {
+    fn report(&self, argv: &[String], outcome: invoke::Outcome) -> CallToolResult {
         let mut structured = Map::new();
         structured.insert("exit_code".to_owned(), json!(outcome.code));
         for (key, value) in invoke::call_context(argv) {
@@ -692,14 +683,10 @@ impl ZellijMcp {
                 structured.insert("ready_ms".to_owned(), json!(ready_ms));
             }
         }
-        if let Some(input_sent) = input_sent {
-            structured.insert("input_sent".to_owned(), json!(input_sent));
-        }
         // a create that waited, missed, and still named its pane made a pane whose shell was not
         // ready in time. That is not the "nothing matched" every other miss is: the pane is there,
         // and the caller made it and has to close it
         if waited && outcome.is_miss() && invoke::reported_pane_id(&outcome.stdout).is_some() {
-            // nothing was typed into a shell that had not said it was listening
             structured.insert("reason".to_owned(), json!(reason::NOT_READY));
             if let Some(pane_id) = report_value(&outcome.stdout, "pane_id") {
                 structured.insert("pane_id".to_owned(), json!(pane_id));
@@ -712,14 +699,9 @@ impl ZellijMcp {
                 structured.insert("diagnostics".to_owned(), json!(outcome.stderr.trim()));
             }
             let message = format!(
-                "The pane was made, but its shell was not ready within {} seconds{}. {} Write to \
+                "The pane was made, but its shell was not ready within {} seconds. {} Write to \
                  the pane once it is ready, or close it.\n{}",
                 invoke::READY_TIMEOUT_DEFAULT_S,
-                if input_sent.is_some() {
-                    ", so the command was not typed into it"
-                } else {
-                    ""
-                },
                 first_words(&outcome.stderr, ""),
                 outcome.stdout.trim()
             );
@@ -792,166 +774,76 @@ impl ZellijMcp {
     }
 }
 
-/// Type a shell-mode create's command into the pane the create made, and say whether it was.
+/// Read a created shell pane back: the directory its shell started in, and whether that is the
+/// `cwd` the create asked for.
 ///
-/// Only into a pane the create reported, and only when the create succeeded - which, with
-/// `--wait-ready`, is when the pane's shell said it was ready. A create that was not ready in time
-/// exits 2 and still names its pane, and nothing is typed into it. A write that fails leaves a pane
-/// with nothing running in it, so its failure becomes the call's.
-async fn type_into_created_pane(
-    then_type: &invoke::TypeAfter,
-    outcome: &mut invoke::Outcome,
-    target: &remote::Target,
-) -> bool {
-    let Some(pane) = invoke::reported_pane_id(&outcome.stdout) else {
-        return false;
-    };
-    if outcome.is_error() {
-        return false;
-    }
-    for argv in then_type.argvs(&pane) {
-        let failure = match invoke::run_on(target, &argv).await {
-            Ok(said) if said.is_error() => (said.code, said.stderr),
-            Ok(_) => continue,
-            Err(message) => (1, message),
-        };
-        outcome.code = failure.0;
-        also_said(&mut outcome.stderr, &failure.1);
-        return false;
-    }
-    true
-}
-
-/// Type a shell-mode create's command into its pane, and check the pane rather than the exit codes.
-///
-/// Returns `input_sent` and what the read-back adds to the answer. Before typing, the fresh shell's
-/// directory is read, while the typed command cannot yet have moved it: a create whose `cwd` the
-/// shell is not in says so in `pane_cwd`, `cwd_honoured` and a note. After typing, `input_sent` is
-/// `true` only if the pane shows the command, or could not be read at all; a pane that was read
-/// and shows nothing turns it `false`, with a note not to type the command twice blind.
-async fn type_and_read_back(
-    then_type: &invoke::TypeAfter,
+/// Only a pane the create reported, and only when the create succeeded. A shell that is not in the
+/// requested directory says so in `pane_cwd`, `cwd_honoured` and a note. Nothing is added when the
+/// pane could not be read.
+async fn read_back_created(
+    created: &invoke::CreatedPane,
     argv: &[String],
-    outcome: &mut invoke::Outcome,
+    outcome: &invoke::Outcome,
     target: &remote::Target,
-) -> (bool, Map<String, Value>) {
+) -> Map<String, Value> {
     let mut checked = Map::new();
-    let mut notes = Vec::new();
-    let pane = invoke::reported_pane_id(&outcome.stdout).filter(|_| !outcome.is_error());
-    if let Some(pane) = &pane {
-        let row = created_pane_row(then_type, pane, target).await;
-        if let Some(cwd) = row
-            .as_ref()
-            .and_then(|row| row.get("pane_cwd"))
-            .and_then(Value::as_str)
-        {
-            checked.insert("pane_cwd".to_owned(), json!(cwd));
-            if let Some(asked) = requested_cwd(argv) {
-                let honoured = same_dir(cwd, asked, target);
-                checked.insert("cwd_honoured".to_owned(), json!(honoured));
-                if !honoured {
-                    notes.push(format!(
-                        "The pane's shell started in {}, not in the requested cwd {}.",
-                        cwd, asked
-                    ));
-                }
-            }
+    let Some(pane) = invoke::reported_pane_id(&outcome.stdout).filter(|_| !outcome.is_error())
+    else {
+        return checked;
+    };
+    // a pane's directory is measured after the pane is made, so a fresh pane's row can come back
+    // without one: read again for a moment before saying nothing
+    let mut cwd = None;
+    for attempt in 0..=CWD_READ_RETRIES {
+        cwd = created_pane_row(created, &pane, target)
+            .await
+            .and_then(|row| {
+                row.get("pane_cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        if cwd.is_some() || attempt == CWD_READ_RETRIES {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(CWD_READ_STEP_MS)).await;
+    }
+    let Some(cwd) = cwd else {
+        return checked;
+    };
+    checked.insert("pane_cwd".to_owned(), json!(cwd));
+    if let Some(asked) = requested_cwd(argv) {
+        let honoured = same_dir(&cwd, asked, target);
+        checked.insert("cwd_honoured".to_owned(), json!(honoured));
+        if !honoured {
+            checked.insert(
+                "note".to_owned(),
+                json!(format!(
+                    "The pane's shell started in {}, not in the requested cwd {}.",
+                    cwd, asked
+                )),
+            );
         }
     }
-    let mut sent = type_into_created_pane(then_type, outcome, target).await;
-    if let (true, Some(pane)) = (sent, &pane) {
-        if typed_command_seen(then_type, pane, target).await == Some(false) {
-            sent = false;
-            notes.push(format!(
-                "The command was handed to the pane, but the pane did not show it within {} \
-                 seconds. Read the pane before typing it again.",
-                READ_BACK_MS / 1000
-            ));
-        }
-    }
-    if !notes.is_empty() {
-        checked.insert("note".to_owned(), json!(notes.join(" ")));
-    }
-    (sent, checked)
+    checked
 }
 
-/// How long a create reads its pane back for a sign of the command it typed, at most.
-const READ_BACK_MS: u64 = 2000;
+/// How many more times a create reads its pane's row for a directory not yet measured.
+const CWD_READ_RETRIES: u32 = 10;
 
-/// The pause between two reads of a created pane.
-const READ_BACK_STEP_MS: u64 = 100;
+/// The pause between two reads of a created pane's row.
+const CWD_READ_STEP_MS: u64 = 100;
 
 /// The created pane's row in the session's pane list, or `None` when it could not be read.
 async fn created_pane_row(
-    then_type: &invoke::TypeAfter,
+    created: &invoke::CreatedPane,
     pane: &str,
     target: &remote::Target,
 ) -> Option<Value> {
-    let [list, _] = then_type.read_back_argvs(pane);
-    let said = invoke::run_on(target, &list).await.ok()?;
+    let said = invoke::run_on(target, &created.list_argv()).await.ok()?;
     if said.is_error() {
         return None;
     }
     terminal_pane_row(&said.stdout, pane)
-}
-
-/// Whether the pane shows the command a create typed into it, read back from the pane itself.
-///
-/// The write's exit code says only that the server took the keystrokes. The pane is the evidence
-/// that they arrived: its shell says a command started (`command_state` running or done), or the
-/// typed line is on its screen. `None` when the pane could not be read at all, which leaves the
-/// write's own answer standing rather than contradicting it with nothing.
-async fn typed_command_seen(
-    then_type: &invoke::TypeAfter,
-    pane: &str,
-    target: &remote::Target,
-) -> Option<bool> {
-    let [_, dump] = then_type.read_back_argvs(pane);
-    let mut read_any = false;
-    let mut waited = 0;
-    loop {
-        if let Some(row) = created_pane_row(then_type, pane, target).await {
-            read_any = true;
-            if command_started(&row) {
-                return Some(true);
-            }
-        }
-        if let Ok(screen) = invoke::run_on(target, &dump).await {
-            if !screen.is_error() {
-                read_any = true;
-                if typed_on_screen(&screen.stdout, then_type.command()) {
-                    return Some(true);
-                }
-            }
-        }
-        if waited >= READ_BACK_MS {
-            return read_any.then_some(false);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(READ_BACK_STEP_MS)).await;
-        waited += READ_BACK_STEP_MS;
-    }
-}
-
-/// A shell with OSC 133 marks says a typed command started: `running`, or `done` once it ended.
-fn command_started(row: &Value) -> bool {
-    matches!(
-        row.get("command_state").and_then(Value::as_str),
-        Some("running" | "done")
-    )
-}
-
-/// Whether the start of a typed command's first line is on a pane's screen. Only the start: a long
-/// line wraps, and the wrap point is the pane's width.
-fn typed_on_screen(screen: &str, command: &str) -> bool {
-    let needle: String = command
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .take(24)
-        .collect();
-    !needle.is_empty() && screen.contains(&needle)
 }
 
 /// The directory a create asked for, as it went onto the command line.
@@ -1580,56 +1472,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_is_typed_into_a_pane_whose_shell_was_not_ready() {
+    async fn nothing_is_read_back_from_a_pane_whose_shell_was_not_ready() {
         // the create named its pane and exited 2: the shell never said it was listening. Nothing
-        // runs here - a write would spawn a child, and this returns before one could
+        // runs here - a read would spawn a child, and this returns before one could
         let plan = invoke::plan(
             "zellij_create",
-            json!({"kind": "stacked", "command": "make"})
-                .as_object()
-                .unwrap(),
+            json!({"kind": "stacked"}).as_object().unwrap(),
             None,
             &remote::Target::Local,
         )
         .await
         .expect("a plan");
-        let mut missed = outcome(
+        let missed = outcome(
             2,
             "pane_id: terminal_7\nhandle: sunny-otter\n",
             "terminal_7 was not ready when the wait timed out.\n",
         );
-        let then_type = plan.then_type.unwrap();
-        let sent = type_into_created_pane(&then_type, &mut missed, &remote::Target::Local).await;
-        assert!(!sent);
-        assert_eq!(missed.code, 2, "the create's own answer stands");
-        // and nothing is read back from it either: the pane said nothing worth checking
-        let (sent, checked) = type_and_read_back(
-            &then_type,
-            &create_argv(),
-            &mut missed,
-            &remote::Target::Local,
-        )
-        .await;
-        assert!(!sent);
+        let created = plan.created.expect("a shell pane");
+        let checked =
+            read_back_created(&created, &create_argv(), &missed, &remote::Target::Local).await;
         assert!(checked.is_empty(), "{:?}", checked);
-    }
-
-    #[test]
-    fn a_typed_command_counts_as_seen_by_its_shell_or_its_screen() {
-        assert!(command_started(&json!({"command_state": "running"})));
-        assert!(command_started(&json!({"command_state": "done"})));
-        assert!(!command_started(&json!({"command_state": "prompt"})));
-        // a shell without OSC 133 marks says nothing, which is not a no
-        assert!(!command_started(&json!({})));
-        let screen = "user ~/src/app 12:20\n> claude --resume abc\n";
-        assert!(typed_on_screen(screen, "claude --resume abc"));
-        // only the start of a long line: the rest may have wrapped onto the next row
-        assert!(typed_on_screen(
-            "> claude --model opus --permi\nssion-mode plan\n",
-            "claude --model opus --permission-mode plan"
-        ));
-        assert!(!typed_on_screen("user ~/src 12:20\n", "claude"));
-        assert!(!typed_on_screen("anything", "   "));
     }
 
     #[test]
@@ -1685,24 +1547,22 @@ mod tests {
                 "pane_id: terminal_7\nhandle: sunny-otter\n",
                 "terminal_7 was not ready when the wait timed out.\n",
             ),
-            Some(false),
         );
         assert_eq!(result.is_error, Some(true));
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["reason"], json!("not_ready"));
         assert_eq!(structured["ready"], json!(false));
-        assert_eq!(structured["input_sent"], json!(false));
         assert_eq!(structured["handle"], json!("sunny-otter"));
         assert_eq!(structured["pane_id"], json!("terminal_7"));
         let text = serde_json::to_string(&result.content).unwrap();
-        assert!(text.contains("not typed"), "{}", text);
+        assert!(
+            text.contains("Write to the pane once it is ready"),
+            "{}",
+            text
+        );
         assert!(text.contains("sunny-otter"), "{}", text);
         // the negative control: a miss that made no pane is still the ordinary miss
-        let result = server.report(
-            &create_argv(),
-            outcome(2, "", "No tab answers to 'x'.\n"),
-            None,
-        );
+        let result = server.report(&create_argv(), outcome(2, "", "No tab answers to 'x'.\n"));
         assert_eq!(result.structured_content.unwrap()["reason"], json!("miss"));
     }
 
@@ -1716,7 +1576,6 @@ mod tests {
                 "pane_id: terminal_7\nhandle: sunny-otter\nready_by: prompt\n",
                 "",
             ),
-            Some(true),
         );
         note_ignored(
             &mut result,
@@ -1737,7 +1596,6 @@ mod tests {
         let mut named = server.report(
             &create_argv(),
             outcome(0, "pane_id: terminal_7\nhandle: sunny-otter\n", ""),
-            Some(true),
         );
         note_ignored(&mut named, "zellij_create", &["name".to_owned()]);
         let first = serde_json::to_value(&named.content[0]).unwrap();
@@ -1749,7 +1607,7 @@ mod tests {
             )
         );
         // nothing ignored, nothing added
-        let mut plain = server.report(&create_argv(), outcome(0, "handle: a-b\n", ""), None);
+        let mut plain = server.report(&create_argv(), outcome(0, "handle: a-b\n", ""));
         let before = plain.content.len();
         note_ignored(&mut plain, "zellij_create", &[]);
         assert_eq!(plain.content.len(), before);
@@ -1770,7 +1628,6 @@ mod tests {
                 "",
                 "The wait on terminal_3 timed out: no new line matched the regex `done`.\n",
             ),
-            None,
         );
         assert_eq!(result.is_error, Some(false));
         let structured = result.structured_content.clone().unwrap();
@@ -1780,8 +1637,7 @@ mod tests {
         let text = text["text"].as_str().unwrap();
         assert!(text.starts_with("Timed out after 50 s: "), "{}", text);
         // a wait that missed for another reason is still a failure, and says nothing matched
-        let gone =
-            ZellijMcp::default().report(&wait, outcome(2, "", "terminal_3 is gone.\n"), None);
+        let gone = ZellijMcp::default().report(&wait, outcome(2, "", "terminal_3 is gone.\n"));
         assert_eq!(gone.is_error, Some(true));
         let structured = gone.structured_content.unwrap();
         assert!(structured.get("timed_out").is_none());
@@ -1791,7 +1647,7 @@ mod tests {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        let held = ZellijMcp::default().report(&send, outcome(2, "", "the wait timed out\n"), None);
+        let held = ZellijMcp::default().report(&send, outcome(2, "", "the wait timed out\n"));
         assert_eq!(held.is_error, Some(true));
     }
 
@@ -1819,8 +1675,8 @@ mod tests {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        let mut result = server.report(&write, outcome(0, "", ""), None);
-        let waited = server.report(&wait, outcome(0, "quiet_by: quiet\n", ""), None);
+        let mut result = server.report(&write, outcome(0, "", ""));
+        let waited = server.report(&wait, outcome(0, "quiet_by: quiet\n", ""));
         then_answer(
             &mut result,
             "quiet",
@@ -1836,20 +1692,16 @@ mod tests {
         assert!(text.contains("screen:\\n$ ls"), "{}", text);
 
         // a timed-out wait is an outcome, and the screen still comes back
-        let mut result = server.report(&write, outcome(0, "", ""), None);
-        let waited = server.report(
-            &wait,
-            outcome(2, "", "The wait on terminal_3 timed out.\n"),
-            None,
-        );
+        let mut result = server.report(&write, outcome(0, "", ""));
+        let waited = server.report(&wait, outcome(2, "", "The wait on terminal_3 timed out.\n"));
         then_answer(&mut result, "quiet", waited, Some("$ ".to_owned()));
         let structured = result.structured_content.clone().unwrap();
         assert_eq!(structured["waited"]["timed_out"], json!(true));
         assert_eq!(result.is_error, Some(false));
 
         // a wait that failed leaves the write a success, and says not to send it again
-        let mut result = server.report(&write, outcome(0, "", ""), None);
-        let waited = server.report(&wait, outcome(2, "", "terminal_3 is gone.\n"), None);
+        let mut result = server.report(&write, outcome(0, "", ""));
+        let waited = server.report(&wait, outcome(2, "", "terminal_3 is gone.\n"));
         then_answer(&mut result, "quiet", waited, None);
         assert_eq!(result.is_error, Some(false));
         let text = serde_json::to_string(&result.content).unwrap();
@@ -1859,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ready_pane_says_how_and_how_long_and_whether_its_command_was_typed() {
+    fn a_ready_pane_says_how_and_how_long() {
         let result = ZellijMcp::default().report(
             &create_argv(),
             outcome(
@@ -1867,29 +1719,12 @@ mod tests {
                 "pane_id: terminal_7\nhandle: sunny-otter\nready_by: prompt\nready_ms: 212\n",
                 "",
             ),
-            Some(true),
         );
         assert_eq!(result.is_error, Some(false));
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["ready"], json!(true));
         assert_eq!(structured["ready_by"], json!("prompt"));
         assert_eq!(structured["ready_ms"], json!(212));
-        assert_eq!(structured["input_sent"], json!(true));
-        // a call that typed nothing carries no `input_sent` at all
-        let result = ZellijMcp::default().report(
-            &create_argv(),
-            outcome(
-                0,
-                "pane_id: terminal_7\nready_by: quiet\nready_ms: 300\n",
-                "",
-            ),
-            None,
-        );
-        assert!(result
-            .structured_content
-            .unwrap()
-            .get("input_sent")
-            .is_none());
     }
 
     #[test]

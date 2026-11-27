@@ -65,9 +65,6 @@ pub fn wait_timeout_s() -> u64 {
 /// client has already given up on.
 pub const READY_TIMEOUT_DEFAULT_S: &str = "10";
 
-/// How `zellij_create` runs a `command` when the caller does not say: typed into a shell pane.
-pub const RUN_IN_DEFAULT: &str = "shell";
-
 /// What the CLI said, and how it ended.
 pub struct Outcome {
     pub code: i32,
@@ -238,13 +235,12 @@ pub enum Call {
 /// instead of the key that sends it. A pause a person would not notice keeps the two apart.
 pub const SEQUENCE_PAUSE_MS: u64 = 150;
 
-/// A tool call, planned: what it runs, and the command a shell-mode create types once its pane is
-/// ready.
+/// A tool call, planned: what it runs, and the shell pane a create made, to read back.
 pub struct Plan {
     pub call: Call,
-    /// `zellij_create` with `run_in: shell` and a `command`: typed into the pane the create made,
-    /// and only once the create has said that pane is ready. `None` for every other call.
-    pub then_type: Option<TypeAfter>,
+    /// `zellij_create` without `exec`: the shell pane it made, read back for its directory.
+    /// `None` for every other call.
+    pub created: Option<CreatedPane>,
     /// `zellij_overview` with `scope: agents` or `my_agents`: how the agent list is shaped before
     /// it is returned. `None` for every other call.
     pub agents: Option<AgentsView>,
@@ -306,53 +302,30 @@ impl From<Call> for Plan {
     fn from(call: Call) -> Self {
         Plan {
             call,
-            then_type: None,
+            created: None,
             agents: None,
         }
     }
 }
 
-/// The command a shell-mode create types into the pane it made, as a person would: the text, then
-/// Enter - the two calls `zellij_write_input` makes.
+/// The shell pane a create made, read back from the session once the create reports its id.
 ///
 /// Like [`RenameAfter`], it is finished with the pane id the create reported, and never with one
 /// it guessed.
-pub struct TypeAfter {
+pub struct CreatedPane {
     session: Option<String>,
-    command: String,
 }
 
-impl TypeAfter {
-    fn scoped(&self, rest: &[&str]) -> Vec<String> {
+impl CreatedPane {
+    /// The command line that lists the session's panes, where the created pane's row is.
+    pub fn list_argv(&self) -> Vec<String> {
         let mut argv = Vec::new();
         if let Some(session) = &self.session {
             argv.push("-s".to_owned());
             argv.push(session.clone());
         }
-        argv.extend(rest.iter().map(|word| (*word).to_owned()));
+        argv.extend(["action", "list-panes", "--json"].map(str::to_owned));
         argv
-    }
-
-    /// The command lines that type the command into `pane` and press Enter, in order.
-    pub fn argvs(&self, pane: &str) -> [Vec<String>; 2] {
-        let pane = flag_value("--pane-id", pane);
-        [
-            self.scoped(&["action", "write-chars", &pane, "--", &self.command]),
-            self.scoped(&["action", "send-keys", &pane, "--", "Enter"]),
-        ]
-    }
-
-    /// The command lines that read the pane back: the session's pane list, and `pane`'s screen.
-    pub fn read_back_argvs(&self, pane: &str) -> [Vec<String>; 2] {
-        [
-            self.scoped(&["action", "list-panes", "--json"]),
-            self.scoped(&["action", "dump-screen", &flag_value("--pane-id", pane)]),
-        ]
-    }
-
-    /// The command as it is typed.
-    pub fn command(&self) -> &str {
-        &self.command
     }
 }
 
@@ -620,7 +593,7 @@ async fn plan_in(
             let call = Call::One(argv_in(tool, args, ambient_session, env, None)?);
             return Ok(Plan {
                 call,
-                then_type: None,
+                created: None,
                 agents: Some(AgentsView { only_tab }),
             });
         }
@@ -631,15 +604,14 @@ async fn plan_in(
     }
     create_kind_allowed(&read)?;
     let session = target_session.clone();
-    let then_type = typed_command(&read)?.map(|command| TypeAfter {
+    let created = read.string("exec").is_none().then(|| CreatedPane {
         session: session.clone(),
-        command,
     });
     if read.enumerated("kind", CREATE_KIND_DEFAULT) != CREATE_KIND_DEFAULT {
         let call = Call::One(argv_in(tool, args, ambient_session, env, None)?);
         return Ok(Plan {
             call,
-            then_type,
+            created,
             agents: None,
         });
     }
@@ -649,7 +621,7 @@ async fn plan_in(
         let call = Call::One(argv);
         return Ok(Plan {
             call,
-            then_type,
+            created,
             agents: None,
         });
     }
@@ -660,7 +632,7 @@ async fn plan_in(
     let call = Call::MakingAgentTab { argv, rename };
     Ok(Plan {
         call,
-        then_type,
+        created,
         agents: None,
     })
 }
@@ -669,6 +641,20 @@ async fn plan_in(
 fn create_kind_allowed(args: &Args) -> Result<(), String> {
     if args.values.contains_key("floating") {
         return Err("`floating` is unsupported; use stacked, agent_tab or tab.".to_owned());
+    }
+    // a create used to type a command into the pane it made. An agent then read that pane as
+    // spent once the command failed, and made another: the pane comes first, the command second
+    if let Some(param) = ["command", "run_in"]
+        .into_iter()
+        .find(|param| args.values.contains_key(*param))
+    {
+        return Err(format!(
+            "zellij_create takes no `{}`: it makes a shell pane and runs nothing in it. Make the \
+             pane, then type the command with zellij_write_input (`pane` = the handle this \
+             returns, `text`, `submit: true`), and keep using that pane. Only for a one-shot \
+             whose exit status you want, pass `exec`: that pane ends with its command.",
+            param
+        ));
     }
     let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
     // `name` names a new tab. A pane keeps its generated handle and its command's name, and a
@@ -879,27 +865,11 @@ fn close_operation(args: &Args) -> Result<CloseOperation, String> {
     }
 }
 
-/// How a create runs its `command`: `shell` or `exec`, refused when it is neither.
-fn run_in(args: &Args) -> Result<String, String> {
-    let run_in = args.enumerated("run_in", RUN_IN_DEFAULT);
-    match run_in.as_str() {
-        "shell" | "exec" => Ok(run_in),
-        other => Err(format!("`run_in` must be shell or exec, not `{}`.", other)),
-    }
-}
-
-/// The command a create types into its pane once the pane is ready: the `command` of a
-/// `run_in: shell` create, and nothing for an `exec` one, which hands it to the server instead.
-fn typed_command(args: &Args) -> Result<Option<String>, String> {
-    Ok(match run_in(args)?.as_str() {
-        "shell" => args.string("command"),
-        _ => None,
-    })
-}
-
-/// The name a created pane is given: the command it runs. The caller does not choose it.
+/// The name a created pane is given: the `exec` command it runs. The caller does not choose it.
+/// A shell pane takes no name, so its title is whatever its shell sets: the directory at the
+/// prompt, the running command while one runs.
 fn pane_name(args: &Args) -> Option<String> {
-    args.string("command").as_deref().map(default_pane_name)
+    args.string("exec").as_deref().map(default_pane_name)
 }
 
 /// The command line a tool call becomes, after the binary's own name.
@@ -1097,7 +1067,7 @@ fn argv_in(
         "zellij_create" if args.string("reopen").is_some() => {
             let reopen = args.string("reopen").unwrap_or_default();
             // the pane comes back as it was: its tab, its directory, its handle, its line
-            if let Some(param) = ["kind", "command", "run_in", "cwd", "name"]
+            if let Some(param) = ["kind", "exec", "cwd", "name"]
                 .into_iter()
                 .find(|param| args.values.contains_key(*param))
             {
@@ -1117,11 +1087,10 @@ fn argv_in(
         "zellij_create" => {
             create_kind_allowed(&args)?;
             let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
-            let command = args.string("command");
-            // `shell` makes a plain shell pane and leaves `command` to be typed into it once it is
-            // ready - see `TypeAfter`. `exec` hands `command` to the server as `$SHELL -c`, as
-            // every create did before, and waits for nothing
-            let shell_mode = run_in(&args)? != "exec";
+            let command = args.string("exec");
+            // without `exec` the pane is a plain shell, made ready for the caller to type into.
+            // `exec` hands its command to the server as `$SHELL -c`, and waits for nothing
+            let shell_mode = command.is_none();
             let wait_ready = shell_mode && args.flag_or("wait_ready", true);
             // the end of every create's command line: the readiness wait, or the command after
             // `--`, which has to come last because everything after it is the command's own argv
@@ -1775,40 +1744,34 @@ mod tests {
 
     #[test]
     fn a_create_makes_a_shell_pane_and_waits_for_it_by_default() {
-        // the command is not handed to the server: it is typed into the shell once it is ready
+        // a shell pane has no name of its own: its title is what its shell sets
         assert_eq!(
-            line(
-                "zellij_create",
-                json!({"kind": "stacked", "command": "cargo test"}),
-                Some("work")
-            ),
-            "-s work action new-pane --near-current-pane --stacked --name=cargo test --wait-ready \
-             --ready-timeout=10"
+            line("zellij_create", json!({"kind": "stacked"}), Some("work")),
+            "-s work action new-pane --near-current-pane --stacked --wait-ready --ready-timeout=10"
         );
         assert_eq!(
-            line(
-                "zellij_create",
-                json!({"kind": "tab", "command": "make"}),
-                None
-            ),
+            line("zellij_create", json!({"kind": "tab"}), None),
             "action new-tab --no-focus --wait-ready --ready-timeout=10"
         );
         assert_eq!(
-            in_agent_tab(
-                json!({"command": "cargo test"}),
-                Some("work"),
-                "work-zj",
-                TabPlacement::Made
-            ),
+            in_agent_tab(json!({}), Some("work"), "work-zj", TabPlacement::Made),
             "-s work action new-pane --new-tab=work-zj --no-focus --wait-ready --ready-timeout=10"
-        );
-        // a pane with nothing to type still waits, so the answer is a pane ready for input
-        assert_eq!(
-            line("zellij_create", json!({"kind": "stacked"}), None),
-            "action new-pane --near-current-pane --stacked --wait-ready --ready-timeout=10"
         );
         // and the one bound is the one the CLI applies by default
         assert_eq!(READY_TIMEOUT_DEFAULT_S, "10");
+    }
+
+    #[test]
+    fn a_create_refuses_a_command_and_says_to_type_it_into_the_pane() {
+        for given in [
+            json!({"kind": "stacked", "command": "cargo test"}),
+            json!({"command": "make", "run_in": "shell"}),
+            json!({"kind": "tab", "run_in": "exec"}),
+        ] {
+            let refused = refusal("zellij_create", given.clone());
+            assert!(refused.contains("zellij_write_input"), "{}", refused);
+            assert!(refused.contains("`exec`"), "{}", refused);
+        }
     }
 
     #[test]
@@ -1823,84 +1786,67 @@ mod tests {
         );
         let refused = argv_in(
             "zellij_create",
-            &args(json!({"reopen": "last", "command": "ls"})),
+            &args(json!({"reopen": "last", "exec": "ls"})),
             None,
             &a_shell_env(),
             None,
         )
         .unwrap_err();
-        assert!(refused.contains("`command`"), "{}", refused);
+        assert!(refused.contains("`exec`"), "{}", refused);
     }
 
     #[test]
     fn exec_hands_the_command_to_the_server_and_waits_for_nothing() {
-        // today's behaviour, for a one-shot command whose exit status the caller wants
+        // a one-shot command whose exit status the caller wants: the pane is named after it
         for wait_ready in [true, false] {
             assert_eq!(
                 line(
                     "zellij_create",
-                    json!({"kind": "stacked", "command": "make", "run_in": "exec",
+                    json!({"kind": "stacked", "exec": "make",
                            "wait_ready": wait_ready}),
                     None
                 ),
                 "action new-pane --near-current-pane --stacked --name=make -- /bin/zsh -c make"
             );
         }
-        // the negative control: a shell pane that is told not to wait types at once
+        // the negative control: a shell pane that is told not to wait answers at once
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "stacked", "command": "make", "wait_ready": false}),
+                json!({"kind": "stacked", "wait_ready": false}),
                 None
             ),
-            "action new-pane --near-current-pane --stacked --name=make"
+            "action new-pane --near-current-pane --stacked"
         );
-        assert!(refusal(
-            "zellij_create",
-            json!({"kind": "stacked", "command": "make", "run_in": "login"})
-        )
-        .contains("shell or exec"));
     }
 
     #[tokio::test]
-    async fn a_shell_create_types_its_command_into_the_pane_it_made_and_an_exec_one_does_not() {
+    async fn a_shell_create_reads_its_pane_back_and_an_exec_one_does_not() {
         let plan = plan_in(
             "zellij_create",
-            &args(json!({"kind": "stacked", "command": "cd /tmp && ls"})),
+            &args(json!({"kind": "stacked", "cwd": "/"})),
             Some("work"),
             &a_shell_env(),
             &Target::Local,
         )
         .await
         .expect("a plan");
-        let then_type = plan.then_type.expect("a command to type");
-        let [write, enter] = then_type.argvs("terminal_7");
+        let created = plan.created.expect("a shell pane to read back");
         assert_eq!(
-            write.join(" "),
-            "-s work action write-chars --pane-id=terminal_7 -- cd /tmp && ls"
+            created.list_argv().join(" "),
+            "-s work action list-panes --json"
         );
-        assert_eq!(
-            enter.join(" "),
-            "-s work action send-keys --pane-id=terminal_7 -- Enter"
-        );
-        // the text goes as one word, whatever is in it: the shell in the pane reads it
-        assert_eq!(write.last().map(String::as_str), Some("cd /tmp && ls"));
-        for exec_or_nothing in [
-            json!({"kind": "stacked", "command": "ls", "run_in": "exec"}),
-            json!({"kind": "stacked"}),
-        ] {
-            let plan = plan_in(
-                "zellij_create",
-                &args(exec_or_nothing.clone()),
-                None,
-                &a_shell_env(),
-                &Target::Local,
-            )
-            .await
-            .expect("a plan");
-            assert!(plan.then_type.is_none(), "{}", exec_or_nothing);
-        }
-        // and no other tool types anything
+        let plan = plan_in(
+            "zellij_create",
+            &args(json!({"kind": "stacked", "exec": "ls"})),
+            None,
+            &a_shell_env(),
+            &Target::Local,
+        )
+        .await
+        .expect("a plan");
+        assert!(plan.created.is_none());
+        // and no other tool reads a pane back
         let plan = plan_in(
             "zellij_read_pane",
             &args(json!({"pane": "3"})),
@@ -1910,7 +1856,7 @@ mod tests {
         )
         .await
         .expect("a plan");
-        assert!(plan.then_type.is_none());
+        assert!(plan.created.is_none());
     }
 
     #[test]
@@ -1930,7 +1876,7 @@ mod tests {
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "stacked", "command": "cargo test", "run_in": "exec"}),
+                json!({"kind": "stacked", "exec": "cargo test"}),
                 Some("work")
             ),
             "-s work action new-pane --near-current-pane --stacked --name=cargo test -- \
@@ -1962,7 +1908,7 @@ mod tests {
         // the tab that exists: nothing moves the focus, and the pane carries its name
         assert_eq!(
             in_agent_tab(
-                json!({"command": "cargo test", "run_in": "exec"}),
+                json!({"exec": "cargo test"}),
                 Some("work"),
                 "work-zj",
                 TabPlacement::Existing
@@ -1974,7 +1920,7 @@ mod tests {
         // focus with it without `--no-focus`
         assert_eq!(
             in_agent_tab(
-                json!({"command": "cargo test", "run_in": "exec"}),
+                json!({"exec": "cargo test"}),
                 Some("work"),
                 "work-zj",
                 TabPlacement::Made
@@ -2016,7 +1962,7 @@ mod tests {
         // a tab nothing answers to. `--name=--force` is the form that cannot be read as a flag
         assert_eq!(
             in_agent_tab(
-                json!({"command": "--force", "run_in": "exec"}),
+                json!({"exec": "--force"}),
                 Some("work"),
                 "work-zj",
                 TabPlacement::Existing
@@ -2028,7 +1974,7 @@ mod tests {
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "stacked", "command": "--force --now", "run_in": "exec"}),
+                json!({"kind": "stacked", "exec": "--force --now"}),
                 None
             ),
             "action new-pane --near-current-pane --stacked --name=--force --now -- /bin/zsh -c --force --now"
@@ -2076,7 +2022,7 @@ mod tests {
         // the caller does not choose the name: the command does
         assert!(line(
             "zellij_create",
-            json!({"kind": "stacked", "command": "cargo test", "run_in": "exec"}),
+            json!({"kind": "stacked", "exec": "cargo test"}),
             None
         )
         .contains("--name=cargo test --"));
@@ -2125,7 +2071,7 @@ mod tests {
         assert_eq!(
             built(
                 "zellij_create",
-                json!({"kind": "stacked", "command": "pwd", "run_in": "exec"}),
+                json!({"kind": "stacked", "exec": "pwd"}),
                 None,
                 &no_shell
             )
@@ -2141,7 +2087,7 @@ mod tests {
         let command = "cd /tmp && echo \"hello world\" $HOME | cat";
         let argv = built(
             "zellij_create",
-            json!({"kind": "stacked", "command": command, "run_in": "exec"}),
+            json!({"kind": "stacked", "exec": command}),
             None,
             &a_shell_env(),
         );
@@ -2162,7 +2108,7 @@ mod tests {
         // and the same for a tab, which builds its command line separately
         let argv = built(
             "zellij_create",
-            json!({"kind": "tab", "command": command, "run_in": "exec"}),
+            json!({"kind": "tab", "exec": command}),
             None,
             &a_shell_env(),
         );
@@ -2527,7 +2473,7 @@ mod tests {
     fn a_remote_create_takes_only_an_absolute_cwd_and_runs_exec_through_sh() {
         let line = built(
             "zellij_create",
-            json!({"kind": "tab", "cwd": "/srv/app", "command": "make", "run_in": "exec"}),
+            json!({"kind": "tab", "cwd": "/srv/app", "exec": "make"}),
             Some("work"),
             &a_remote_env(),
         )
@@ -2584,7 +2530,7 @@ mod tests {
             (json!({"floating": false}), "`floating` is unsupported"),
         ] {
             let mut request = args(placement);
-            request.insert("command".into(), json!("claude"));
+            request.insert("exec".into(), json!("claude"));
             let result = plan_in(
                 "zellij_create",
                 &request,
